@@ -19,6 +19,7 @@ GLOW = 0.07         # lamps/displays stay lit this long (s) so fast blinks are v
 MAX_RATE = 4000
 SAVE_EVERY = 0.5    # min seconds between autosaves
 MAX_LABEL = 20
+MAX_DESC = 60
 TUBE_SPEED = 60     # px/s, the little signal tubes sliding along wires
 MAX_DEPTH = 5       # chips inside chips, this many levels
 MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
@@ -199,6 +200,13 @@ HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = ad
         'clr: ctrl+sh+del']
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
+# kinds with an editable description in the body (double-click the empty space)
+DESC_KINDS = set(GATES) | {'SOURCE', 'SWITCH', 'BUTTON', 'GATE', 'LAMP', 'SR LATCH', 'NV LATCH'}
+DEFAULT_DESC = {'AND': 'both high', 'OR': 'any high', 'NAND': 'not both', 'NOR': 'none high',
+                'XOR': 'odd count', 'XNOR': 'even count', 'NOT': 'inverts', 'BUF': 'copies',
+                'SOURCE': 'always on', 'LAMP': 'glows', 'GATE': 'EN opens it',
+                'SR LATCH': 'S sets, R resets', 'NV LATCH': 'remembers', 'BUTTON': '1 pulse'}
+WIDGET_KINDS = ('SWITCH', 'BUTTON')     # these draw a little control in the body
 
 
 def cat_color(kind):
@@ -252,6 +260,9 @@ class Part:
         self.counter = 0        # clock ticks since last flip
         self.label_on = None    # switch names, one per state
         self.label_off = None
+        self.desc = None        # body text, None = default
+        self.desc_on = None     # switch: one per state
+        self.desc_off = None
         self.defn = None        # chip: the saved circuit
         self.inner = None       # chip: this copy's own parts
         self.inner_wires = None
@@ -472,6 +483,8 @@ class App:
         self.small = pygame.font.SysFont(MONO, 13)
         self.tiny = pygame.font.SysFont(MONO, 11, bold=True)
         self.pillf = pygame.font.SysFont(MONO, 10, bold=True)
+        self.descf = pygame.font.SysFont(MONO, 11)
+        self.edit_field = 'title'
         global FONT
         FONT = self.font
         self.light = False
@@ -715,6 +728,7 @@ class App:
     def part_to_dict(self, p, dx=0, dy=0):
         d = dict(kind=p.kind, gx=p.gx - dx, gy=p.gy - dy, on=p.on, label=p.label, pidx=p.pidx,
                  label_on=p.label_on, label_off=p.label_off,
+                 desc=p.desc, desc_on=p.desc_on, desc_off=p.desc_off,
                  q=p.out if p.kind == 'NV LATCH' else 0)
         if p.kind == 'CHIP':
             d['defn'] = p.defn
@@ -749,6 +763,9 @@ class App:
             p.label_on = d['label_on'][:MAX_LABEL]
         if isinstance(d.get('label_off'), str):
             p.label_off = d['label_off'][:MAX_LABEL]
+        for f in ('desc', 'desc_on', 'desc_off'):
+            if isinstance(d.get(f), str):
+                setattr(p, f, d[f][:MAX_DESC])
         if p.kind == 'NV LATCH':
             p.out = int(bool(d.get('q')))
         return p
@@ -1106,14 +1123,28 @@ class App:
             return 'CHIP'
         return k
 
+    def base_desc(self, p):
+        if p.kind == 'SWITCH':
+            t = p.desc_on if p.on else p.desc_off
+            return t if t is not None else ('passes' if p.on else 'blocks')
+        if p.desc is not None:
+            return p.desc
+        return DEFAULT_DESC.get(p.kind, '')
+
+    def desc_text(self, p):
+        if p is self.editing and self.edit_field == 'desc':
+            return self.edit_text + ('_' if (pygame.time.get_ticks() // 400) % 2 == 0 else ' ')
+        return self.base_desc(p)
+
     def label_text(self, p):
-        if p is self.editing:
+        if p is self.editing and self.edit_field == 'title':
             return self.edit_text + ('_' if (pygame.time.get_ticks() // 400) % 2 == 0 else ' ')
         return self.base_label(p)
 
-    def start_edit(self, p):
+    def start_edit(self, p, field='title'):
         self.editing = p
-        self.edit_text = self.base_label(p)
+        self.edit_field = field
+        self.edit_text = self.base_desc(p) if field == 'desc' else self.base_label(p)
         self.edit_on = p.on
         self.edit_fresh = True      # first key replaces everything
         pygame.key.set_repeat(400, 35)
@@ -1122,7 +1153,16 @@ class App:
         p = self.editing
         self.editing = None
         pygame.key.set_repeat()
-        if p and commit and p in self.parts:
+        if p and commit and p in self.parts and self.edit_field == 'desc':
+            if p.kind == 'SWITCH':
+                if self.edit_on:
+                    p.desc_on = self.edit_text
+                else:
+                    p.desc_off = self.edit_text
+            else:
+                p.desc = self.edit_text
+            self.dirty = True
+        elif p and commit and p in self.parts:
             if p.kind == 'SWITCH':
                 if self.edit_on:
                     p.label_on = self.edit_text
@@ -1145,7 +1185,10 @@ class App:
             if self.edit_fresh:
                 self.edit_text = ''
                 self.edit_fresh = False
-            if len(self.edit_text) < MAX_LABEL:
+            if self.edit_field == 'desc':
+                if len(self.edit_text) < MAX_DESC:
+                    self.edit_text += e.unicode
+            elif len(self.edit_text) < MAX_LABEL:
                 cand = self.edit_text + e.unicode
                 if self.editing.kind != 'LABEL' or self.label_fits(self.editing, cand):
                     self.edit_text = cand
@@ -1327,7 +1370,8 @@ class App:
                     p.pidx = (p.pidx - 1) % len(PERIODS)
                 elif p.kind == 'PIN':
                     self.set_pin_dir(p, not p.on)
-                self.start_edit(p)
+                body = p.kind in DESC_KINDS and e.pos[1] >= p.rect().y + sc(HDR)
+                self.start_edit(p, 'desc' if body else 'title')
                 return
             self.last_click = (p, now)
             if p in self.sel and len(self.sel) > 1:
@@ -1489,6 +1533,20 @@ class App:
                     surf.set_clip(None)
             pygame.draw.rect(surf, SEL if editing else PART_LINE, r, 1)
             cx, cy = r.centerx, r.y + hdrh + (r.h - hdrh) // 2
+            if k in DESC_KINDS and txt:
+                text = self.desc_text(p)
+                widget = k in WIDGET_KINDS
+                if text.strip():
+                    if widget:
+                        cy = r.bottom - sc(10)
+                    room = r.bottom - (sc(18) if widget else sc(4)) - (r.y + hdrh + 3)
+                    lines = wrap(self.descf, text, r.w - 8)[:max(0, room // 12)]
+                    col = SEL if p is self.editing and self.edit_fresh else TEXT_DIM
+                    surf.set_clip(pygame.Rect(r.x + 2, r.y + hdrh, r.w - 4, r.h - hdrh - 1))
+                    for li, line in enumerate(lines):
+                        t = self.descf.render(line, True, col)
+                        surf.blit(t, t.get_rect(midtop=(r.centerx, r.y + hdrh + 3 + li * 12)))
+                    surf.set_clip(None)
             if k == 'SWITCH':
                 track = pygame.Rect(cx - sc(12), cy - sc(5), sc(24), sc(10))
                 pygame.draw.rect(surf, TEXT_DIM, track, 1)
