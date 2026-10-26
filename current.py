@@ -430,6 +430,11 @@ class App:
         self.flow = []
         self.grid_cache = None
         self.pill_cache = {}
+        self.prev_state = None
+        self.root_wires = {}
+        self.wire_root = []
+        self.pulses = {}
+        self.pending = {}
 
     # ------------------------------------------------------------ sim
     def topo_sig(self):
@@ -478,6 +483,13 @@ class App:
                     seen.add(other)
                     queue.append(other)
         self.flow = flow
+        self.wire_root = [self.root[(w[0].uid, w[1])] for w in self.wires]
+        self.root_wires = {}
+        for wi, r in enumerate(self.wire_root):
+            self.root_wires.setdefault(r, []).append(wi)
+        self.prev_state = None      # no pulses for whatever changed with the layout
+        self.pulses = {}            # wire index -> [[distance, value], ...]
+        self.pending = {}           # wire index -> values waiting to leave the start
         self.topo_key = self.topo_sig()
 
     def netstate(self):
@@ -496,8 +508,41 @@ class App:
                 s.add(v)
         return self.root.__getitem__, drv
 
+    def track_changes(self, drv):
+        # a net that changes value sends one pulse down each of its wires
+        cur = {r: next(iter(s)) for r, s in drv.items() if len(s) == 1}
+        prev = self.prev_state
+        self.prev_state = cur
+        if prev is None or not self.tubes:
+            return
+        for r in set(cur) | set(prev):
+            if cur.get(r) != prev.get(r) and r in cur:
+                for wi in self.root_wires.get(r, ()):
+                    q = self.pending.setdefault(wi, [])
+                    if len(q) < 6:
+                        q.append(cur[r])
+
+    def move_pulses(self, dt):
+        for wi in list(self.pending.keys() | self.pulses.keys()):
+            if wi >= len(self.wires):
+                continue
+            pa, ia, pb, ib = self.wires[wi]
+            length = poly_len(wire_pts(pa.pin_pos(ia), pb.pin_pos(ib)))
+            ps = self.pulses.setdefault(wi, [])
+            for p in ps:
+                p[0] += TUBE_SPEED * dt
+            ps[:] = [p for p in ps if p[0] < length + 14]
+            q = self.pending.get(wi)
+            # next pulse only leaves once the last one is clear of the start
+            if q and (not ps or ps[-1][0] > 34):
+                ps.append([0.0, q.pop(0)])
+            if not ps and not q:
+                self.pulses.pop(wi, None)
+                self.pending.pop(wi, None)
+
     def step(self):
         find, drv = self.netstate()
+        self.track_changes(drv)
 
         def hi(p, i):
             return drv.get(find((p.uid, i))) == {1}
@@ -554,6 +599,8 @@ class App:
         if self.paused:
             return
         self.anim += dt
+        if self.topo_key == self.topo_sig():
+            self.move_pulses(dt)
         for p in self.parts:
             if p.glow > 0:
                 p.glow = max(0.0, p.glow - dt)
@@ -1197,30 +1244,28 @@ class App:
             return self.net_color(drv.get(find((p.uid, i))))
 
         # wires
-        jobs = []
         for wi, (pa, ia, pb, ib) in enumerate(self.wires):
             pts = wire_pts(pa.pin_pos(ia), pb.pin_pos(ib))
             s = drv.get(find((pa.uid, ia)))
             color = self.net_color(s)
             w = 1 if not s else (2 if s == {0} else 3)
             draw_wire(surf, pts, color, w)
-            if self.tubes and s in ({0}, {1}) and wi < len(self.flow) and self.flow[wi] is not None:
-                jobs.append((wi, pts, s))
 
-        # little signal tubes sliding along the wires, away from whatever drives them
-        for wi, pts, s in jobs:
-            length = poly_len(pts)
-            if length < 30:
-                continue
-            n = max(1, int(length // 96))
-            gap = length / n
-            base = (self.anim * TUBE_SPEED + wi * 53) % gap
-            path = pts if self.flow[wi] else pts[::-1]
-            pill = self.pill('ON' if s == {1} else 'OFF')
-            hw, hh = pill.get_width() // 2, pill.get_height() // 2
-            for k in range(n):
-                x, y = point_at(path, base + k * gap)
-                surf.blit(pill, (int(x) - hw, int(y) - hh))
+        # signal pulses: one per change, sliding away from the driver
+        if self.tubes and self.topo_key == self.topo_sig():
+            for wi, ps in self.pulses.items():
+                if wi >= len(self.wires) or self.flow[wi] is None:
+                    continue
+                pa, ia, pb, ib = self.wires[wi]
+                pts = wire_pts(pa.pin_pos(ia), pb.pin_pos(ib))
+                path = pts if self.flow[wi] else pts[::-1]
+                length = poly_len(pts)
+                for dist, val in ps:
+                    if dist > length:
+                        continue
+                    pill = self.pill('ON' if val == 1 else 'OFF')
+                    x, y = point_at(path, dist)
+                    surf.blit(pill, (int(x) - pill.get_width() // 2, int(y) - pill.get_height() // 2))
 
         if self.drag and self.drag['kind'] == 'wire':
             pa, ia = self.drag['a']
