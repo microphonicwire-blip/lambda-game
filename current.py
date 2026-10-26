@@ -124,7 +124,7 @@ THEMES = {
         PANEL=(13, 22, 40), PANEL_LINE=(44, 72, 118),
         PART_BG=(17, 27, 48), PART_LINE=(74, 112, 172),
         TEXT=(214, 228, 248), TEXT_DIM=(104, 130, 170),
-        ON=(72, 210, 255), OFF=(62, 156, 100), FLOAT=(58, 76, 108), SHORT=(232, 72, 72),
+        ON=(72, 210, 255), OFF=(62, 156, 100), FLOAT=(150, 170, 205), SHORT=(232, 72, 72),
         SEL=(255, 208, 80), ACTIVE=(22, 64, 96), LAMP_ON=(255, 226, 120),
         SEG_OFF=(27, 40, 68), SEG_DEFAULT=(240, 245, 255), PREVIEW=(150, 190, 235),
         HDR_LOGIC=(92, 70, 160), HDR_INPUT=(176, 112, 38), HDR_OUTPUT=(28, 128, 140),
@@ -134,7 +134,7 @@ THEMES = {
         PANEL=(222, 230, 242), PANEL_LINE=(140, 162, 196),
         PART_BG=(250, 252, 255), PART_LINE=(84, 114, 166),
         TEXT=(20, 32, 54), TEXT_DIM=(112, 126, 152),
-        ON=(0, 118, 214), OFF=(34, 140, 80), FLOAT=(160, 174, 198), SHORT=(212, 52, 52),
+        ON=(0, 118, 214), OFF=(34, 140, 80), FLOAT=(96, 110, 142), SHORT=(212, 52, 52),
         SEL=(226, 140, 0), ACTIVE=(206, 230, 250), LAMP_ON=(255, 200, 40),
         SEG_OFF=(214, 222, 236), SEG_DEFAULT=(20, 30, 50), PREVIEW=(70, 110, 170),
         HDR_LOGIC=(132, 112, 206), HDR_INPUT=(222, 150, 60), HDR_OUTPUT=(60, 164, 176),
@@ -293,6 +293,12 @@ def wire_pts(a, b):
 
 
 def draw_wire(surf, pts, color, w):
+    # outline in the opposite color so a wire never melts into the background or grid
+    inv = (255 - color[0], 255 - color[1], 255 - color[2])
+    ow = w + 2
+    pygame.draw.lines(surf, inv, False, pts, ow)
+    for q in pts[1:-1]:
+        pygame.draw.rect(surf, inv, (q[0] - ow // 2, q[1] - ow // 2, ow, ow))
     pygame.draw.lines(surf, color, False, pts, w)
     if w > 1:
         for q in pts[1:-1]:
