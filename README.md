@@ -1,2 +1,9 @@
 # lambda-game
-A game repository for experimenting with serverless lambda-style gameplay.
+circuits, gases, fun fun fun
+2d
+light
+fun
+uh
+why am i making so many new lines
+anyway update hub
+undex why u here
