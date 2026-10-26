@@ -20,9 +20,27 @@ MAX_RATE = 4000
 SAVE_EVERY = 0.5    # min seconds between autosaves
 MAX_LABEL = 20
 TUBE_SPEED = 60     # px/s, the little signal tubes sliding along wires
+MAX_DEPTH = 5       # chips inside chips, this many levels
+MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
+CAMX = CAMY = 0.0   # world pixel under the top-left of the work area
+ZOOM = 1.0
 PERIODS = [5, 10, 25, 50, 100, 250, 500, 1000]   # clock half-periods in ticks
 MONO = 'dejavusansmono,consolas,couriernew,menlo,monospace'
 FONT = None         # set by App, used to size LABEL parts
+
+
+def w2s(x, y):
+    # world pixels -> screen pixels
+    return PAL_W + (x - CAMX) * ZOOM, (y - CAMY) * ZOOM
+
+
+def s2w(x, y):
+    return (x - PAL_W) / ZOOM + CAMX, y / ZOOM + CAMY
+
+
+def sc(v, lo=1):
+    # scale a size with the zoom
+    return max(lo, int(v * ZOOM))
 
 
 def label_w(text):
@@ -109,7 +127,7 @@ THEMES = {
         SEL=(255, 208, 80), ACTIVE=(22, 64, 96), LAMP_ON=(255, 226, 120),
         SEG_OFF=(27, 40, 68), SEG_DEFAULT=(240, 245, 255), PREVIEW=(150, 190, 235),
         HDR_LOGIC=(92, 70, 160), HDR_INPUT=(176, 112, 38), HDR_OUTPUT=(28, 128, 140),
-        HDR_MEM=(160, 58, 120), HDR_TEXT=(255, 255, 255), DIM=(0, 0, 0)),
+        HDR_MEM=(160, 58, 120), HDR_CHIP=(50, 112, 190), HDR_TEXT=(255, 255, 255), DIM=(0, 0, 0)),
     'light': dict(
         BG=(234, 240, 248), GRID=(214, 223, 236), GRID2=(196, 208, 226),
         PANEL=(222, 230, 242), PANEL_LINE=(140, 162, 196),
@@ -119,7 +137,7 @@ THEMES = {
         SEL=(226, 140, 0), ACTIVE=(206, 230, 250), LAMP_ON=(255, 200, 40),
         SEG_OFF=(214, 222, 236), SEG_DEFAULT=(20, 30, 50), PREVIEW=(70, 110, 170),
         HDR_LOGIC=(132, 112, 206), HDR_INPUT=(222, 150, 60), HDR_OUTPUT=(60, 164, 176),
-        HDR_MEM=(200, 100, 166), HDR_TEXT=(255, 255, 255), DIM=(20, 30, 50)),
+        HDR_MEM=(200, 100, 166), HDR_CHIP=(70, 130, 210), HDR_TEXT=(255, 255, 255), DIM=(20, 30, 50)),
 }
 
 
@@ -156,6 +174,10 @@ DEFS = {
     # 7 segments on the left, then red green blue along the bottom
     '7SEG':    dict(w=5, h=8, pins=[(0, k, 'in') for k in range(1, 8)]
                     + [(1, 8, 'in'), (2, 8, 'in'), (3, 8, 'in')]),
+    # PIN = the port of a chip. PIN_O is the same part flipped (chip output)
+    'PIN':     dict(w=3, h=2, pins=[(3, 1, 'io')]),
+    'PIN_O':   dict(w=3, h=2, pins=[(0, 1, 'io')]),
+    'CHIP':    dict(w=4, h=2, pins=[]),         # real size/pins come from its circuit
     'NOT': ONE_IN, 'BUF': ONE_IN,
     'SR LATCH': TWO_IN, 'NV LATCH': TWO_IN,    # NV keeps its state in the save file
     'AND': TWO_IN, 'NAND': TWO_IN, 'OR': TWO_IN,
@@ -168,11 +190,12 @@ NAMES = {'DISPLAY': ['R', 'G', 'B', 'ON'], 'GATE': ['IN', 'OUT', 'EN'],
 
 PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', '7SEG',
              'NOT', 'BUF', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
-             'SR LATCH', 'NV LATCH', 'LABEL']
+             'SR LATCH', 'NV LATCH', 'PIN', 'LABEL']
 
-HELP = ['drag out parts', 'pin-pin = wire', 'bg drag = box', 'ctrl+click = add',
-        'ctrl+c x v a', 'del = delete', 'rmb = delete', 'dbl-click: name',
-        'space = pause', 'n = step', 'up/dn = speed', 'l = light mode', 't = tubes',
+HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
+        'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
+        'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
+        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes',
         'clr: ctrl+sh+del']
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
@@ -187,10 +210,17 @@ def cat_color(kind):
         return HDR_MEM
     if kind == 'LABEL':
         return TEXT_DIM
+    if kind in ('CHIP', 'PIN'):
+        return HDR_CHIP
     return HDR_LOGIC
 
 
-def pin_name(kind, i):
+def pin_name(p, i):
+    kind = p.kind
+    if kind == 'CHIP':
+        return p.pnames[i]
+    if kind == 'PIN':
+        return 'PORT'
     if kind in NAMES:
         return NAMES[kind][i]
     pins = DEFS[kind]['pins']
@@ -222,22 +252,30 @@ class Part:
         self.counter = 0        # clock ticks since last flip
         self.label_on = None    # switch names, one per state
         self.label_off = None
+        self.defn = None        # chip: the saved circuit
+        self.inner = None       # chip: this copy's own parts
+        self.inner_wires = None
+        self.pinmap = None      # chip: the PIN part behind each chip pin
+        self.pnames = None
 
     def rect(self):
         w = self.d['w'] * C
         if self.kind == 'LABEL':
             w = label_w(self.label if self.label is not None else 'LABEL') * C
-        return pygame.Rect(PAL_W + self.gx * C, self.gy * C, w, self.d['h'] * C)
+        x, y = w2s(self.gx * C, self.gy * C)
+        return pygame.Rect(round(x), round(y), round(w * ZOOM), round(self.d['h'] * C * ZOOM))
 
     def pin_pos(self, i):
         dx, dy, _ = self.d['pins'][i]
-        return (PAL_W + (self.gx + dx) * C, (self.gy + dy) * C)
+        x, y = w2s((self.gx + dx) * C, (self.gy + dy) * C)
+        return (round(x), round(y))
 
 
 def wire_pts(a, b):
     if a[0] == b[0] or a[1] == b[1]:
         return [a, b]
-    mx = PAL_W + round(((a[0] + b[0]) / 2 - PAL_W) / C) * C
+    wx = s2w((a[0] + b[0]) / 2, 0)[0]
+    mx = round(w2s(round(wx / C) * C, 0)[0])
     return [a, (mx, a[1]), (mx, b[1]), b]
 
 
@@ -458,14 +496,37 @@ class App:
         self.wire_root = []
         self.pulses = {}
         self.pending = {}
+        self.sim_parts = []     # every real part, chip insides included
+        self.toast = ('', 0.0)
+        self.view_moved = False
 
     # ------------------------------------------------------------ sim
     def topo_sig(self):
         return (id(self.parts), len(self.parts), id(self.wires), len(self.wires))
 
+    @staticmethod
+    def k(p, i):
+        # net key of a pin; a chip's pin is really the PIN part inside it
+        if p.kind == 'CHIP':
+            return (p.pinmap[i].uid, 0)
+        return (p.uid, i)
+
+    @staticmethod
+    def flatten(p, parts, wires):
+        if p.kind == 'CHIP':
+            for q in p.inner:
+                App.flatten(q, parts, wires)
+            wires.extend(p.inner_wires)
+        else:
+            parts.append(p)
+
     def build_topo(self):
         parent = {}
+        sim, all_wires = [], list(self.wires)
         for p in self.parts:
+            self.flatten(p, sim, all_wires)
+        self.sim_parts = sim
+        for p in sim:
             for i in range(len(p.d['pins'])):
                 k = (p.uid, i)
                 parent[k] = k
@@ -478,20 +539,25 @@ class App:
             return a
 
         adj = {}
-        for wi, (pa, ia, pb, ib) in enumerate(self.wires):
-            ka, kb = (pa.uid, ia), (pb.uid, ib)
+        nw = len(self.wires)
+        for wi, (pa, ia, pb, ib) in enumerate(all_wires):
+            ka, kb = self.k(pa, ia), self.k(pb, ib)
             ra, rb = find(ka), find(kb)
             if ra != rb:
                 parent[ra] = rb
-            adj.setdefault(ka, []).append((kb, wi, True))
-            adj.setdefault(kb, []).append((ka, wi, False))
+            if wi < nw:     # only the wires you can see get a flow direction
+                adj.setdefault(ka, []).append((kb, wi, True))
+                adj.setdefault(kb, []).append((ka, wi, False))
         self.root = {k: find(k) for k in list(parent)}
         self.out_pins, queue = [], []
-        for p in self.parts:
+        for p in sim:
             for i, (_, _, role) in enumerate(p.d['pins']):
                 if role == 'out':
                     self.out_pins.append((p, i, self.root[(p.uid, i)]))
-                    queue.append((p.uid, i))
+        for p in self.parts:
+            for i, (_, _, role) in enumerate(p.d['pins']):
+                if role == 'out':
+                    queue.append(self.k(p, i))
         # which way signals travel along each wire: away from the driving pin
         flow = [None] * len(self.wires)
         seen = set(queue)
@@ -506,7 +572,7 @@ class App:
                     seen.add(other)
                     queue.append(other)
         self.flow = flow
-        self.wire_root = [self.root[(w[0].uid, w[1])] for w in self.wires]
+        self.wire_root = [self.root[self.k(w[0], w[1])] for w in self.wires]
         self.root_wires = {}
         for wi, r in enumerate(self.wire_root):
             self.root_wires.setdefault(r, []).append(wi)
@@ -572,7 +638,7 @@ class App:
 
         new = []
         passes = []
-        for p in self.parts:
+        for p in self.sim_parts:
             k = p.kind
             if k == 'GATE':
                 st = drv.get(find((p.uid, 0)))
@@ -624,7 +690,7 @@ class App:
         self.anim += dt
         if self.topo_key == self.topo_sig():
             self.move_pulses(dt)
-        for p in self.parts:
+        for p in self.sim_parts:
             if p.glow > 0:
                 p.glow = max(0.0, p.glow - dt)
             if p.kind == '7SEG':
@@ -640,13 +706,88 @@ class App:
             self.acc = 0.0
 
     # ------------------------------------------------------------ saving
+    @staticmethod
+    def prims(p):
+        out = []
+        App.flatten(p, out, [])
+        return out
+
+    def part_to_dict(self, p, dx=0, dy=0):
+        d = dict(kind=p.kind, gx=p.gx - dx, gy=p.gy - dy, on=p.on, label=p.label, pidx=p.pidx,
+                 label_on=p.label_on, label_off=p.label_off,
+                 q=p.out if p.kind == 'NV LATCH' else 0)
+        if p.kind == 'CHIP':
+            d['defn'] = p.defn
+            d['st'] = [[int(q.on), q.out] for q in self.prims(p)]
+        return d
+
+    def part_from_dict(self, d, level=0):
+        if d['kind'] not in DEFS:
+            return None
+        if d['kind'] == 'CHIP':
+            p = self.build_chip(d['defn'], int(d['gx']), int(d['gy']), level)
+            st = d.get('st')
+            prims = self.prims(p)
+            if isinstance(st, list) and len(st) == len(prims):
+                for q, (on, out) in zip(prims, st):
+                    if q.kind == 'SWITCH':
+                        q.on = bool(on)
+                    elif q.kind == 'NV LATCH':
+                        q.out = int(bool(out))
+        else:
+            p = Part(d['kind'], int(d['gx']), int(d['gy']))
+        p.on = bool(d.get('on'))
+        p.pidx = max(0, min(len(PERIODS) - 1, int(d.get('pidx', 4))))
+        if p.kind == 'PIN':
+            self.set_pin_dir(p, p.on)
+        if isinstance(d.get('label'), str):
+            p.label = d['label'][:MAX_LABEL]
+            if p.kind == 'SWITCH':      # old saves: one name for both states
+                p.label_on = p.label_off = p.label
+                p.label = None
+        if isinstance(d.get('label_on'), str):
+            p.label_on = d['label_on'][:MAX_LABEL]
+        if isinstance(d.get('label_off'), str):
+            p.label_off = d['label_off'][:MAX_LABEL]
+        if p.kind == 'NV LATCH':
+            p.out = int(bool(d.get('q')))
+        return p
+
+    def set_pin_dir(self, p, out):
+        p.on = bool(out)
+        p.d = DEFS['PIN_O' if out else 'PIN']
+
+    def build_chip(self, defn, gx, gy, level=0):
+        if level > MAX_DEPTH:
+            raise ValueError('chips nested too deep')
+        clones = [self.part_from_dict(d, level + 1) for d in defn['parts']]
+        if None in clones:
+            raise ValueError('bad chip')
+        p = Part('CHIP', gx, gy)
+        p.defn = defn
+        p.inner = clones
+        p.inner_wires = [(clones[a], ia, clones[b], ib) for a, ia, b, ib in defn['wires']]
+        pins = sorted((c for c in clones if c.kind == 'PIN'), key=lambda c: (c.gy, c.gx))
+        ins = [c for c in pins if not c.on]
+        outs = [c for c in pins if c.on]
+        p.pinmap = ins + outs
+        p.pnames = [self.base_label(c) for c in p.pinmap]
+        nl = len(ins)
+        lw = max([len(n) for n in p.pnames[:nl]] or [0])
+        rw = max([len(n) for n in p.pnames[nl:]] or [0])
+        w = max(4, -(-((lw + rw) * 7 + 24) // C))
+        h = max(len(ins), len(outs), 1) + 1
+        p.d = dict(w=w, h=h, pins=[(0, i + 1, 'in') for i in range(len(ins))]
+                   + [(w, j + 1, 'out') for j in range(len(outs))])
+        p.label = defn.get('name', 'CHIP')
+        return p
+
     def save(self):
         idx = {p.uid: i for i, p in enumerate(self.parts)}
         data = dict(
-            version=1, rate=self.rate, light=self.light, tubes=self.tubes,
-            parts=[dict(kind=p.kind, gx=p.gx, gy=p.gy, on=p.on, label=p.label, pidx=p.pidx,
-                        label_on=p.label_on, label_off=p.label_off,
-                        q=p.out if p.kind == 'NV LATCH' else 0) for p in self.parts],
+            version=2, rate=self.rate, light=self.light, tubes=self.tubes,
+            view=[CAMX, CAMY, ZOOM],
+            parts=[self.part_to_dict(p) for p in self.parts],
             wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires])
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -664,6 +805,7 @@ class App:
             self.save()
 
     def load(self):
+        global CAMX, CAMY, ZOOM
         try:
             with open(self.path) as f:
                 data = json.load(f)
@@ -674,26 +816,7 @@ class App:
         try:
             if data is None:
                 raise ValueError
-            parts = []
-            for d in data['parts']:
-                if d['kind'] not in DEFS:
-                    parts.append(None)
-                    continue
-                p = Part(d['kind'], int(d['gx']), int(d['gy']))
-                p.on = bool(d.get('on'))
-                p.pidx = max(0, min(len(PERIODS) - 1, int(d.get('pidx', 4))))
-                if isinstance(d.get('label'), str):
-                    p.label = d['label'][:MAX_LABEL]
-                    if p.kind == 'SWITCH':      # old saves: one name for both states
-                        p.label_on = p.label_off = p.label
-                        p.label = None
-                if isinstance(d.get('label_on'), str):
-                    p.label_on = d['label_on'][:MAX_LABEL]
-                if isinstance(d.get('label_off'), str):
-                    p.label_off = d['label_off'][:MAX_LABEL]
-                if p.kind == 'NV LATCH':
-                    p.out = int(bool(d.get('q')))
-                parts.append(p)
+            parts = [self.part_from_dict(d) for d in data['parts']]
             wires = []
             for a, ia, b, ib in data['wires']:
                 pa, pb = parts[a], parts[b]
@@ -705,6 +828,10 @@ class App:
             self.rate = max(1, min(MAX_RATE, int(data.get('rate', self.rate))))
             self.light = bool(data.get('light'))
             self.tubes = bool(data.get('tubes', True))
+            v = data.get('view')
+            if isinstance(v, list) and len(v) == 3:
+                CAMX, CAMY = float(v[0]), float(v[1])
+                ZOOM = max(MIN_ZOOM, min(MAX_ZOOM, float(v[2])))
             set_theme(self.light)
             self.reset_caches()
         except (KeyError, TypeError, ValueError, IndexError):
@@ -785,7 +912,7 @@ class App:
 
     def label_fits(self, p, text):
         r0 = p.rect()
-        r = pygame.Rect(r0.x, r0.y, label_w(text + '_') * C, C)
+        r = pygame.Rect(r0.x, r0.y, round(label_w(text + '_') * C * ZOOM), r0.h)
         return not any(q is not p and r.colliderect(q.rect()) for q in self.parts)
 
     # ------------------------------------------------------------ selection and clipboard
@@ -802,9 +929,7 @@ class App:
         minx, miny = min(p.gx for p in group), min(p.gy for p in group)
         idx = {p.uid: i for i, p in enumerate(group)}
         self.clip = dict(
-            parts=[dict(kind=p.kind, rx=p.gx - minx, ry=p.gy - miny, on=p.on, label=p.label,
-                        label_on=p.label_on, label_off=p.label_off, pidx=p.pidx,
-                        q=p.out if p.kind == 'NV LATCH' else 0) for p in group],
+            parts=[self.part_to_dict(p, minx, miny) for p in group],
             wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires
                    if a.uid in idx and b.uid in idx])
 
@@ -813,26 +938,90 @@ class App:
             return
         if self.drag and self.drag.get('carry'):
             self.cancel_carry()
-        clones = []
-        for d in self.clip['parts']:
-            p = Part(d['kind'], d['rx'], d['ry'])
-            p.on, p.label, p.pidx = d['on'], d['label'], d['pidx']
-            p.label_on, p.label_off = d['label_on'], d['label_off']
-            if p.kind == 'NV LATCH':
-                p.out = d['q']
-            clones.append(p)
+        try:
+            clones = [self.part_from_dict(d) for d in self.clip['parts']]
+        except (ValueError, KeyError):
+            return
         self.parts.extend(clones)
         for a, ia, b, ib in self.clip['wires']:
             self.wires.append((clones[a], ia, clones[b], ib))
         self.topo_key = None
         self.sel = set(clones)
-        bw = max(p.rect().right for p in clones) - PAL_W
-        bh = max(p.rect().bottom for p in clones)
+        bw = max(p.gx + p.d['w'] for p in clones) * C * ZOOM
+        bh = max(p.gy + p.d['h'] for p in clones) * C * ZOOM
         d = dict(kind='part', parts=clones, rel=[(p.gx, p.gy) for p in clones],
                  ox=bw // 2, oy=bh // 2, start=pygame.mouse.get_pos(), moved=True,
                  new=True, carry=True, hit=None, orig=None)
         self.place_group(d, *pygame.mouse.get_pos())
         self.drag = d       # follows the mouse until you click to drop it
+
+    # chips
+    def say(self, text):
+        self.toast = (text, time.time() + 2.8)
+
+    def find_free(self, group):
+        # nudge a group to the nearest spot where it doesn't overlap anything
+        base = [(p.gx, p.gy) for p in group]
+        for r in range(0, 80):
+            for dx in range(-r, r + 1):
+                rest = r - abs(dx)
+                for dy in ({rest, -rest}):
+                    for p, (gx, gy) in zip(group, base):
+                        p.gx, p.gy = gx + dx, gy + dy
+                    if not self.group_collides(group):
+                        return
+        for p, (gx, gy) in zip(group, base):
+            p.gx, p.gy = gx, gy
+
+    def chipify(self):
+        group = [p for p in self.parts if p in self.sel and p.kind != 'LABEL']
+        if not group:
+            self.say('select some parts first')
+            return
+        if not any(p.kind == 'PIN' for p in group):
+            self.say('add PIN parts so the chip has ports')
+            return
+        depth = 1 + max([p.defn.get('depth', 1) for p in group if p.kind == 'CHIP'] or [0])
+        if depth > MAX_DEPTH:
+            self.say(f'chips can only nest {MAX_DEPTH} deep')
+            return
+        minx, miny = min(p.gx for p in group), min(p.gy for p in group)
+        idx = {p.uid: i for i, p in enumerate(group)}
+        defn = dict(name='CHIP', depth=depth,
+                    parts=[self.part_to_dict(p, minx, miny) for p in group],
+                    wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires
+                           if a.uid in idx and b.uid in idx])
+        try:
+            chip = self.build_chip(defn, minx, miny)
+        except (ValueError, KeyError):
+            self.say("couldn't make that chip")
+            return
+        for p in group:
+            self.remove_part(p)
+        self.parts.append(chip)
+        self.find_free([chip])
+        self.topo_key = None
+        self.sel = {chip}
+        self.dirty = True
+        self.say('chip made, dbl-click to name it, u opens it')
+
+    def unpack(self):
+        chips = [p for p in self.parts if p in self.sel and p.kind == 'CHIP']
+        if not chips:
+            self.say('select a chip first')
+            return
+        chip = chips[0]
+        self.parts.remove(chip)
+        self.wires = [w for w in self.wires if w[0] is not chip and w[2] is not chip]
+        for q in chip.inner:
+            q.gx += chip.gx
+            q.gy += chip.gy
+        self.parts.extend(chip.inner)
+        self.wires.extend(chip.inner_wires)
+        self.find_free(chip.inner)
+        self.sel = set(chip.inner)
+        self.topo_key = None
+        self.dirty = True
 
     def cancel_carry(self):
         d, self.drag = self.drag, None
@@ -851,16 +1040,17 @@ class App:
         return False
 
     def place_group(self, d, mx, my):
-        gx0 = max(0, round((mx - d['ox'] - PAL_W) / C))
-        gy0 = max(0, round((my - d['oy']) / C))
+        wx, wy = s2w(mx - d['ox'], my - d['oy'])
+        gx0, gy0 = round(wx / C), round(wy / C)
         for p, (rx, ry) in zip(d['parts'], d['rel']):
             p.gx, p.gy = gx0 + rx, gy0 + ry
 
     def begin_part_drag(self, group, pos, hit):
         minx, miny = min(p.gx for p in group), min(p.gy for p in group)
+        sx, sy = w2s(minx * C, miny * C)
         self.drag = dict(kind='part', parts=group,
                          rel=[(p.gx - minx, p.gy - miny) for p in group],
-                         ox=pos[0] - (PAL_W + minx * C), oy=pos[1] - miny * C,
+                         ox=pos[0] - sx, oy=pos[1] - sy,
                          start=pos, moved=False, new=False, carry=False, hit=hit,
                          orig=[(p.gx, p.gy) for p in group])
 
@@ -891,6 +1081,8 @@ class App:
             elif h.kind == 'CLOCK':
                 h.pidx = (h.pidx + 1) % len(PERIODS)
                 h.counter = 0
+            elif h.kind == 'PIN':
+                self.set_pin_dir(h, not h.on)
 
     # ------------------------------------------------------------ renaming
     def base_label(self, p):
@@ -908,6 +1100,10 @@ class App:
             return f'CLK {PERIODS[p.pidx]}'
         if k == 'DISPLAY':
             return ''
+        if k == 'PIN':
+            return 'OUT' if p.on else 'IN'
+        if k == 'CHIP':
+            return 'CHIP'
         return k
 
     def label_text(self, p):
@@ -980,14 +1176,50 @@ class App:
         if e.type == pygame.KEYDOWN:
             self.on_key(e)
         elif e.type == pygame.MOUSEWHEEL:
-            if pygame.mouse.get_pos()[0] < PAL_W:
+            mp = pygame.mouse.get_pos()
+            if mp[0] < PAL_W:
                 self.scroll_palette(-e.y * 26)
+            else:
+                self.zoom_at(mp, 1.12 ** e.y)
         elif e.type == pygame.MOUSEBUTTONDOWN:
             self.on_down(e)
         elif e.type == pygame.MOUSEMOTION:
             self.on_motion(e)
-        elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
-            self.on_up(e)
+        elif e.type == pygame.MOUSEBUTTONUP:
+            if e.button == 1:
+                self.on_up(e)
+            elif e.button in (2, 3):
+                self.end_pan(e)
+
+    def zoom_at(self, mp, f):
+        # zoom toward whatever the mouse is pointing at
+        global CAMX, CAMY, ZOOM
+        wx, wy = s2w(*mp)
+        ZOOM = max(MIN_ZOOM, min(MAX_ZOOM, ZOOM * f))
+        CAMX = wx - (mp[0] - PAL_W) / ZOOM
+        CAMY = wy - mp[1] / ZOOM
+        self.dirty = True
+        d = self.drag
+        if d and d['kind'] == 'part' and d.get('carry'):
+            self.place_group(d, *mp)
+
+    def end_pan(self, e):
+        d = self.drag
+        if not d or d['kind'] != 'pan':
+            return
+        self.drag = None
+        if d['moved'] or d['button'] != 3:
+            return
+        p = self.part_at(d['start'])        # rmb click without moving = delete
+        if p:
+            self.remove_part(p)
+            self.dirty = True
+        else:
+            w = self.wire_at(d['start'])
+            if w:
+                self.wires.remove(w)
+                self.topo_key = None
+                self.dirty = True
 
     def on_key(self, e):
         k = e.key
@@ -1006,6 +1238,15 @@ class App:
             self.clear_all()
         elif k in (pygame.K_DELETE, pygame.K_BACKSPACE):
             self.delete_sel()
+        elif k == pygame.K_g and not ctrl:
+            self.chipify()
+        elif k == pygame.K_u and not ctrl:
+            self.unpack()
+        elif k == pygame.K_HOME:
+            global CAMX, CAMY, ZOOM
+            CAMX = CAMY = 0.0
+            ZOOM = 1.0
+            self.dirty = True
         elif k == pygame.K_SPACE:
             self.paused = not self.paused
         elif k == pygame.K_l:
@@ -1023,27 +1264,21 @@ class App:
             self.rate = max(1, self.rate // 2)
             self.dirty = True
         elif k == pygame.K_n and self.paused:
-            for p in self.parts:
+            for p in self.sim_parts:
                 p.glow = 0.0
                 p.seg_glow = [0.0] * 7
             self.step()
 
     def on_down(self, e):
         mx, my = e.pos
-        if e.button == 3:
+        if e.button in (2, 3):
             if self.drag and self.drag.get('carry'):
-                self.cancel_carry()
+                if e.button == 3:
+                    self.cancel_carry()
                 return
-            p = self.part_at(e.pos)
-            if p:
-                self.remove_part(p)
-                self.dirty = True
-            else:
-                w = self.wire_at(e.pos)
-                if w:
-                    self.wires.remove(w)
-                    self.topo_key = None
-                    self.dirty = True
+            if self.drag is None and mx >= PAL_W:
+                self.drag = dict(kind='pan', start=e.pos, cam=(CAMX, CAMY), moved=False,
+                                 button=e.button)
             return
         if e.button != 1:
             return
@@ -1059,7 +1294,7 @@ class App:
                     if self.pal_rect(i).collidepoint(e.pos):
                         p = Part(k)
                         d = dict(kind='part', parts=[p], rel=[(0, 0)],
-                                 ox=p.d['w'] * C // 2, oy=p.d['h'] * C // 2, start=e.pos,
+                                 ox=p.d['w'] * C * ZOOM // 2, oy=p.d['h'] * C * ZOOM // 2, start=e.pos,
                                  moved=True, new=True, carry=False, hit=None, orig=None)
                         self.place_group(d, mx, my)
                         self.parts.append(p)
@@ -1090,6 +1325,8 @@ class App:
                     p.on = not p.on     # undo the first click's toggle
                 elif p.kind == 'CLOCK':
                     p.pidx = (p.pidx - 1) % len(PERIODS)
+                elif p.kind == 'PIN':
+                    self.set_pin_dir(p, not p.on)
                 self.start_edit(p)
                 return
             self.last_click = (p, now)
@@ -1108,6 +1345,16 @@ class App:
         d = self.drag
         if not d:
             return
+        if d['kind'] == 'pan':
+            global CAMX, CAMY
+            dx, dy = e.pos[0] - d['start'][0], e.pos[1] - d['start'][1]
+            if abs(dx) + abs(dy) > 4:
+                d['moved'] = True
+            if d['moved']:
+                CAMX = d['cam'][0] - dx / ZOOM
+                CAMY = d['cam'][1] - dy / ZOOM
+                self.dirty = True
+            return
         if d['kind'] == 'part':
             if abs(e.pos[0] - d['start'][0]) + abs(e.pos[1] - d['start'][1]) > 4:
                 d['moved'] = True
@@ -1120,7 +1367,7 @@ class App:
 
     def on_up(self, e):
         d = self.drag
-        if not d or d.get('carry'):
+        if not d or d.get('carry') or d['kind'] == 'pan':
             return
         self.drag = None
         if d['kind'] == 'wire':
@@ -1150,15 +1397,25 @@ class App:
         surf.blit(t, t.get_rect(center=center))
 
     def draw_grid(self, surf, W, H):
-        if self.grid_cache is None or self.grid_cache.get_size() != (W, H):
-            g = pygame.Surface((W, H))
-            g.fill(BG)
-            for n, x in enumerate(range(PAL_W, W, C)):
-                pygame.draw.line(g, GRID2 if n % 4 == 0 else GRID, (x, 0), (x, H))
-            for n, y in enumerate(range(0, H, C)):
-                pygame.draw.line(g, GRID2 if n % 4 == 0 else GRID, (PAL_W, y), (W, y))
-            self.grid_cache = g
-        surf.blit(self.grid_cache, (0, 0))
+        surf.fill(BG)
+        step = C * ZOOM
+        i0 = int(CAMX // C)
+        i1 = int((CAMX + (W - PAL_W) / ZOOM) // C) + 1
+        for i in range(i0, i1 + 1):
+            major = i % 4 == 0
+            if step < 9 and not major:
+                continue
+            x = round(PAL_W + (i * C - CAMX) * ZOOM)
+            if x >= PAL_W:
+                pygame.draw.line(surf, GRID2 if major else GRID, (x, 0), (x, H))
+        j0 = int(CAMY // C)
+        j1 = int((CAMY + H / ZOOM) // C) + 1
+        for j in range(j0, j1 + 1):
+            major = j % 4 == 0
+            if step < 9 and not major:
+                continue
+            y = round((j * C - CAMY) * ZOOM)
+            pygame.draw.line(surf, GRID2 if major else GRID, (PAL_W, y), (W, y))
 
     def pill(self, text):
         key = (text, self.light)
@@ -1181,8 +1438,9 @@ class App:
         return ON if 1 in s else OFF
 
     def draw_7seg(self, surf, p, r):
-        x0, y0 = r.x + 34, r.y + HDR + 10
-        dw, dh, t = 68, r.h - HDR - 10 - 28, 9
+        hdr = sc(HDR)
+        x0, y0 = r.x + sc(34), r.y + hdr + sc(10)
+        dw, dh, t = sc(68), r.h - hdr - sc(10) - sc(28), sc(9)
         vl = (dh - 3 * t) // 2
         segs = [(x0 + t, y0, dw - 2 * t, t),                     # a
                 (x0 + dw - t, y0 + t, t, vl),                    # b
@@ -1199,14 +1457,16 @@ class App:
         r = p.rect()
         k = p.kind
         editing = p is self.editing
+        txt = ZOOM >= 0.55          # skip text when zoomed way out
         if k == 'LABEL':
             text = self.label_text(p)
-            r = pygame.Rect(r.x, r.y, label_w(text) * C, C)
-            pygame.draw.rect(surf, BG, r)
+            r = pygame.Rect(r.x, r.y, round(label_w(text) * C * ZOOM), r.h)
             if editing or not text.strip():
                 pygame.draw.rect(surf, SEL if editing else FLOAT, r, 1)
-            self.label(surf, text, SEL if editing and self.edit_fresh else TEXT, r.center)
+            if txt:
+                self.label(surf, text, SEL if editing and self.edit_fresh else TEXT, r.center)
             return
+        hdrh = sc(HDR)
         if k == 'DISPLAY':
             pygame.draw.rect(surf, p.rgb if p.glow > 0 and p.rgb else PART_BG, r)
             pygame.draw.rect(surf, SEL if editing else PART_LINE, r, 1)
@@ -1218,44 +1478,57 @@ class App:
                     or (k in ('CLOCK', 'SR LATCH', 'NV LATCH', 'GATE') and (p.out and (k != 'GATE' or p.drive))):
                 body = ACTIVE
             pygame.draw.rect(surf, body, r)
-            hdr = pygame.Rect(r.x, r.y, r.w, HDR)
+            hdr = pygame.Rect(r.x, r.y, r.w, hdrh)
             pygame.draw.rect(surf, cat_color(k), hdr)
-            text = self.label_text(p)
-            if text.strip():
-                t = self.tiny.render(text, True, SEL if editing and self.edit_fresh else HDR_TEXT)
-                surf.set_clip(hdr.inflate(-4, 0))
-                surf.blit(t, t.get_rect(center=hdr.center))
-                surf.set_clip(None)
+            if txt:
+                text = self.label_text(p)
+                if text.strip():
+                    t = self.tiny.render(text, True, SEL if editing and self.edit_fresh else HDR_TEXT)
+                    surf.set_clip(hdr.inflate(-4, 0))
+                    surf.blit(t, t.get_rect(center=hdr.center))
+                    surf.set_clip(None)
             pygame.draw.rect(surf, SEL if editing else PART_LINE, r, 1)
-            cx, cy = r.centerx, r.y + HDR + (r.h - HDR) // 2
+            cx, cy = r.centerx, r.y + hdrh + (r.h - hdrh) // 2
             if k == 'SWITCH':
-                track = pygame.Rect(cx - 12, cy - 5, 24, 10)
+                track = pygame.Rect(cx - sc(12), cy - sc(5), sc(24), sc(10))
                 pygame.draw.rect(surf, TEXT_DIM, track, 1)
-                kx = track.right - 10 if p.on else track.x + 2
-                pygame.draw.rect(surf, ON if p.on else TEXT_DIM, (kx, track.y + 2, 8, 6))
+                kx = track.right - sc(10) if p.on else track.x + sc(2)
+                pygame.draw.rect(surf, ON if p.on else TEXT_DIM, (kx, track.y + sc(2), sc(8), sc(6)))
             elif k == 'BUTTON':
-                b = pygame.Rect(cx - 10, cy - 5, 20, 10)
+                b = pygame.Rect(cx - sc(10), cy - sc(5), sc(20), sc(10))
                 pygame.draw.rect(surf, ON if p.flash > 0 else PART_BG, b)
                 pygame.draw.rect(surf, TEXT_DIM, b, 1)
-            elif k == 'CLOCK':
+            elif k == 'CLOCK' and txt:
                 t = self.tiny.render(f'{PERIODS[p.pidx]} ticks', True, TEXT_DIM)
                 surf.blit(t, t.get_rect(center=(cx, cy)))
+            elif k == 'PIN':
+                a = sc(7)       # little arrow, signals always go left to right through a pin
+                pygame.draw.polygon(surf, ON if p.on else TEXT_DIM,
+                                    [(cx - a, cy - a), (cx + a, cy), (cx - a, cy + a)])
             elif k == '7SEG':
                 self.draw_7seg(surf, p, r)
         # pins
         small = k == 'DISPLAY'
-        o, i_ = (7, 3) if small else (9, 5)
+        o, i_ = (sc(7, 3), sc(3, 2)) if small else (sc(9, 4), sc(5, 2))
         for i in range(len(p.d['pins'])):
             q = p.pin_pos(i)
             pygame.draw.rect(surf, BG, (q[0] - o // 2, q[1] - o // 2, o, o))
             pygame.draw.rect(surf, pcol(p, i), (q[0] - i_ // 2, q[1] - i_ // 2, i_, i_))
+            if not txt:
+                continue
             if k == '7SEG':
                 if i < 7:
                     t = self.tiny.render(SEG_NAMES[i], True, TEXT_DIM)
-                    surf.blit(t, t.get_rect(center=(q[0] + 11, q[1])))
+                    surf.blit(t, t.get_rect(center=(q[0] + sc(11), q[1])))
                 else:
                     t = self.tiny.render('RGB'[i - 7], True, TEXT_DIM)
-                    surf.blit(t, t.get_rect(center=(q[0], q[1] - 10)))
+                    surf.blit(t, t.get_rect(center=(q[0], q[1] - sc(10))))
+            elif k == 'CHIP':
+                t = self.tiny.render(p.pnames[i], True, TEXT_DIM)
+                if p.d['pins'][i][2] == 'in':
+                    surf.blit(t, t.get_rect(midleft=(q[0] + sc(7), q[1])))
+                else:
+                    surf.blit(t, t.get_rect(midright=(q[0] - sc(7), q[1])))
 
     def draw(self, surf):
         W, H = surf.get_size()
@@ -1263,13 +1536,15 @@ class App:
         find, drv = self.netstate()
         mp = pygame.mouse.get_pos()
 
+        k_ = self.k
+
         def pcol(p, i):
-            return self.net_color(drv.get(find((p.uid, i))))
+            return self.net_color(drv.get(find(k_(p, i))))
 
         # wires
         for wi, (pa, ia, pb, ib) in enumerate(self.wires):
             pts = wire_pts(pa.pin_pos(ia), pb.pin_pos(ib))
-            s = drv.get(find((pa.uid, ia)))
+            s = drv.get(find(k_(pa, ia)))
             color = self.net_color(s)
             w = 1 if not s else (2 if s == {0} else 3)
             draw_wire(surf, pts, color, w)
@@ -1294,8 +1569,10 @@ class App:
             pa, ia = self.drag['a']
             draw_wire(surf, wire_pts(pa.pin_pos(ia), mp), PREVIEW, 2)
 
+        view = pygame.Rect(PAL_W, 0, W - PAL_W, H)
         for p in self.parts:
-            self.draw_part(surf, p, pcol)
+            if p.rect().colliderect(view):
+                self.draw_part(surf, p, pcol)
 
         for p in self.sel:
             pygame.draw.rect(surf, SEL, p.rect().inflate(6, 6), 2)
@@ -1353,7 +1630,7 @@ class App:
             hit = self.pin_at(mp)
             if hit:
                 p, i = hit
-                t = self.small.render(f"{p.kind} {pin_name(p.kind, i)}", True, TEXT)
+                t = self.small.render(f"{p.label if p.kind == 'CHIP' else p.kind} {pin_name(p, i)}", True, TEXT)
                 w, h = t.get_width() + 10, t.get_height() + 6
                 x, y = mp[0] + 14, mp[1] + 14
                 if x + w > W:
@@ -1363,6 +1640,14 @@ class App:
                 pygame.draw.rect(surf, PANEL, (x, y, w, h))
                 pygame.draw.rect(surf, PART_LINE, (x, y, w, h), 1)
                 surf.blit(t, (x + 5, y + 3))
+
+        if self.toast[0] and time.time() < self.toast[1]:
+            t = self.font.render(self.toast[0], True, TEXT)
+            tr = pygame.Rect(0, 0, t.get_width() + 24, t.get_height() + 14)
+            tr.midtop = ((W + PAL_W) // 2, 12)
+            pygame.draw.rect(surf, PANEL, tr)
+            pygame.draw.rect(surf, SEL, tr, 1)
+            surf.blit(t, t.get_rect(center=tr.center))
 
         u = self.updater
         if u and u.state in ('prompt', 'installing', 'failed'):
