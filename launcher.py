@@ -11,6 +11,8 @@ import hashlib, heapq, itertools, json, math, pathlib, queue, random, re, shutil
 import socket, ssl, string, struct, subprocess, tempfile, textwrap, threading, time  # noqa
 import typing, urllib.parse, urllib.request, zlib  # noqa
 import pygame  # noqa
+import numpy  # noqa  (gas lab)
+import pygame.surfarray  # noqa
 
 
 def data_dir():
