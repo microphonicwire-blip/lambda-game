@@ -2,6 +2,7 @@
 # logic gate sandbox
 import colorsys
 import hashlib
+import random
 import heapq
 import math
 import json
@@ -2009,14 +2010,21 @@ G_COLOR = [(46, 66, 108), (60, 100, 160), (130, 70, 190), (170, 145, 40), (60, 1
            (110, 110, 110), (90, 150, 180), (180, 100, 150)]
 G_NICE = {'N2': 'N2', 'O2': 'O2', 'H2': 'H2', 'C3H8': 'propane', 'CH4': 'methane',
           'CO2': 'CO2', 'H2O': 'steam', 'He': 'He'}
-# fuel: (O2 needed per fuel, products, heat released / R per mol, autoignition temp K)
-G_FUELS = {'H2': (0.5, {'H2O': 1}, 29100, 773),
-           'C3H8': (5, {'CO2': 3, 'H2O': 4}, 245800, 743),
-           'CH4': (2, {'CO2': 1, 'H2O': 2}, 96460, 853)}
+# fuel: (O2 needed per fuel, products, heat released / R per mol, activation temp K)
+G_FUELS = {'H2': (0.5, {'H2O': 1}, 29100, 7000),
+           'C3H8': (5, {'CO2': 3, 'H2O': 4}, 245800, 8500),
+           'CH4': (2, {'CO2': 1, 'H2O': 2}, 96460, 9500)}
 G_AIR = {'N2': 0.79, 'O2': 0.21}
-G_MATS = [('WALL', None), ('IGNITER', None), ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
+# solid kinds: (name, strength in atm per cell of thickness (0 = never breaks), color)
+G_SOLIDS = [None, ('WALL', 60, (150, 160, 178)), ('STEEL', 0, (100, 108, 122)),
+            ('GLASS', 4, (150, 210, 225)), ('IGNITER', 60, (235, 125, 30))]
+G_WALL, G_STEEL, G_GLASS, G_IGNITER = 1, 2, 3, 4
+G_BLOCK_COLOR, G_BLOCK_EDGE = (178, 130, 86), (120, 84, 52)
+G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('IGNITER', None),
+          ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
           ('PROPANE', {'C3H8': 1}), ('METHANE', {'CH4': 1}), ('OXYGEN', {'O2': 1}),
           ('HELIUM', {'He': 1}), ('CO2', {'CO2': 1}), ('VACUUM', None)]
+G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER}
 G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE']
 G_K = 0.08          # how hard pressure pushes
 G_DAMP = 0.985      # flow friction
@@ -2024,41 +2032,51 @@ G_DIFF = 0.02       # gases mixing
 G_HEAT = 0.05       # heat conduction
 G_BURN = 0.35       # burn speed once lit
 G_EFF = 0.6         # share of the reaction heat that stays (real flames lose some)
+G_BURN_A = {f: 0.25 / math.exp(-v[3] / 1500) for f, v in G_FUELS.items()}   # 0.25/step at 1500K
+G_BUOY = 1e-3       # how fast light / hot gas rises and heavy gas sinks
+G_PDV = 0.35         # compression heating / expansion cooling
+G_PUSH = 0.01       # how hard pressure shoves blocks
+G_BODY_DENSITY = 1.0
+G_BODY_G = 0.0015   # block gravity
 G_COOL = 0.0004     # hot gas slowly radiating heat away
 G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
 G_VISC = 0.03
 G_HELP = ['tab = circuits', 'lmb = use tool', 'rmb = erase', 'wheel = size',
           'e = ignite', 'space = pause', 'up/dn = speed', 'o = open edges',
-          'a = reset air', 'clr: ctrl+sh+del']
+          'g = gravity', 'a = reset air', 'clr: ctrl+sh+del']
 
 
 class GasSim:
-    # 2d gas grid: each cell has amounts of each gas, a temperature, and flow on its faces
+    # 2d gas grid: each cell has amounts of each gas, a temperature, and flow on its faces.
+    # walls are static cells, BLOCKs are rigid boxes that get shoved around by the gas
     def __init__(self):
         S = len(G_SPECIES)
         self.W2, self.H2 = GW + 2, GH + 2       # one ghost cell around the edge
         shape = (self.W2, self.H2)
         self.n = np.zeros((S,) + shape, np.float32)     # 1.0 = 1 atm worth at 20C
         self.T = np.full(shape, 293.0, np.float32)
-        self.solid = np.zeros(shape, bool)
-        self.ign = np.zeros(shape, bool)
+        self.kind = np.zeros(shape, np.uint8)           # 0 gas, else index into G_SOLIDS
+        self.strength = np.zeros(shape, np.float32)     # atm per cell of thickness, 0 = never breaks
+        self.solid = np.zeros(shape, bool)              # walls + blocks, what the gas sees
         self.u = np.zeros((self.W2 - 1, self.H2), np.float32)
         self.v = np.zeros((self.W2, self.H2 - 1), np.float32)
         self.ring = np.ones(shape, bool)
         self.ring[1:-1, 1:-1] = False
         self.open = True                        # edges open to the outside air
+        self.gravity = True
         self.spark = 0
         self.spark_mask = None
-        self.near_wall = None       # cells touching a wall, redone when walls change
-        self.active = {0, 1}        # which gases are present (index into G_SPECIES)
+        self.near_wall = None
+        self.active = {0, 1}                    # which gases exist (index into G_SPECIES)
         self.age = 0
-        self.cv = np.array(G_CV, np.float32)[:, None, None]
+        self.bodies = []                        # moving blocks
+        self.debris = []                        # [x, y, vx, vy, life, color] bits of broken walls
         self.cvv = np.array(G_CV, np.float32)
-        self.M = np.array(G_MASS, np.float32)[:, None, None]
         self.Mv = np.array(G_MASS, np.float32)
         self.amb = self.mix(G_AIR)
         X, Y = np.meshgrid(np.arange(self.W2), np.arange(self.H2), indexing='ij')
         self.X, self.Y = X.astype(np.float32), Y.astype(np.float32)
+        self.update_ambient()
         self.reset_air()
 
     def mix(self, comp):
@@ -2067,18 +2085,40 @@ class GasSim:
             v[G_IDX[k]] = f
         return v
 
+    def update_ambient(self):
+        # outside air is a bit denser at the bottom when gravity is on
+        self.amb_field = self.amb[:, None, None] * np.ones((1, 1, self.H2), np.float32)
+        self.amb_ring = np.broadcast_to(self.amb_field, self.n.shape)[:, self.ring].copy()
+
     def reset_air(self):
-        self.n[:] = self.amb[:, None, None]
+        self.n[:] = self.amb_field
         self.T[:] = 293
         self.n[:, self.solid] = 0
         self.u[:] = 0
         self.v[:] = 0
+        self.active = {0, 1}
 
     def clear(self):
-        self.near_wall = None
-        self.solid[:] = False
-        self.ign[:] = False
+        self.kind[:] = 0
+        self.strength[:] = 0
+        self.bodies = []
+        self.debris = []
+        self.rebuild()
         self.reset_air()
+
+    def rebuild(self):
+        sol = self.kind > 0
+        for b in self.bodies:
+            sol[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']] = True
+        self.solid = sol
+        self.near_wall = None
+
+    def body_mask(self, skip=None):
+        m = np.zeros(self.solid.shape, bool)
+        for b in self.bodies:
+            if b is not skip:
+                m[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']] = True
+        return m
 
     # editing
     def add_gas(self, mask, comp, amount):
@@ -2097,23 +2137,38 @@ class GasSim:
         mask = mask & ~self.solid
         self.n[:, mask] *= keep
 
-    def set_solid(self, mask, igniter):
-        mask = mask & ~self.ring
-        self.solid[mask] = True
-        self.ign[mask] = igniter
-        self.near_wall = None
+    def set_solid(self, mask, kind):
+        mask = mask & ~self.ring & ~self.body_mask()
+        self.kind[mask] = kind
+        self.strength[mask] = G_SOLIDS[kind][1]
         self.n[:, mask] = 0
         self.T[mask] = 293
+        self.rebuild()
 
     def erase(self, mask):
-        mask = mask & ~self.ring & self.solid
-        self.solid[mask] = False
-        self.ign[mask] = False
-        self.near_wall = None
-        self.T[mask] = 293      # the hole starts empty and gas rushes in
+        mask = mask & ~self.ring
+        hit = mask & (self.kind > 0)
+        self.kind[hit] = 0
+        self.strength[hit] = 0
+        self.T[hit] = 293      # the hole starts empty and gas rushes in
+        self.bodies = [b for b in self.bodies
+                       if not mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]
+        self.rebuild()
+
+    def add_body(self, x0, y0, x1, y1):
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        w, h = x1 - x0 + 1, y1 - y0 + 1
+        if self.solid[x0:x1 + 1, y0:y1 + 1].any() or w * h < 1:
+            return False
+        self.n[:, x0:x1 + 1, y0:y1 + 1] = 0
+        self.bodies.append(dict(x=x0, y=y0, w=w, h=h, vx=0.0, vy=0.0, fx=0.0, fy=0.0))
+        self.rebuild()
+        return True
 
     def ignite(self):
-        m = self.ign.copy()
+        ign = self.kind == G_IGNITER
+        m = ign.copy()
         for _ in range(2):
             g = m.copy()
             g[1:] |= m[:-1]
@@ -2124,19 +2179,158 @@ class GasSim:
         self.spark_mask = m & ~self.solid
         self.spark = 8
 
+    # moving blocks
+    def merge_gas(self, sx, sy, dx, dy):
+        # pour the gas of cells (sx, sy) into cells (dx, dy), keeping the heat right
+        if len(sx) == 0:
+            return
+        cs = self.cvv @ self.n[:, sx, sy]
+        cd = self.cvv @ self.n[:, dx, dy]
+        e = cs * self.T[sx, sy] + cd * self.T[dx, dy]
+        self.n[:, dx, dy] += self.n[:, sx, sy]
+        self.n[:, sx, sy] = 0
+        self.T[dx, dy] = np.where(cs + cd > 1e-6, e / np.maximum(cs + cd, 1e-6), 293)
+
+    def try_move(self, b, dx, dy):
+        x, y, w, h = b['x'], b['y'], b['w'], b['h']
+        if dx:
+            lead = x + w if dx > 0 else x - 1
+            trail = x if dx > 0 else x + w - 1
+            rows = np.arange(y, y + h)
+            lx, ly = np.full(h, lead), rows
+            tx, ty = np.full(h, trail), rows
+            bx, by = np.full(h, lead + dx), rows
+        else:
+            lead = y + h if dy > 0 else y - 1
+            trail = y if dy > 0 else y + h - 1
+            cols = np.arange(x, x + w)
+            lx, ly = cols, np.full(w, lead)
+            tx, ty = cols, np.full(w, trail)
+            bx, by = cols, np.full(w, lead + dy)
+        if (self.solid[lx, ly] | self.ring[lx, ly]).any():
+            return False
+        # free the trailing edge, push the gas in front ahead (or behind if it's boxed in)
+        self.solid[tx, ty] = False
+        ok = ~(self.solid[bx, by] | self.ring[bx, by])
+        self.merge_gas(lx[ok], ly[ok], bx[ok], by[ok])
+        self.merge_gas(lx[~ok], ly[~ok], tx[~ok], ty[~ok])
+        self.solid[lx, ly] = True
+        self.T[lx, ly] = 293
+        b['x'] += dx
+        b['y'] += dy
+        self.near_wall = None
+        return True
+
+    def move_bodies(self, p):
+        for b in self.bodies:
+            x, y, w, h = b['x'], b['y'], b['w'], b['h']
+            mass = w * h * G_BODY_DENSITY
+            # pressure on each side (gas cells only)
+            def side(xs, ys):
+                return float((p[xs, ys] * ~self.solid[xs, ys]).sum())
+            fx = side(x - 1, slice(y, y + h)) - side(x + w, slice(y, y + h))
+            fy = side(slice(x, x + w), y - 1) - side(slice(x, x + w), y + h)
+            b['vx'] = (b['vx'] + fx * G_PUSH / mass) * 0.998
+            b['vy'] = (b['vy'] + fy * G_PUSH / mass + (G_BODY_G if self.gravity else 0)) * 0.998
+            b['vx'] = max(-0.9, min(0.9, b['vx']))
+            b['vy'] = max(-0.9, min(0.9, b['vy']))
+            for axis in ('x', 'y'):
+                vk, fk = 'v' + axis, 'f' + axis
+                b[fk] += b[vk]
+                while abs(b[fk]) >= 1:
+                    d = 1 if b[fk] > 0 else -1
+                    moved = self.try_move(b, d, 0) if axis == 'x' else self.try_move(b, 0, d)
+                    if not moved:
+                        b[vk] *= -0.25          # bonk
+                        b[fk] = 0.0
+                        if axis == 'y':
+                            b['vx'] *= 0.9      # friction on the floor
+                        break
+                    b[fk] -= d
+
+    # walls cracking
+    def check_breaks(self, p):
+        brk_full = self.strength > 0
+        if not brk_full.any():
+            return
+        # only look at the area around breakable walls
+        xs, ys = np.nonzero(brk_full)
+        x0, x1 = max(0, xs.min() - 8), min(self.W2, xs.max() + 9)
+        y0, y1 = max(0, ys.min() - 8), min(self.H2, ys.max() + 9)
+        box = (slice(x0, x1), slice(y0, y1))
+        p = p[box]
+        brk = brk_full[box]
+        gas = ~self.solid[box]
+        wall = self.kind[box] > 0
+        load = np.zeros_like(p)
+        for d, axis in ((1, 0), (-1, 0), (1, 1), (-1, 1)):
+            pg = np.roll(p, d, axis)            # pressure on the near side
+            g_ok = np.roll(gas, d, axis)
+            # how thick the wall is going away from that gas (up to 6)
+            t = np.ones_like(p)
+            cont = wall.copy()
+            pb = np.ones_like(p)
+            found = np.zeros(p.shape, bool)
+            for k in range(1, 7):
+                nxt_wall = np.roll(wall, -k * d, axis)
+                nxt_gas = np.roll(gas, -k * d, axis)
+                hit = cont & ~nxt_wall & ~found
+                pb = np.where(hit & nxt_gas, np.roll(p, -k * d, axis), pb)
+                found |= hit
+                cont = cont & nxt_wall
+                t += cont
+            l = np.where(g_ok & wall, (pg - pb) / t, 0)
+            np.maximum(load, l, out=load)
+        broken = np.zeros_like(brk_full)
+        broken[box] = brk & (load > self.strength[box])
+        broken &= ~self.ring
+        if broken.any():
+            xs, ys = np.nonzero(broken)
+            for x, y in zip(xs.tolist(), ys.tolist()):
+                if len(self.debris) < 600:
+                    col = G_SOLIDS[int(self.kind[x, y])][2]
+                    uu = float(self.u[min(x, self.W2 - 2), y] if x < self.W2 - 1 else 0)
+                    vv = float(self.v[x, min(y, self.H2 - 2)])
+                    self.debris.append([x + 0.5, y + 0.5, uu * 2 + random.uniform(-0.3, 0.3),
+                                        vv * 2 + random.uniform(-0.3, 0.3), 2.0, col])
+            self.kind[broken] = 0
+            self.strength[broken] = 0
+            self.rebuild()
+
+    def move_debris(self, steps, dt):
+        alive = []
+        for d in self.debris:
+            d[0] += d[2] * steps
+            d[1] += d[3] * steps
+            d[3] += 0.002 * steps if self.gravity else 0
+            d[2] *= 0.995 ** steps
+            d[4] -= dt
+            if d[4] > 0 and 0 <= d[0] < self.W2 and 0 <= d[1] < self.H2:
+                alive.append(d)
+        self.debris = alive
+
     # physics
     def step(self):
         n, T, sol = self.n, self.T, self.solid
         ring = self.ring
         if self.open:
             sol[ring] = False
-            n[:, ring] = self.amb[:, None]
+            n[:, ring] = self.amb_ring
             T[ring] = 293
         else:
             sol[ring] = True
             n[:, ring] = 0
-        # only push around the gases that actually exist right now (much faster)
         self.age += 1
+        # blocks and cracking walls work on the whole grid before the gas moves
+        if self.bodies or (self.age % 4 == 0 and self.strength.any()):
+            p0 = n.sum(0) * T / 293
+            if self.bodies:
+                self.move_bodies(p0)
+            if self.age % 4 == 0:
+                self.check_breaks(p0)    # walls crack when the pressure across them is too much
+            sol = self.solid
+            n[:, sol] = 0
+        # only push around the gases that actually exist right now (much faster)
         if self.age % 120 == 0:
             live = n.reshape(n.shape[0], -1).max(1) > 1e-7
             self.active = set(np.nonzero(live)[0].tolist()) | ({0, 1} if self.open else set())
@@ -2152,13 +2346,17 @@ class GasSim:
         ox = ~sol[:-1] & ~sol[1:]
         oy = ~sol[:, :-1] & ~sol[:, 1:]
         u, v = self.u, self.v
-        # pressure pushes the flow, friction slows it
-        # capped so light or very hot gas can't overshoot into a checkerboard
-        ku = np.minimum(G_K / (0.5 * (rho[:-1] + rho[1:])), 0.3 / (np.maximum(p[:-1], p[1:]) + 1e-3))
-        kv = np.minimum(G_K / (0.5 * (rho[:, :-1] + rho[:, 1:])), 0.3 / (np.maximum(p[:, :-1], p[:, 1:]) + 1e-3))
+        # pressure pushes the flow (capped so it can't overshoot into a checkerboard)
+        ku = np.minimum(G_K / (0.5 * (rho[:-1] + rho[1:])), 0.25 / (np.maximum(p[:-1], p[1:]) + 1e-3))
+        kv = np.minimum(G_K / (0.5 * (rho[:, :-1] + rho[:, 1:])), 0.25 / (np.maximum(p[:, :-1], p[:, 1:]) + 1e-3))
         u += ku * (p[:-1] - p[1:])
         v += kv * (p[:, :-1] - p[:, 1:])
-        # a little viscosity keeps jets smooth instead of checkered
+        if self.gravity:
+            # buoyancy: gas lighter than air would be at that pressure floats, heavier sinks
+            rf = 0.5 * (rho[:, :-1] + rho[:, 1:])
+            pf = 0.5 * (p[:, :-1] + p[:, 1:])
+            v += G_BUOY * np.clip((rf - 0.02 - pf) / rf, -3, 3) * (pf > 0.05)
+        # viscosity keeps jets smooth
         uu, vv = u.copy(), v.copy()
         u[1:-1] += G_VISC * (uu[:-2] + uu[2:] - 2 * uu[1:-1])
         u[:, 1:-1] += G_VISC * (uu[:, :-2] + uu[:, 2:] - 2 * uu[:, 1:-1])
@@ -2166,9 +2364,9 @@ class GasSim:
         v[:, 1:-1] += G_VISC * (vv[:, :-2] + vv[:, 2:] - 2 * vv[:, 1:-1])
         u *= G_DAMP * ox
         v *= G_DAMP * oy
-        np.clip(u, -0.45, 0.45, out=u)
-        np.clip(v, -0.45, 0.45, out=v)
-        # never move more than 80% of a cell out in one step
+        np.clip(u, -0.4, 0.4, out=u)
+        np.clip(v, -0.4, 0.4, out=v)
+        # never move more than 70% of a cell out in one step
         up, un = np.maximum(u, 0), np.minimum(u, 0)
         vp, vn = np.maximum(v, 0), np.minimum(v, 0)
         out = np.zeros_like(T)
@@ -2176,7 +2374,7 @@ class GasSim:
         out[1:] -= un
         out[:, :-1] += vp
         out[:, 1:] -= vn
-        s = np.minimum(1.0, 0.8 / (out + 1e-9))
+        s = np.minimum(1.0, 0.7 / (out + 1e-9))
         # flux = (what leaves the left cell) - (what leaves the right cell), upwind + mixing
         dx = G_DIFF * ox
         dy = G_DIFF * oy
@@ -2185,6 +2383,16 @@ class GasSim:
         bl = vp * s[:, :-1] + dy
         br = vn * s[:, 1:] - dy
         E = C * T
+        # squeezing gas heats it, letting it expand cools it (p dV work)
+        ue = up * s[:-1] + un * s[1:]
+        ve = vp * s[:, :-1] + vn * s[:, 1:]
+        div = np.zeros_like(T)
+        div[:-1] += ue
+        div[1:] -= ue
+        div[:, :-1] += ve
+        div[:, 1:] -= ve
+        E -= G_PDV * flat.sum(0).reshape(T.shape) * T * div
+        np.maximum(E, 0, out=E)
         fx = n[:, :-1] * al + n[:, 1:] * ar
         fy = n[:, :, :-1] * bl + n[:, :, 1:] * br
         hx = G_HEAT * np.minimum(C[:-1], C[1:]) * ox
@@ -2207,22 +2415,23 @@ class GasSim:
         S = n.shape[0]
         # sparks from igniters
         if self.spark > 0 and self.spark_mask is not None:
-            T[self.spark_mask] = np.maximum(T[self.spark_mask], 1800)
+            T[self.spark_mask] = np.maximum(T[self.spark_mask], 1900)
             self.spark -= 1
-        # burning
-        if (T > 700).any():
+        # burning: reaction speed climbs steeply with temperature (arrhenius)
+        if (T > 650).any():
             o2 = G_IDX['O2']
-            for f, (nu, prods, dh, tign) in G_FUELS.items():
+            for f, (nu, prods, dh, ta) in G_FUELS.items():
                 fi = G_IDX[f]
-                m = (T > tign) & (n[fi] > 1e-5) & (n[o2] > 1e-5)
+                m = (T > 650) & (n[fi] > 1e-5) & (n[o2] > 1e-5)
                 if not m.any():
                     continue
-                b = np.where(m, G_BURN * np.minimum(n[fi], n[o2] / nu), 0)
+                k = np.minimum(G_BURN, G_BURN_A[f] * np.exp(-ta / np.maximum(T, 1)))
+                b = np.where(m, k * np.minimum(n[fi], n[o2] / nu), 0)
                 e = (self.cvv @ n.reshape(S, -1)).reshape(T.shape) * T + b * dh * G_EFF
                 n[fi] -= b
                 n[o2] -= nu * b
-                for pr, k in prods.items():
-                    n[G_IDX[pr]] += k * b
+                for pr, kk in prods.items():
+                    n[G_IDX[pr]] += kk * b
                     self.active.add(G_IDX[pr])
                 C = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
                 T[:] = np.where(C > 1e-5, e / np.maximum(C, 1e-5), 293)
@@ -2248,21 +2457,30 @@ class GasSim:
         frac = n / np.maximum(ntot, 1e-6)
         col = np.tensordot(frac, np.array(G_COLOR, np.float32), axes=(0, 0))
         col *= (0.2 + 0.8 * np.clip(p, 0, 1) ** 0.6)[..., None]
-        red = np.clip((p - 1.05) / 5, 0, 1)[..., None]
+        red = np.clip((p - 1.15) / 5, 0, 1)[..., None]
         col = col * (1 - red) + np.array([235, 40, 30], np.float32) * red
         heat = np.clip((T - 500) / 1500, 0, 1)[..., None]
         hot = np.clip((T - 1500) / 1500, 0, 1)[..., None]
         flame = np.array([255, 120, 20], np.float32) * (1 - hot) + np.array([255, 235, 170], np.float32) * hot
         col = col * (1 - heat) + flame * heat
         col[ntot < 1e-3] = (6, 8, 16)
-        col[self.solid[1:-1, 1:-1]] = (150, 160, 178)
-        col[self.ign[1:-1, 1:-1]] = (235, 125, 30)
+        kind = self.kind[1:-1, 1:-1]
+        for i in range(1, len(G_SOLIDS)):
+            col[kind == i] = G_SOLIDS[i][2]
+        for b in self.bodies:
+            x, y, w, h = b['x'] - 1, b['y'] - 1, b['w'], b['h']
+            col[x:x + w, y:y + h] = G_BLOCK_EDGE
+            if w > 2 and h > 2:
+                col[x + 1:x + w - 1, y + 1:y + h - 1] = G_BLOCK_COLOR
         return np.clip(col, 0, 255).astype(np.uint8)
 
     def info(self, cx, cy):
         x, y = cx + 1, cy + 1
+        if self.kind[x, y]:
+            name, st, _ = G_SOLIDS[int(self.kind[x, y])]
+            return name.lower() + (f'  holds {st:.0f} atm/cell' if st else '  unbreakable')
         if self.solid[x, y]:
-            return 'igniter' if self.ign[x, y] else 'wall'
+            return 'block'
         n = self.n[:, x, y]
         tot = float(n.sum())
         if tot < 1e-3:
@@ -2274,9 +2492,11 @@ class GasSim:
 
     def save(self, path):
         tmp = path + '.tmp'
+        bodies = np.array([[b['x'], b['y'], b['w'], b['h'], b['vx'], b['vy']] for b in self.bodies],
+                          np.float32).reshape(-1, 6)
         with open(tmp, 'wb') as f:
-            np.savez_compressed(f, n=self.n, T=self.T, solid=self.solid, ign=self.ign,
-                                open=np.array(self.open))
+            np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
+                                bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity))
         os.replace(tmp, path)
 
     def load(self, path):
@@ -2285,10 +2505,23 @@ class GasSim:
                 return
             self.n[:] = d['n']
             self.T[:] = d['T']
-            self.solid[:] = d['solid']
-            self.ign[:] = d['ign']
+            if 'kind' in d:
+                self.kind[:] = d['kind']
+                self.strength[:] = d['strength']
+            else:       # first gas lab version: plain walls + igniters
+                self.kind[:] = np.where(d['solid'], G_WALL, 0)
+                self.kind[d['ign']] = G_IGNITER
+                self.strength[:] = np.array([0] + [s[1] for s in G_SOLIDS[1:]], np.float32)[self.kind]
+            self.bodies = []
+            if 'bodies' in d:
+                for x, y, w, h, vx, vy in d['bodies'].tolist():
+                    self.bodies.append(dict(x=int(x), y=int(y), w=int(w), h=int(h), vx=vx, vy=vy,
+                                            fx=0.0, fy=0.0))
             self.open = bool(d['open'])
-            self.near_wall = None
+            if 'gravity' in d:
+                self.gravity = bool(d['gravity'])
+            self.update_ambient()
+            self.rebuild()
             live = self.n.reshape(self.n.shape[0], -1).max(1) > 1e-7
             self.active = set(np.nonzero(live)[0].tolist()) | {0, 1}
 
@@ -2380,8 +2613,10 @@ class GasMode:
         sim = self.sim
         if erase or self.tool == 'ERASE':
             sim.erase(mask)
-        elif self.mat in ('WALL', 'IGNITER'):
-            sim.set_solid(mask, self.mat == 'IGNITER')
+        elif self.mat in G_SOLID_MATS:
+            sim.set_solid(mask, G_SOLID_MATS[self.mat])
+        elif self.mat == 'BLOCK':
+            self.app.say('draw blocks with RECT')
         elif self.mat == 'VACUUM':
             sim.drain(mask, 0.5 if amount < 1 else 0.0)
         else:
@@ -2417,6 +2652,10 @@ class GasMode:
             elif k == pygame.K_o:
                 self.sim.open = not self.sim.open
                 self.dirty = True
+            elif k == pygame.K_g:
+                self.sim.gravity = not self.sim.gravity
+                self.sim.update_ambient()
+                self.dirty = True
             elif k == pygame.K_a:
                 self.sim.reset_air()
                 self.dirty = True
@@ -2450,8 +2689,14 @@ class GasMode:
             if d['tool'] == 'LINE':
                 self.apply(self.seg_mask(d['start'], d['cur'], self.size), 1.0)
             elif d['tool'] == 'RECT':
-                solid = self.mat in ('WALL', 'IGNITER')
-                self.apply(self.rect_mask(d['start'], d['cur'], solid), 1.0)
+                if self.mat == 'BLOCK':
+                    (ax, ay), (bx, by) = d['start'], d['cur']
+                    if not self.sim.add_body(ax + 1, ay + 1, bx + 1, by + 1):
+                        self.app.say('block needs empty space')
+                    self.dirty = True
+                else:
+                    solid = self.mat in G_SOLID_MATS
+                    self.apply(self.rect_mask(d['start'], d['cur'], solid), 1.0)
         return None
 
     def update(self, dt):
@@ -2462,10 +2707,13 @@ class GasMode:
             d['last'] = d['cur']
         if not self.paused:
             t0 = time.perf_counter()
+            done = 0
             for _ in range(self.speed):
                 self.sim.step()
+                done += 1
                 if time.perf_counter() - t0 > 0.014:
                     break       # slow pc: keep the frame rate, run the sim slower
+            self.sim.move_debris(done, dt)
             self.dirty = True
 
     def save(self):
@@ -2490,6 +2738,9 @@ class GasMode:
         if self.cs != 1:
             img = pygame.transform.scale(img, (GW * self.cs, GH * self.cs))
         surf.blit(img, (self.x0, self.y0))
+        ds = max(2, self.cs)
+        for d in self.sim.debris:
+            surf.fill(d[5], (self.x0 + int((d[0] - 1) * self.cs), self.y0 + int((d[1] - 1) * self.cs), ds, ds))
         pygame.draw.rect(surf, PANEL_LINE if self.sim.open else SEL,
                          (self.x0 - 1, self.y0 - 1, GW * self.cs + 2, GH * self.cs + 2), 1)
         cs = self.cs
@@ -2536,14 +2787,24 @@ class GasMode:
                 sw = tuple(int(sum(G_COLOR[G_IDX[s]][ch] * f for s, f in comp.items()) * 1.4) for ch in range(3))
                 sw = tuple(min(255, x) for x in sw)
             else:
-                sw = {'WALL': (150, 160, 178), 'IGNITER': (235, 125, 30)}.get(m, (6, 8, 16))
+                sw = G_SOLIDS[G_SOLID_MATS[m]][2] if m in G_SOLID_MATS else \
+                    (G_BLOCK_COLOR if m == 'BLOCK' else (6, 8, 16))
             pygame.draw.rect(surf, sw, (r.x, r.y, 4, r.h))
             surf.blit(self.app.small.render(m, True, TEXT), (r.x + 10, r.y + 2))
         hy = H - (len(G_HELP) * 15 + 30)
         for i, t in enumerate(G_HELP):
             surf.blit(self.app.small.render(t, True, TEXT_DIM), (12, hy + i * 15))
-        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if self.sim.open else '  closed')
+        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if self.sim.open else '  closed') \
+            + ('' if self.sim.gravity else '  no g')
         surf.blit(self.app.small.render(st, True, SEL if self.paused else TEXT), (12, H - 22))
+        msg, until = self.app.toast
+        if msg and time.time() < until:
+            t = self.app.font.render(msg, True, TEXT)
+            tr = pygame.Rect(0, 0, t.get_width() + 24, t.get_height() + 14)
+            tr.midtop = ((W + PAL_W) // 2, 12)
+            pygame.draw.rect(surf, PANEL, tr)
+            pygame.draw.rect(surf, SEL, tr, 1)
+            surf.blit(t, t.get_rect(center=tr.center))
 
 
 def main():
