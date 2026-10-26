@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # logic gate sandbox
+import colorsys
 import hashlib
+import heapq
+import math
 import json
 import os
 import ssl
@@ -10,6 +13,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zlib
+from collections import deque
 import pygame
 
 C = 24              # cell size
@@ -25,6 +30,9 @@ MAX_DEPTH = 5       # chips inside chips, this many levels
 MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
 CAMX = CAMY = 0.0   # world pixel under the top-left of the work area
 ZOOM = 1.0
+DPER = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]   # delay / extender lengths
+RU = 12             # wire router grid, half a cell
+MARGIN = 15         # wires keep this far from parts when they can
 PERIODS = [5, 10, 25, 50, 100, 250, 500, 1000]   # clock half-periods in ticks
 MONO = 'dejavusansmono,consolas,couriernew,menlo,monospace'
 FONT = None         # set by App, used to size LABEL parts
@@ -169,6 +177,8 @@ DEFS = {
     'BUTTON':  ONE_IN,                                  # passes signal for 1 tick
     'GATE':    dict(w=3, h=2, pins=[(0, 1, 'in'), (3, 1, 'out'), (1, 0, 'in')]),  # EN on top
     'CLOCK':   dict(w=3, h=2, pins=[(3, 1, 'out')]),    # blinks, click to change speed
+    'DELAY':   dict(w=3, h=2, pins=[(0, 1, 'in'), (3, 1, 'out')]),    # same signal, N ticks late
+    'EXTENDER': dict(w=3, h=2, pins=[(0, 1, 'in'), (3, 1, 'out')]),   # keeps it high N ticks longer
     'LAMP':    dict(w=2, h=2, pins=[(0, 1, 'in')]),
     'LABEL':   dict(w=1, h=1, pins=[]),                 # just text, no ports
     # touch display: a display you can click, pulses OUT when clicked
@@ -192,7 +202,7 @@ NAMES = {'DISPLAY': ['R', 'G', 'B'], 'TOUCH': ['R', 'G', 'B', 'OUT'], 'GATE': ['
                   'RED', 'GREEN', 'BLUE']}
 
 PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', 'TOUCH', '7SEG',
-             'NOT', 'BUF', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
+             'NOT', 'BUF', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
              'SR LATCH', 'NV LATCH', 'PIN', 'LABEL']
 
 HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
@@ -262,6 +272,7 @@ class Part:
         self.counter = 0        # clock ticks since last flip
         self.label_on = None    # switch names, one per state
         self.label_off = None
+        self.buf = None         # delay: the signals still on their way
         self.desc = None        # body text, None = default
         self.desc_on = None     # switch: one per state
         self.desc_off = None
@@ -277,6 +288,19 @@ class Part:
             w = label_w(self.label if self.label is not None else 'LABEL') * C
         x, y = w2s(self.gx * C, self.gy * C)
         return pygame.Rect(round(x), round(y), round(w * ZOOM), round(self.d['h'] * C * ZOOM))
+
+    def pin_world(self, i):
+        dx, dy, _ = self.d['pins'][i]
+        return ((self.gx + dx) * C, (self.gy + dy) * C)
+
+    def exit_dir(self, i):
+        # which way a wire should leave this pin
+        dx, dy, _ = self.d['pins'][i]
+        if dx == 0:
+            return (-1, 0)
+        if dx == self.d['w']:
+            return (1, 0)
+        return (0, -1) if dy == 0 else (0, 1)
 
     def pin_pos(self, i):
         dx, dy, _ = self.d['pins'][i]
@@ -517,6 +541,11 @@ class App:
         self.wire_root = []
         self.pulses = {}
         self.pending = {}
+        self.obs_ver = None     # wire routes are redone when parts move
+        self.blocked = None
+        self.routes = {}
+        self.route_budget = 12
+        self.tint_cache = {}
         self.sim_parts = []     # every real part, chip insides included
         self.toast = ('', 0.0)
         self.view_moved = False
@@ -637,7 +666,7 @@ class App:
             if wi >= len(self.wires):
                 continue
             pa, ia, pb, ib = self.wires[wi]
-            length = poly_len(wire_pts(pa.pin_pos(ia), pb.pin_pos(ib)))
+            length = poly_len(self.wire_screen(self.wires[wi]))
             ps = self.pulses.setdefault(wi, [])
             for p in ps:
                 p[0] += TUBE_SPEED * dt
@@ -678,6 +707,25 @@ class App:
                 if p.counter >= PERIODS[p.pidx]:
                     p.counter = 0
                     new.append((p, 1 - p.out))
+            elif k == 'DELAY':
+                n = DPER[p.pidx] - 1
+                v = int(hi(p, 0))
+                if n <= 0:
+                    new.append((p, v))
+                else:
+                    if p.buf is None or len(p.buf) != n:
+                        p.buf = deque([0] * n)
+                    p.buf.append(v)
+                    new.append((p, p.buf.popleft()))
+            elif k == 'EXTENDER':
+                if hi(p, 0):
+                    p.counter = DPER[p.pidx] - 1
+                    new.append((p, 1))
+                elif p.counter > 0:
+                    p.counter -= 1
+                    new.append((p, 1))
+                else:
+                    new.append((p, 0))
             elif k in ('SR LATCH', 'NV LATCH'):
                 # reset wins if both are high
                 new.append((p, 0 if hi(p, 1) else (1 if hi(p, 0) else p.out)))
@@ -707,6 +755,10 @@ class App:
                 p.pulse = False
 
     def update(self, dt):
+        self.route_budget = 12
+        self.update_obstacles()
+        if len(self.routes) > 2 * len(self.wires) + 50:
+            self.routes.clear()
         for p in self.parts:
             p.flash = max(0.0, p.flash - dt)
         if self.paused:
@@ -728,6 +780,115 @@ class App:
             n += 1
         if n == 400:
             self.acc = 0.0
+
+    # ------------------------------------------------------------ wire routing
+    def update_obstacles(self):
+        ver = hash(tuple((p.uid, p.gx, p.gy) for p in self.parts if p.kind != 'LABEL'))
+        if ver != self.obs_ver:
+            self.obs_ver = ver
+            self.blocked = None
+
+    def blocked_set(self):
+        if self.blocked is None:
+            b = set()
+            for p in self.parts:
+                if p.kind == 'LABEL':
+                    continue
+                x0, y0 = p.gx * C - MARGIN, p.gy * C - MARGIN
+                x1, y1 = (p.gx + p.d['w']) * C + MARGIN, (p.gy + p.d['h']) * C + MARGIN
+                for ix in range(math.floor(x0 / RU) + 1, math.ceil(x1 / RU)):
+                    for iy in range(math.floor(y0 / RU) + 1, math.ceil(y1 / RU)):
+                        b.add((ix, iy))
+            self.blocked = b
+        return self.blocked
+
+    def route_world(self, w):
+        # orthogonal path around parts (world px), or None if there's no room
+        pa, ia, pb, ib = w
+        a, b = pa.pin_world(ia), pb.pin_world(ib)
+        da, db = pa.exit_dir(ia), pb.exit_dir(ib)
+        sa = ((a[0] + da[0] * C) // RU, (a[1] + da[1] * C) // RU)
+        sb = ((b[0] + db[0] * C) // RU, (b[1] + db[1] * C) // RU)
+        blocked = self.blocked_set()
+        if sa in blocked or sb in blocked:
+            return None
+        lo = (min(sa[0], sb[0]) - 14, min(sa[1], sb[1]) - 14)
+        hi = (max(sa[0], sb[0]) + 14, max(sa[1], sb[1]) + 14)
+        dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        start = (sa[0], sa[1], dirs.index(da))
+        heap = [(abs(sa[0] - sb[0]) + abs(sa[1] - sb[1]), 0, start)]
+        best, parent, n, end = {start: 0}, {}, 0, None
+        while heap:
+            f, g, st = heapq.heappop(heap)
+            if g > best.get(st, 1e9):
+                continue
+            x, y, d = st
+            if (x, y) == sb:
+                end = st
+                break
+            n += 1
+            if n > 5000:
+                return None
+            for nd, (dx, dy) in enumerate(dirs):
+                if nd == d ^ 1:
+                    continue
+                nx, ny = x + dx, y + dy
+                if nx < lo[0] or nx > hi[0] or ny < lo[1] or ny > hi[1] or (nx, ny) in blocked:
+                    continue
+                ng = g + 1 + (0 if nd == d else 3)
+                ns = (nx, ny, nd)
+                if ng < best.get(ns, 1e9):
+                    best[ns] = ng
+                    parent[ns] = st
+                    heapq.heappush(heap, (ng + abs(nx - sb[0]) + abs(ny - sb[1]), ng, ns))
+        if end is None:
+            return None
+        cells = []
+        st = end
+        while st is not None:
+            cells.append((st[0] * RU, st[1] * RU))
+            st = parent.get(st)
+        cells.reverse()
+        pts = [a] + cells + [b]
+        out = [pts[0]]
+        for q in pts[1:]:       # drop points in the middle of straight runs
+            while len(out) >= 2 and ((out[-2][0] == out[-1][0] == q[0]) or (out[-2][1] == out[-1][1] == q[1])):
+                out.pop()
+            if q != out[-1]:
+                out.append(q)
+        return out
+
+    def wire_screen(self, w):
+        pa, ia, pb, ib = w
+        key = (self.obs_ver, pa.pin_world(ia), pb.pin_world(ib))
+        ent = self.routes.get(w)
+        if ent is None or ent[0] != key:
+            dragging = self.drag is not None and self.drag['kind'] == 'part' and self.drag['moved']
+            if dragging or self.route_budget <= 0:
+                ent = None
+            else:
+                self.route_budget -= 1
+                ent = (key, self.route_world(w))
+                self.routes[w] = ent
+        if ent and ent[1]:
+            return [(round(x), round(y)) for x, y in (w2s(*q) for q in ent[1])]
+        return wire_pts(pa.pin_pos(ia), pb.pin_pos(ib))
+
+    def tint(self, w, color):
+        # each wire gets its own slightly different hue
+        pa, ia, pb, ib = w
+        key = (pa.gx, pa.gy, ia, pb.gx, pb.gy, ib, color)
+        c = self.tint_cache.get(key)
+        if c is None:
+            h = zlib.crc32(repr(key[:6]).encode())
+            hh, l, sat = colorsys.rgb_to_hls(*(v / 255 for v in color))
+            hh = (hh + ((h & 255) / 255 - 0.5) * 0.10) % 1
+            l = min(0.9, max(0.3, l + (((h >> 8) & 255) / 255 - 0.5) * 0.14))
+            c = tuple(int(v * 255) for v in colorsys.hls_to_rgb(hh, l, sat))
+            if len(self.tint_cache) > 20000:
+                self.tint_cache.clear()
+            self.tint_cache[key] = c
+        return c
 
     # ------------------------------------------------------------ saving
     @staticmethod
@@ -762,7 +923,7 @@ class App:
         else:
             p = Part(d['kind'], int(d['gx']), int(d['gy']))
         p.on = bool(d.get('on'))
-        p.pidx = max(0, min(len(PERIODS) - 1, int(d.get('pidx', 4))))
+        p.pidx = max(0, min((len(DPER) if p.kind in ('DELAY', 'EXTENDER') else len(PERIODS)) - 1, int(d.get('pidx', 3 if p.kind in ('DELAY', 'EXTENDER') else 4))))
         if p.kind == 'PIN':
             self.set_pin_dir(p, p.on)
             if d.get('label') in ('IN', 'OUT'):     # old saves pinned the default name
@@ -905,7 +1066,7 @@ class App:
 
     def wire_at(self, pos):
         for w in reversed(self.wires):
-            pts = wire_pts(w[0].pin_pos(w[1]), w[2].pin_pos(w[3]))
+            pts = self.wire_screen(w)
             if any(seg_dist(pos, a, b) <= 6 for a, b in zip(pts, pts[1:])):
                 return w
         return None
@@ -1111,6 +1272,9 @@ class App:
             elif h.kind == 'CLOCK':
                 h.pidx = (h.pidx + 1) % len(PERIODS)
                 h.counter = 0
+            elif h.kind in ('DELAY', 'EXTENDER'):
+                h.pidx = (h.pidx + 1) % len(DPER)
+                h.counter, h.buf = 0, None
             elif h.kind == 'PIN':
                 self.set_pin_dir(h, not h.on)
 
@@ -1383,6 +1547,9 @@ class App:
                     p.on = not p.on     # undo the first click's toggle
                 elif p.kind == 'CLOCK':
                     p.pidx = (p.pidx - 1) % len(PERIODS)
+                elif p.kind in ('DELAY', 'EXTENDER'):
+                    p.pidx = (p.pidx - 1) % len(DPER)
+                    p.counter, p.buf = 0, None
                 elif p.kind == 'PIN':
                     self.set_pin_dir(p, not p.on)
                 body = p.kind in DESC_KINDS and e.pos[1] >= p.rect().y + sc(HDR)
@@ -1571,8 +1738,9 @@ class App:
                 b = pygame.Rect(cx - sc(10), cy - sc(5), sc(20), sc(10))
                 pygame.draw.rect(surf, ON if p.flash > 0 else PART_BG, b)
                 pygame.draw.rect(surf, TEXT_DIM, b, 1)
-            elif k == 'CLOCK' and txt:
-                t = self.tiny.render(f'{PERIODS[p.pidx]} ticks', True, TEXT_DIM)
+            elif k in ('CLOCK', 'DELAY', 'EXTENDER') and txt:
+                n = (PERIODS if k == 'CLOCK' else DPER)[p.pidx]
+                t = self.tiny.render(f'{n} ticks', True, TEXT_DIM)
                 surf.blit(t, t.get_rect(center=(cx, cy)))
             elif k == 'PIN':
                 a = sc(7)       # little arrow, signals always go left to right through a pin
@@ -1616,9 +1784,11 @@ class App:
 
         # wires
         for wi, (pa, ia, pb, ib) in enumerate(self.wires):
-            pts = wire_pts(pa.pin_pos(ia), pb.pin_pos(ib))
+            pts = self.wire_screen(self.wires[wi])
             s = drv.get(find(k_(pa, ia)))
             color = self.net_color(s)
+            if s in ({0}, {1}):
+                color = self.tint(self.wires[wi], color)
             w = 1 if not s else (2 if s == {0} else 3)
             draw_wire(surf, pts, color, w)
 
@@ -1627,8 +1797,7 @@ class App:
             for wi, ps in self.pulses.items():
                 if wi >= len(self.wires) or self.flow[wi] is None:
                     continue
-                pa, ia, pb, ib = self.wires[wi]
-                pts = wire_pts(pa.pin_pos(ia), pb.pin_pos(ib))
+                pts = self.wire_screen(self.wires[wi])
                 path = pts if self.flow[wi] else pts[::-1]
                 length = poly_len(pts)
                 for dist, val in ps:
