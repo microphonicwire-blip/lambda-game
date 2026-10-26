@@ -30,10 +30,12 @@ def label_w(text):
 # auto update: set this to "owner/repo" to turn it on, e.g. "max/logicsim"
 GITHUB_REPO = "microphonicwire-blip/lambda-game"
 GITHUB_BRANCH = "main"
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # current.py in the repo is the game itself: it replaces whatever file is running
 REPO_MAIN = "current.py"
-MAIN_LOCAL = os.path.abspath(__file__)
+# other repo files that get synced too (text ones are compared ignoring CRLF)
+TEXT_EXT = ('.py', '.txt', '.json')
+SYNC_EXT = TEXT_EXT + ('.png', '.jpg', '.wav', '.ogg', '.ttf')
+SKIP = ('launcher.py',)     # only used to build the exe
 
 
 def local_path(path):
@@ -55,6 +57,30 @@ def save_path():
 
 def version_path():
     return os.path.join(os.path.dirname(save_path()), 'version.txt')
+
+
+FROZEN = getattr(sys, 'frozen', False)      # running as the packaged exe
+if FROZEN:
+    # the exe can't overwrite itself, so updates live next to the save and the launcher runs them
+    APP_DIR = os.path.join(os.path.dirname(save_path()), 'code')
+    MAIN_LOCAL = os.path.join(APP_DIR, REPO_MAIN)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    MAIN_LOCAL = os.path.abspath(__file__)
+
+
+def read_local(path):
+    try:
+        with open(local_path(path), 'rb') as f:
+            return f.read()
+    except OSError:
+        if FROZEN and path == REPO_MAIN:    # no downloaded copy yet, use the one inside the exe
+            try:
+                with open(os.path.join(sys._MEIPASS, REPO_MAIN), 'rb') as f:
+                    return f.read()
+            except OSError:
+                pass
+        return None
 
 
 def github_token():
@@ -256,15 +282,15 @@ class Updater:
             has_main = any(t['path'] == REPO_MAIN for t in tree['tree'])
             for t in tree['tree']:
                 path = t['path']
-                if t['type'] != 'blob' or not path.endswith('.py') or not safe_repo_path(path):
+                ext = os.path.splitext(path)[1].lower()
+                if t['type'] != 'blob' or ext not in SYNC_EXT or not safe_repo_path(path) \
+                        or os.path.basename(path) in SKIP:
                     continue
                 if has_main and path != REPO_MAIN and local_path(path) == MAIN_LOCAL:
                     continue        # same file as current.py, current.py wins
-                try:
-                    with open(local_path(path), 'rb') as f:
-                        local = f.read().replace(b'\r\n', b'\n')
-                except OSError:
-                    local = None
+                local = read_local(path)
+                if local is not None and ext in TEXT_EXT:
+                    local = local.replace(b'\r\n', b'\n')
                 if local is None or git_blob_sha(local) != t['sha']:
                     todo.append(path)
             if not todo:
@@ -286,7 +312,8 @@ class Updater:
             files = []
             for path in self.todo:
                 data = self._get(f'{api}/contents/{urllib.parse.quote(path)}?ref={self.sha}', raw=True)
-                compile(data, path, 'exec')      # don't install something that can't even parse
+                if path.endswith('.py'):
+                    compile(data, path, 'exec')      # don't install something that can't even parse
                 files.append((path, data))
             for path, data in files:
                 dst = local_path(path)
@@ -909,7 +936,11 @@ def main():
     app.save()
     pygame.quit()
     if restart:     # run the freshly installed version
-        subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        if FROZEN:
+            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')   # fresh unpack for the new process
+            subprocess.Popen([sys.executable] + sys.argv[1:], env=env)
+        else:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
 
 if __name__ == '__main__':
