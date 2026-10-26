@@ -218,6 +218,7 @@ DEFAULT_DESC = {'AND': 'both high', 'OR': 'any high', 'NAND': 'not both', 'NOR':
                 'XOR': 'odd count', 'XNOR': 'even count', 'NOT': 'inverts', 'BUF': 'copies',
                 'SOURCE': 'always on', 'LAMP': 'glows', 'GATE': 'EN opens it',
                 'SR LATCH': 'S sets, R resets', 'NV LATCH': 'remembers', 'BUTTON': '1 pulse'}
+IND_KINDS = ('LAMP', 'DISPLAY', 'TOUCH', '7SEG')
 WIDGET_KINDS = ('SWITCH', 'BUTTON')     # these draw a little control in the body
 
 
@@ -273,6 +274,8 @@ class Part:
         self.label_on = None    # switch names, one per state
         self.label_off = None
         self.buf = None         # delay: the signals still on their way
+        self.inds = []          # chip: lamps/displays inside that it shows
+        self.lw = self.rw = 0   # chip: widest pin names, left and right
         self.desc = None        # body text, None = default
         self.desc_on = None     # switch: one per state
         self.desc_off = None
@@ -789,17 +792,21 @@ class App:
             self.blocked = None
 
     def blocked_set(self):
+        # hard = inside a part (never routed through), soft = its 15px margin (costs extra)
         if self.blocked is None:
-            b = set()
+            hard, soft = set(), set()
             for p in self.parts:
                 if p.kind == 'LABEL':
                     continue
-                x0, y0 = p.gx * C - MARGIN, p.gy * C - MARGIN
-                x1, y1 = (p.gx + p.d['w']) * C + MARGIN, (p.gy + p.d['h']) * C + MARGIN
-                for ix in range(math.floor(x0 / RU) + 1, math.ceil(x1 / RU)):
-                    for iy in range(math.floor(y0 / RU) + 1, math.ceil(y1 / RU)):
-                        b.add((ix, iy))
-            self.blocked = b
+                x0, y0 = p.gx * C, p.gy * C
+                x1, y1 = (p.gx + p.d['w']) * C, (p.gy + p.d['h']) * C
+                for ix in range(math.floor((x0 - MARGIN) / RU) + 1, math.ceil((x1 + MARGIN) / RU)):
+                    for iy in range(math.floor((y0 - MARGIN) / RU) + 1, math.ceil((y1 + MARGIN) / RU)):
+                        if x0 <= ix * RU <= x1 and y0 <= iy * RU <= y1:
+                            hard.add((ix, iy))
+                        else:
+                            soft.add((ix, iy))
+            self.blocked = (hard, soft - hard)
         return self.blocked
 
     def route_world(self, w):
@@ -809,7 +816,7 @@ class App:
         da, db = pa.exit_dir(ia), pb.exit_dir(ib)
         sa = ((a[0] + da[0] * C) // RU, (a[1] + da[1] * C) // RU)
         sb = ((b[0] + db[0] * C) // RU, (b[1] + db[1] * C) // RU)
-        blocked = self.blocked_set()
+        blocked, soft = self.blocked_set()
         if sa in blocked or sb in blocked:
             return None
         lo = (min(sa[0], sb[0]) - 14, min(sa[1], sb[1]) - 14)
@@ -835,7 +842,7 @@ class App:
                 nx, ny = x + dx, y + dy
                 if nx < lo[0] or nx > hi[0] or ny < lo[1] or ny > hi[1] or (nx, ny) in blocked:
                     continue
-                ng = g + 1 + (0 if nd == d else 3)
+                ng = g + 1 + (0 if nd == d else 2) + (4 if (nx, ny) in soft else 0)
                 ns = (nx, ny, nd)
                 if ng < best.get(ns, 1e9):
                     best[ns] = ng
@@ -860,34 +867,41 @@ class App:
 
     def wire_screen(self, w):
         pa, ia, pb, ib = w
-        key = (self.obs_ver, pa.pin_world(ia), pb.pin_world(ib))
+        pins = (pa.pin_world(ia), pb.pin_world(ib))
         ent = self.routes.get(w)
-        if ent is None or ent[0] != key:
+        fresh = ent is not None and ent[0] == self.obs_ver and ent[1] == pins
+        if not fresh:
             dragging = self.drag is not None and self.drag['kind'] == 'part' and self.drag['moved']
-            if dragging or self.route_budget <= 0:
-                ent = None
-            else:
+            same_pins = ent is not None and ent[1] == pins
+            if dragging and same_pins:
+                pass            # wires nobody is touching keep their path while you drag
+            elif self.route_budget > 0:
                 self.route_budget -= 1
-                ent = (key, self.route_world(w))
+                ent = (self.obs_ver, pins, self.route_world(w))
                 self.routes[w] = ent
-        if ent and ent[1]:
-            return [(round(x), round(y)) for x, y in (w2s(*q) for q in ent[1])]
+            elif not same_pins:
+                ent = None      # no time left this frame, plain route for now
+        pts = ent[2] if ent else None
+        if pts:
+            return [(round(x), round(y)) for x, y in (w2s(*q) for q in pts)]
         return wire_pts(pa.pin_pos(ia), pb.pin_pos(ib))
 
-    def tint(self, w, color):
-        # each wire gets its own slightly different hue
+    def tint(self, w, state):
+        # every wire gets its own hue, brightness still says on / off / floating
         pa, ia, pb, ib = w
-        key = (pa.gx, pa.gy, ia, pb.gx, pb.gy, ib, color)
-        c = self.tint_cache.get(key)
+        key = (pa.gx, pa.gy, ia, pb.gx, pb.gy, ib)
+        ck = (key, state, self.light)
+        c = self.tint_cache.get(ck)
         if c is None:
-            h = zlib.crc32(repr(key[:6]).encode())
-            hh, l, sat = colorsys.rgb_to_hls(*(v / 255 for v in color))
-            hh = (hh + ((h & 255) / 255 - 0.5) * 0.10) % 1
-            l = min(0.9, max(0.3, l + (((h >> 8) & 255) / 255 - 0.5) * 0.14))
-            c = tuple(int(v * 255) for v in colorsys.hls_to_rgb(hh, l, sat))
+            hue = (zlib.crc32(repr(key).encode()) % 997) / 997
+            if self.light:
+                l, sat = {'on': (0.38, 1.0), 'off': (0.66, 0.55), 'float': (0.45, 0.25)}[state]
+            else:
+                l, sat = {'on': (0.62, 1.0), 'off': (0.38, 0.65), 'float': (0.64, 0.28)}[state]
+            c = tuple(int(v * 255) for v in colorsys.hls_to_rgb(hue, l, sat))
             if len(self.tint_cache) > 20000:
                 self.tint_cache.clear()
-            self.tint_cache[key] = c
+            self.tint_cache[ck] = c
         return c
 
     # ------------------------------------------------------------ saving
@@ -966,8 +980,20 @@ class App:
         nl = len(ins)
         lw = max([len(n) for n in p.pnames[:nl]] or [0])
         rw = max([len(n) for n in p.pnames[nl:]] or [0])
+        # lamps, displays and 7seg digits inside show up in the chip body
+        inds = []
+        for q in sorted(clones, key=lambda c: (c.gy, c.gx)):
+            if q.kind in IND_KINDS:
+                inds.append(q)
+            elif q.kind == 'CHIP':
+                inds.extend(q.inds)
+        p.inds, p.lw, p.rw = inds, lw, rw
         w = max(4, -(-((lw + rw) * 7 + 24) // C))
         h = max(len(ins), len(outs), 1) + 1
+        if inds:
+            cols = min(len(inds), 5)
+            w = max(4, -(-((lw + rw) * 7 + 24) // C) + cols * 2)
+            h = max(h, -(-len(inds) // cols) * 3 + 1)
         p.d = dict(w=w, h=h, pins=[(0, i + 1, 'in') for i in range(len(ins))]
                    + [(w, j + 1, 'out') for j in range(len(outs))])
         p.label = defn.get('name', 'CHIP')
@@ -1663,21 +1689,70 @@ class App:
             return SHORT
         return ON if 1 in s else OFF
 
-    def draw_7seg(self, surf, p, r):
-        hdr = sc(HDR)
-        x0, y0 = r.x + sc(34), r.y + hdr + sc(10)
-        dw, dh, t = sc(68), r.h - hdr - sc(10) - sc(28), sc(9)
+    @staticmethod
+    def seg_rects(x0, y0, dw, dh, t):
         vl = (dh - 3 * t) // 2
-        segs = [(x0 + t, y0, dw - 2 * t, t),                     # a
+        return [(x0 + t, y0, dw - 2 * t, t),                     # a
                 (x0 + dw - t, y0 + t, t, vl),                    # b
                 (x0 + dw - t, y0 + 2 * t + vl, t, vl),           # c
                 (x0 + t, y0 + dh - t, dw - 2 * t, t),            # d
                 (x0, y0 + 2 * t + vl, t, vl),                    # e
                 (x0, y0 + t, t, vl),                             # f
                 (x0 + t, y0 + t + vl, dw - 2 * t, t)]            # g
+
+    def draw_7seg(self, surf, p, r):
+        hdr = sc(HDR)
+        x0, y0 = r.x + sc(34), r.y + hdr + sc(10)
+        segs = self.seg_rects(x0, y0, sc(68), r.h - hdr - sc(10) - sc(28), sc(9))
         color = p.rgb or SEG_DEFAULT
         for i, rect in enumerate(segs):
             pygame.draw.rect(surf, color if p.seg_glow[i] > 0 else SEG_OFF, rect)
+
+    def draw_ind(self, surf, q, cell):
+        # one lamp / display / digit shown inside a chip
+        k = q.kind
+        if k == '7SEG':
+            w = int(min(cell.w - 4, (cell.h - 4) / 1.7))
+            if w < 6:
+                return
+            h = int(w * 1.7)
+            t = max(2, w // 5)
+            segs = self.seg_rects(cell.centerx - w // 2, cell.centery - h // 2, w, h, t)
+            color = q.rgb or SEG_DEFAULT
+            for i, rect in enumerate(segs):
+                pygame.draw.rect(surf, color if q.seg_glow[i] > 0 else SEG_OFF, rect)
+            return
+        side = min(cell.w, cell.h) - 4
+        if side < 4:
+            return
+        box = pygame.Rect(0, 0, side, side)
+        box.center = cell.center
+        if k == 'LAMP':
+            lit = q.glow > 0
+            pygame.draw.rect(surf, LAMP_ON if lit else SEG_OFF, box)
+        else:
+            lit = q.glow > 0 and q.rgb
+            pygame.draw.rect(surf, q.rgb if lit else SEG_OFF, box)
+        pygame.draw.rect(surf, PART_LINE, box, 1)
+
+    def draw_chip_body(self, surf, p, r, hdrh):
+        n = len(p.inds)
+        lp, rp = sc(p.lw * 7 + 10, 4), sc(p.rw * 7 + 10, 4)
+        area = pygame.Rect(r.x + lp, r.y + hdrh + 3, r.w - lp - rp, r.h - hdrh - 6)
+        if n == 0 or area.w < 8 or area.h < 8:
+            return
+        best, bc = -1, 1
+        for cols in range(1, n + 1):
+            rows = -(-n // cols)
+            score = min(area.w / cols, area.h / rows / 1.7)
+            if score > best:
+                best, bc = score, cols
+        cols, rows = bc, -(-n // bc)
+        cw, ch = area.w / cols, area.h / rows
+        for i, q in enumerate(p.inds):
+            cx, cy = i % cols, i // cols
+            self.draw_ind(surf, q, pygame.Rect(int(area.x + cx * cw), int(area.y + cy * ch),
+                                               int(cw), int(ch)))
 
     def draw_part(self, surf, p, pcol):
         r = p.rect()
@@ -1748,6 +1823,8 @@ class App:
                                     [(cx - a, cy - a), (cx + a, cy), (cx - a, cy + a)])
             elif k == '7SEG':
                 self.draw_7seg(surf, p, r)
+            elif k == 'CHIP' and p.inds:
+                self.draw_chip_body(surf, p, r, hdrh)
         # pins
         small = k in ('DISPLAY', 'TOUCH')
         o, i_ = (sc(7, 3), sc(3, 2)) if small else (sc(9, 4), sc(5, 2))
@@ -1787,8 +1864,8 @@ class App:
             pts = self.wire_screen(self.wires[wi])
             s = drv.get(find(k_(pa, ia)))
             color = self.net_color(s)
-            if s in ({0}, {1}):
-                color = self.tint(self.wires[wi], color)
+            if len(s or ()) < 2:
+                color = self.tint(self.wires[wi], 'float' if not s else ('on' if 1 in s else 'off'))
             w = 1 if not s else (2 if s == {0} else 3)
             draw_wire(surf, pts, color, w)
 
