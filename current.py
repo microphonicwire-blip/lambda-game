@@ -16,6 +16,11 @@ import urllib.request
 import zlib
 from collections import deque
 import pygame
+try:
+    import numpy as np          # only the gas lab needs it
+    import pygame.surfarray     # noqa
+except ImportError:
+    np = None
 
 C = 24              # cell size
 PAL_W = 144         # palette width (multiple of C so the grid lines up)
@@ -209,7 +214,7 @@ HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = ad
         'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
         'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
         'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes',
-        'clr: ctrl+sh+del']
+        'clr: ctrl+sh+del', 'tab = gas lab']
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
 # kinds with an editable description in the body (double-click the empty space)
@@ -551,6 +556,7 @@ class App:
         self.tint_cache = {}
         self.sim_parts = []     # every real part, chip insides included
         self.toast = ('', 0.0)
+        self.mode = 'circuit'   # or 'gas'
         self.view_moved = False
 
     # ------------------------------------------------------------ sim
@@ -1195,9 +1201,6 @@ class App:
         if not group:
             self.say('select some parts first')
             return
-        if not any(p.kind == 'PIN' for p in group):
-            self.say('add PIN parts so the chip has ports')
-            return
         depth = 1 + max([p.defn.get('depth', 1) for p in group if p.kind == 'CHIP'] or [0])
         if depth > MAX_DEPTH:
             self.say(f'chips can only nest {MAX_DEPTH} deep')
@@ -1486,6 +1489,11 @@ class App:
             self.clear_all()
         elif k in (pygame.K_DELETE, pygame.K_BACKSPACE):
             self.delete_sel()
+        elif k == pygame.K_TAB:
+            if np is None:
+                self.say('gas lab needs numpy (pip install numpy)')
+            else:
+                self.mode = 'gas'
         elif k == pygame.K_g and not ctrl:
             self.chipify()
         elif k == pygame.K_u and not ctrl:
@@ -1991,6 +1999,553 @@ class App:
                 self.label(surf, 'OK', TEXT, btn.center)
 
 
+# ---------------------------------------------------------------- gas lab
+GW, GH = 224, 152           # gas grid size in cells
+G_SPECIES = ['N2', 'O2', 'H2', 'C3H8', 'CH4', 'CO2', 'H2O', 'He']
+G_IDX = {s: i for i, s in enumerate(G_SPECIES)}
+G_MASS = [28, 32, 2, 44, 16, 44, 18, 4]                 # g/mol
+G_CV = [2.5, 2.5, 2.5, 8.0, 3.3, 3.5, 3.0, 1.5]         # heat capacity, in units of R
+G_COLOR = [(46, 66, 108), (60, 100, 160), (130, 70, 190), (170, 145, 40), (60, 140, 85),
+           (110, 110, 110), (90, 150, 180), (180, 100, 150)]
+G_NICE = {'N2': 'N2', 'O2': 'O2', 'H2': 'H2', 'C3H8': 'propane', 'CH4': 'methane',
+          'CO2': 'CO2', 'H2O': 'steam', 'He': 'He'}
+# fuel: (O2 needed per fuel, products, heat released / R per mol, autoignition temp K)
+G_FUELS = {'H2': (0.5, {'H2O': 1}, 29100, 773),
+           'C3H8': (5, {'CO2': 3, 'H2O': 4}, 245800, 743),
+           'CH4': (2, {'CO2': 1, 'H2O': 2}, 96460, 853)}
+G_AIR = {'N2': 0.79, 'O2': 0.21}
+G_MATS = [('WALL', None), ('IGNITER', None), ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
+          ('PROPANE', {'C3H8': 1}), ('METHANE', {'CH4': 1}), ('OXYGEN', {'O2': 1}),
+          ('HELIUM', {'He': 1}), ('CO2', {'CO2': 1}), ('VACUUM', None)]
+G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE']
+G_K = 0.08          # how hard pressure pushes
+G_DAMP = 0.985      # flow friction
+G_DIFF = 0.02       # gases mixing
+G_HEAT = 0.05       # heat conduction
+G_BURN = 0.35       # burn speed once lit
+G_EFF = 0.6         # share of the reaction heat that stays (real flames lose some)
+G_COOL = 0.0004     # hot gas slowly radiating heat away
+G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
+G_VISC = 0.03
+G_HELP = ['tab = circuits', 'lmb = use tool', 'rmb = erase', 'wheel = size',
+          'e = ignite', 'space = pause', 'up/dn = speed', 'o = open edges',
+          'a = reset air', 'clr: ctrl+sh+del']
+
+
+class GasSim:
+    # 2d gas grid: each cell has amounts of each gas, a temperature, and flow on its faces
+    def __init__(self):
+        S = len(G_SPECIES)
+        self.W2, self.H2 = GW + 2, GH + 2       # one ghost cell around the edge
+        shape = (self.W2, self.H2)
+        self.n = np.zeros((S,) + shape, np.float32)     # 1.0 = 1 atm worth at 20C
+        self.T = np.full(shape, 293.0, np.float32)
+        self.solid = np.zeros(shape, bool)
+        self.ign = np.zeros(shape, bool)
+        self.u = np.zeros((self.W2 - 1, self.H2), np.float32)
+        self.v = np.zeros((self.W2, self.H2 - 1), np.float32)
+        self.ring = np.ones(shape, bool)
+        self.ring[1:-1, 1:-1] = False
+        self.open = True                        # edges open to the outside air
+        self.spark = 0
+        self.spark_mask = None
+        self.near_wall = None       # cells touching a wall, redone when walls change
+        self.active = {0, 1}        # which gases are present (index into G_SPECIES)
+        self.age = 0
+        self.cv = np.array(G_CV, np.float32)[:, None, None]
+        self.cvv = np.array(G_CV, np.float32)
+        self.M = np.array(G_MASS, np.float32)[:, None, None]
+        self.Mv = np.array(G_MASS, np.float32)
+        self.amb = self.mix(G_AIR)
+        X, Y = np.meshgrid(np.arange(self.W2), np.arange(self.H2), indexing='ij')
+        self.X, self.Y = X.astype(np.float32), Y.astype(np.float32)
+        self.reset_air()
+
+    def mix(self, comp):
+        v = np.zeros(len(G_SPECIES), np.float32)
+        for k, f in comp.items():
+            v[G_IDX[k]] = f
+        return v
+
+    def reset_air(self):
+        self.n[:] = self.amb[:, None, None]
+        self.T[:] = 293
+        self.n[:, self.solid] = 0
+        self.u[:] = 0
+        self.v[:] = 0
+
+    def clear(self):
+        self.near_wall = None
+        self.solid[:] = False
+        self.ign[:] = False
+        self.reset_air()
+
+    # editing
+    def add_gas(self, mask, comp, amount):
+        mask = mask & ~self.solid
+        if not mask.any():
+            return
+        vec = self.mix(comp) * amount
+        self.active |= set(np.nonzero(vec)[0].tolist())
+        c_old = (self.n[:, mask] * self.cvv[:, None]).sum(0)
+        add_c = float((vec * self.cvv).sum())
+        e = c_old * self.T[mask] + add_c * 293
+        self.n[:, mask] += vec[:, None]
+        self.T[mask] = e / np.maximum(c_old + add_c, 1e-6)
+
+    def drain(self, mask, keep):
+        mask = mask & ~self.solid
+        self.n[:, mask] *= keep
+
+    def set_solid(self, mask, igniter):
+        mask = mask & ~self.ring
+        self.solid[mask] = True
+        self.ign[mask] = igniter
+        self.near_wall = None
+        self.n[:, mask] = 0
+        self.T[mask] = 293
+
+    def erase(self, mask):
+        mask = mask & ~self.ring & self.solid
+        self.solid[mask] = False
+        self.ign[mask] = False
+        self.near_wall = None
+        self.T[mask] = 293      # the hole starts empty and gas rushes in
+
+    def ignite(self):
+        m = self.ign.copy()
+        for _ in range(2):
+            g = m.copy()
+            g[1:] |= m[:-1]
+            g[:-1] |= m[1:]
+            g[:, 1:] |= m[:, :-1]
+            g[:, :-1] |= m[:, 1:]
+            m = g
+        self.spark_mask = m & ~self.solid
+        self.spark = 8
+
+    # physics
+    def step(self):
+        n, T, sol = self.n, self.T, self.solid
+        ring = self.ring
+        if self.open:
+            sol[ring] = False
+            n[:, ring] = self.amb[:, None]
+            T[ring] = 293
+        else:
+            sol[ring] = True
+            n[:, ring] = 0
+        # only push around the gases that actually exist right now (much faster)
+        self.age += 1
+        if self.age % 120 == 0:
+            live = n.reshape(n.shape[0], -1).max(1) > 1e-7
+            self.active = set(np.nonzero(live)[0].tolist()) | ({0, 1} if self.open else set())
+        idx = np.array(sorted(self.active) or [0])
+        full = n
+        n = full[idx]
+        cvv, Mv = self.cvv[idx], self.Mv[idx]
+        S = n.shape[0]
+        flat = n.reshape(S, -1)
+        C = (cvv @ flat).reshape(T.shape)
+        p = flat.sum(0).reshape(T.shape) * T / 293
+        rho = (Mv @ flat).reshape(T.shape) / 29 + 0.02
+        ox = ~sol[:-1] & ~sol[1:]
+        oy = ~sol[:, :-1] & ~sol[:, 1:]
+        u, v = self.u, self.v
+        # pressure pushes the flow, friction slows it
+        # capped so light or very hot gas can't overshoot into a checkerboard
+        ku = np.minimum(G_K / (0.5 * (rho[:-1] + rho[1:])), 0.3 / (np.maximum(p[:-1], p[1:]) + 1e-3))
+        kv = np.minimum(G_K / (0.5 * (rho[:, :-1] + rho[:, 1:])), 0.3 / (np.maximum(p[:, :-1], p[:, 1:]) + 1e-3))
+        u += ku * (p[:-1] - p[1:])
+        v += kv * (p[:, :-1] - p[:, 1:])
+        # a little viscosity keeps jets smooth instead of checkered
+        uu, vv = u.copy(), v.copy()
+        u[1:-1] += G_VISC * (uu[:-2] + uu[2:] - 2 * uu[1:-1])
+        u[:, 1:-1] += G_VISC * (uu[:, :-2] + uu[:, 2:] - 2 * uu[:, 1:-1])
+        v[1:-1] += G_VISC * (vv[:-2] + vv[2:] - 2 * vv[1:-1])
+        v[:, 1:-1] += G_VISC * (vv[:, :-2] + vv[:, 2:] - 2 * vv[:, 1:-1])
+        u *= G_DAMP * ox
+        v *= G_DAMP * oy
+        np.clip(u, -0.45, 0.45, out=u)
+        np.clip(v, -0.45, 0.45, out=v)
+        # never move more than 80% of a cell out in one step
+        up, un = np.maximum(u, 0), np.minimum(u, 0)
+        vp, vn = np.maximum(v, 0), np.minimum(v, 0)
+        out = np.zeros_like(T)
+        out[:-1] += up
+        out[1:] -= un
+        out[:, :-1] += vp
+        out[:, 1:] -= vn
+        s = np.minimum(1.0, 0.8 / (out + 1e-9))
+        # flux = (what leaves the left cell) - (what leaves the right cell), upwind + mixing
+        dx = G_DIFF * ox
+        dy = G_DIFF * oy
+        al = up * s[:-1] + dx
+        ar = un * s[1:] - dx
+        bl = vp * s[:, :-1] + dy
+        br = vn * s[:, 1:] - dy
+        E = C * T
+        fx = n[:, :-1] * al + n[:, 1:] * ar
+        fy = n[:, :, :-1] * bl + n[:, :, 1:] * br
+        hx = G_HEAT * np.minimum(C[:-1], C[1:]) * ox
+        hy = G_HEAT * np.minimum(C[:, :-1], C[:, 1:]) * oy
+        ex = E[:-1] * al + E[1:] * ar + hx * (T[:-1] - T[1:])
+        ey = E[:, :-1] * bl + E[:, 1:] * br + hy * (T[:, :-1] - T[:, 1:])
+        n[:, :-1] -= fx
+        n[:, 1:] += fx
+        n[:, :, :-1] -= fy
+        n[:, :, 1:] += fy
+        E[:-1] -= ex
+        E[1:] += ex
+        E[:, :-1] -= ey
+        E[:, 1:] += ey
+        np.maximum(n, 0, out=n)
+        C = (cvv @ n.reshape(S, -1)).reshape(T.shape)
+        T[:] = np.where(C > 1e-5, E / np.maximum(C, 1e-5), 293)
+        full[idx] = n
+        n = full
+        S = n.shape[0]
+        # sparks from igniters
+        if self.spark > 0 and self.spark_mask is not None:
+            T[self.spark_mask] = np.maximum(T[self.spark_mask], 1800)
+            self.spark -= 1
+        # burning
+        if (T > 700).any():
+            o2 = G_IDX['O2']
+            for f, (nu, prods, dh, tign) in G_FUELS.items():
+                fi = G_IDX[f]
+                m = (T > tign) & (n[fi] > 1e-5) & (n[o2] > 1e-5)
+                if not m.any():
+                    continue
+                b = np.where(m, G_BURN * np.minimum(n[fi], n[o2] / nu), 0)
+                e = (self.cvv @ n.reshape(S, -1)).reshape(T.shape) * T + b * dh * G_EFF
+                n[fi] -= b
+                n[o2] -= nu * b
+                for pr, k in prods.items():
+                    n[G_IDX[pr]] += k * b
+                    self.active.add(G_IDX[pr])
+                C = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
+                T[:] = np.where(C > 1e-5, e / np.maximum(C, 1e-5), 293)
+        T += (293 - T) * G_COOL
+        if self.near_wall is None:
+            w = np.zeros_like(sol)
+            w[1:] |= sol[:-1]
+            w[:-1] |= sol[1:]
+            w[:, 1:] |= sol[:, :-1]
+            w[:, :-1] |= sol[:, 1:]
+            self.near_wall = w & ~sol
+        T[self.near_wall] += (293 - T[self.near_wall]) * G_WALLCOOL
+        np.clip(T, 20, 5000, out=T)
+        n[:, sol] = 0
+        T[sol] = 293
+
+    def render(self):
+        # pressure: dark = thin, normal = gas color, high = red. hot = flame glow
+        n = self.n[:, 1:-1, 1:-1]
+        T = self.T[1:-1, 1:-1]
+        ntot = n.sum(0)
+        p = ntot * T / 293
+        frac = n / np.maximum(ntot, 1e-6)
+        col = np.tensordot(frac, np.array(G_COLOR, np.float32), axes=(0, 0))
+        col *= (0.2 + 0.8 * np.clip(p, 0, 1) ** 0.6)[..., None]
+        red = np.clip((p - 1.05) / 5, 0, 1)[..., None]
+        col = col * (1 - red) + np.array([235, 40, 30], np.float32) * red
+        heat = np.clip((T - 500) / 1500, 0, 1)[..., None]
+        hot = np.clip((T - 1500) / 1500, 0, 1)[..., None]
+        flame = np.array([255, 120, 20], np.float32) * (1 - hot) + np.array([255, 235, 170], np.float32) * hot
+        col = col * (1 - heat) + flame * heat
+        col[ntot < 1e-3] = (6, 8, 16)
+        col[self.solid[1:-1, 1:-1]] = (150, 160, 178)
+        col[self.ign[1:-1, 1:-1]] = (235, 125, 30)
+        return np.clip(col, 0, 255).astype(np.uint8)
+
+    def info(self, cx, cy):
+        x, y = cx + 1, cy + 1
+        if self.solid[x, y]:
+            return 'igniter' if self.ign[x, y] else 'wall'
+        n = self.n[:, x, y]
+        tot = float(n.sum())
+        if tot < 1e-3:
+            return 'vacuum'
+        p = tot * float(self.T[x, y]) / 293
+        parts = sorted(((float(a) / tot, G_NICE[s]) for s, a in zip(G_SPECIES, n)), reverse=True)
+        mix = ' '.join(f'{name} {f * 100:.0f}%' for f, name in parts[:3] if f > 0.03)
+        return f'{p:.2f} atm  {float(self.T[x, y]) - 273:.0f}C  {mix}'
+
+    def save(self, path):
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as f:
+            np.savez_compressed(f, n=self.n, T=self.T, solid=self.solid, ign=self.ign,
+                                open=np.array(self.open))
+        os.replace(tmp, path)
+
+    def load(self, path):
+        with np.load(path) as d:
+            if d['n'].shape != self.n.shape:
+                return
+            self.n[:] = d['n']
+            self.T[:] = d['T']
+            self.solid[:] = d['solid']
+            self.ign[:] = d['ign']
+            self.open = bool(d['open'])
+            self.near_wall = None
+            live = self.n.reshape(self.n.shape[0], -1).max(1) > 1e-7
+            self.active = set(np.nonzero(live)[0].tolist()) | {0, 1}
+
+
+class GasMode:
+    # the gas lab screen: same window, tab flips between this and the circuits
+    def __init__(self, app):
+        self.app = app
+        self.sim = GasSim()
+        self.tool = 'BRUSH'
+        self.mat = 'WALL'
+        self.size = 2
+        self.speed = 4          # sim steps per frame
+        self.paused = False
+        self.drag = None
+        self.dirty = False
+        self.last_save = time.time()
+        self.path = os.path.join(os.path.dirname(save_path()), 'gas.npz')
+        self.cs, self.x0, self.y0 = 5, PAL_W, 0
+        try:
+            if os.path.exists(self.path):
+                self.sim.load(self.path)
+        except Exception:
+            try:
+                os.replace(self.path, self.path + '.bad')
+            except OSError:
+                pass
+
+    # layout
+    def layout(self, W, H):
+        self.cs = max(1, min((W - PAL_W) // GW, H // GH))
+        self.x0 = PAL_W + ((W - PAL_W) - GW * self.cs) // 2
+        self.y0 = (H - GH * self.cs) // 2
+
+    def cell(self, pos, clamp=True):
+        cx = (pos[0] - self.x0) // self.cs
+        cy = (pos[1] - self.y0) // self.cs
+        if clamp:
+            return (max(0, min(GW - 1, cx)), max(0, min(GH - 1, cy)))
+        return (cx, cy) if 0 <= cx < GW and 0 <= cy < GH else None
+
+    def tool_rect(self, i):
+        return pygame.Rect(12, 40 + i * 24, PAL_W - 24, 20)
+
+    def mat_rect(self, i):
+        return pygame.Rect(12, 40 + len(G_TOOLS) * 24 + 26 + i * 24, PAL_W - 24, 20)
+
+    # masks over the padded grid
+    def seg_mask(self, a, b, r):
+        ax, ay, bx, by = a[0] + 1, a[1] + 1, b[0] + 1, b[1] + 1
+        X, Y = self.sim.X, self.sim.Y
+        dx, dy = bx - ax, by - ay
+        l2 = dx * dx + dy * dy
+        if l2 == 0:
+            d2 = (X - ax) ** 2 + (Y - ay) ** 2
+        else:
+            t = np.clip(((X - ax) * dx + (Y - ay) * dy) / l2, 0, 1)
+            d2 = (X - ax - t * dx) ** 2 + (Y - ay - t * dy) ** 2
+        return (d2 <= r * r + 0.5) & ~self.sim.ring
+
+    def rect_mask(self, a, b, outline):
+        x0, x1 = sorted((a[0] + 1, b[0] + 1))
+        y0, y1 = sorted((a[1] + 1, b[1] + 1))
+        m = np.zeros(self.sim.solid.shape, bool)
+        m[x0:x1 + 1, y0:y1 + 1] = True
+        if outline:
+            t = max(1, self.size)
+            m[x0 + t:x1 + 1 - t, y0 + t:y1 + 1 - t] = False
+        return m & ~self.sim.ring
+
+    def flood(self, c):
+        sol = self.sim.solid
+        start = (c[0] + 1, c[1] + 1)
+        m = np.zeros(sol.shape, bool)
+        if sol[start]:
+            return m
+        q = deque([start])
+        m[start] = True
+        W2, H2 = sol.shape
+        while q:
+            x, y = q.popleft()
+            for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if 1 <= nx < W2 - 1 and 1 <= ny < H2 - 1 and not m[nx, ny] and not sol[nx, ny]:
+                    m[nx, ny] = True
+                    q.append((nx, ny))
+        return m
+
+    def apply(self, mask, amount, erase=False):
+        sim = self.sim
+        if erase or self.tool == 'ERASE':
+            sim.erase(mask)
+        elif self.mat in ('WALL', 'IGNITER'):
+            sim.set_solid(mask, self.mat == 'IGNITER')
+        elif self.mat == 'VACUUM':
+            sim.drain(mask, 0.5 if amount < 1 else 0.0)
+        else:
+            sim.add_gas(mask, dict(G_MATS)[self.mat], amount)
+        self.dirty = True
+
+    # input
+    def handle(self, e):
+        # returns 'quit' when esc should close the game
+        if e.type == pygame.KEYDOWN:
+            k = e.key
+            ctrl = bool(e.mod & pygame.KMOD_CTRL)
+            shift = bool(e.mod & pygame.KMOD_SHIFT)
+            if k == pygame.K_ESCAPE:
+                if self.drag:
+                    self.drag = None
+                else:
+                    return 'quit'
+            elif k == pygame.K_TAB:
+                self.save()
+                self.app.mode = 'circuit'
+            elif ctrl and shift and k == pygame.K_DELETE:
+                self.sim.clear()
+                self.dirty = True
+            elif k == pygame.K_e:
+                self.sim.ignite()
+            elif k == pygame.K_SPACE:
+                self.paused = not self.paused
+            elif k == pygame.K_UP:
+                self.speed = min(16, self.speed * 2)
+            elif k == pygame.K_DOWN:
+                self.speed = max(1, self.speed // 2)
+            elif k == pygame.K_o:
+                self.sim.open = not self.sim.open
+                self.dirty = True
+            elif k == pygame.K_a:
+                self.sim.reset_air()
+                self.dirty = True
+            elif k == pygame.K_RIGHTBRACKET:
+                self.size = min(12, self.size + 1)
+            elif k == pygame.K_LEFTBRACKET:
+                self.size = max(0, self.size - 1)
+        elif e.type == pygame.MOUSEWHEEL:
+            self.size = max(0, min(12, self.size + e.y))
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button in (1, 3):
+            if e.pos[0] < PAL_W:
+                for i, t in enumerate(G_TOOLS):
+                    if self.tool_rect(i).collidepoint(e.pos):
+                        self.tool = t
+                for i, (m, _) in enumerate(G_MATS):
+                    if self.mat_rect(i).collidepoint(e.pos):
+                        self.mat = m
+                return None
+            c = self.cell(e.pos)
+            erase = e.button == 3
+            if self.tool == 'FILL' and not erase:
+                amount = 1.0
+                self.apply(self.flood(c), amount)
+                return None
+            self.drag = dict(start=c, cur=c, last=c, erase=erase,
+                             tool='BRUSH' if erase else self.tool)
+        elif e.type == pygame.MOUSEMOTION and self.drag:
+            self.drag['cur'] = self.cell(e.pos)
+        elif e.type == pygame.MOUSEBUTTONUP and self.drag and e.button in (1, 3):
+            d, self.drag = self.drag, None
+            if d['tool'] == 'LINE':
+                self.apply(self.seg_mask(d['start'], d['cur'], self.size), 1.0)
+            elif d['tool'] == 'RECT':
+                solid = self.mat in ('WALL', 'IGNITER')
+                self.apply(self.rect_mask(d['start'], d['cur'], solid), 1.0)
+        return None
+
+    def update(self, dt):
+        d = self.drag
+        if d and d['tool'] in ('BRUSH', 'ERASE'):
+            # brush paints every frame it's held, so holding gas pumps pressure up
+            self.apply(self.seg_mask(d['last'], d['cur'], self.size), 0.12, erase=d['erase'])
+            d['last'] = d['cur']
+        if not self.paused:
+            t0 = time.perf_counter()
+            for _ in range(self.speed):
+                self.sim.step()
+                if time.perf_counter() - t0 > 0.014:
+                    break       # slow pc: keep the frame rate, run the sim slower
+            self.dirty = True
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.sim.save(self.path)
+        except OSError as err:
+            print('gas save failed:', err)
+        self.dirty = False
+        self.last_save = time.time()
+
+    def autosave(self):
+        if self.dirty and time.time() - self.last_save >= 10:
+            self.save()
+
+    # drawing
+    def draw(self, surf):
+        W, H = surf.get_size()
+        self.layout(W, H)
+        surf.fill(BG)
+        img = pygame.surfarray.make_surface(self.sim.render())
+        if self.cs != 1:
+            img = pygame.transform.scale(img, (GW * self.cs, GH * self.cs))
+        surf.blit(img, (self.x0, self.y0))
+        pygame.draw.rect(surf, PANEL_LINE if self.sim.open else SEL,
+                         (self.x0 - 1, self.y0 - 1, GW * self.cs + 2, GH * self.cs + 2), 1)
+        cs = self.cs
+        mp = pygame.mouse.get_pos()
+        d = self.drag
+        if d and d['tool'] == 'LINE':
+            a = (self.x0 + d['start'][0] * cs + cs // 2, self.y0 + d['start'][1] * cs + cs // 2)
+            b = (self.x0 + d['cur'][0] * cs + cs // 2, self.y0 + d['cur'][1] * cs + cs // 2)
+            pygame.draw.line(surf, SEL, a, b, max(1, (2 * self.size + 1) * cs))
+        elif d and d['tool'] == 'RECT':
+            (ax, ay), (bx, by) = d['start'], d['cur']
+            r = pygame.Rect(self.x0 + min(ax, bx) * cs, self.y0 + min(ay, by) * cs,
+                            (abs(bx - ax) + 1) * cs, (abs(by - ay) + 1) * cs)
+            pygame.draw.rect(surf, SEL, r, 1)
+        if mp[0] >= PAL_W and self.tool != 'FILL':
+            pygame.draw.circle(surf, SEL, mp, max(2, int((self.size + 0.5) * cs)), 1)
+        # hover readout
+        c = self.cell(mp, clamp=False)
+        if c and mp[0] >= PAL_W:
+            t = self.app.small.render(self.sim.info(*c), True, TEXT)
+            r = pygame.Rect(0, 0, t.get_width() + 12, t.get_height() + 6)
+            r.bottomright = (W - 8, H - 8)
+            pygame.draw.rect(surf, PANEL, r)
+            pygame.draw.rect(surf, PART_LINE, r, 1)
+            surf.blit(t, (r.x + 6, r.y + 3))
+        # palette
+        pygame.draw.rect(surf, PANEL, (0, 0, PAL_W, H))
+        pygame.draw.line(surf, PANEL_LINE, (PAL_W - 1, 0), (PAL_W - 1, H))
+        self.app.label(surf, 'GAS LAB', TEXT, (PAL_W // 2, 18))
+        for i, t in enumerate(G_TOOLS):
+            r = self.tool_rect(i)
+            on = t == self.tool
+            pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
+            pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
+            surf.blit(self.app.small.render(t, True, TEXT), (r.x + 8, r.y + 2))
+        y = self.mat_rect(0).y - 20
+        surf.blit(self.app.small.render('MATERIAL', True, TEXT_DIM), (12, y))
+        for i, (m, comp) in enumerate(G_MATS):
+            r = self.mat_rect(i)
+            on = m == self.mat
+            pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
+            pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
+            if comp:
+                sw = tuple(int(sum(G_COLOR[G_IDX[s]][ch] * f for s, f in comp.items()) * 1.4) for ch in range(3))
+                sw = tuple(min(255, x) for x in sw)
+            else:
+                sw = {'WALL': (150, 160, 178), 'IGNITER': (235, 125, 30)}.get(m, (6, 8, 16))
+            pygame.draw.rect(surf, sw, (r.x, r.y, 4, r.h))
+            surf.blit(self.app.small.render(m, True, TEXT), (r.x + 10, r.y + 2))
+        hy = H - (len(G_HELP) * 15 + 30)
+        for i, t in enumerate(G_HELP):
+            surf.blit(self.app.small.render(t, True, TEXT_DIM), (12, hy + i * 15))
+        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if self.sim.open else '  closed')
+        surf.blit(self.app.small.render(st, True, SEL if self.paused else TEXT), (12, H - 22))
+
+
 def main():
     pygame.init()
     pygame.display.set_caption("logic sandbox")
@@ -2001,25 +2556,42 @@ def main():
     app.updater = Updater()
     running = True
     restart = False
+    gas = None
     while running:
         dt = clock.tick(60) / 1000
+        modal = app.updater.state in ('prompt', 'installing', 'failed')
+        if app.mode == 'gas' and gas is None:
+            gas = GasMode(app)
+        in_gas = app.mode == 'gas' and not modal
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
+            elif in_gas:
+                if gas.handle(e) == 'quit':
+                    running = False
             elif e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE and not app.editing:
                 if not app.on_escape():
                     running = False
             else:
                 app.handle(e)
-        app.update(dt)
+        if in_gas and app.mode == 'gas':
+            gas.update(dt)
+            gas.autosave()
+        else:
+            app.update(dt)
         app.autosave()
         if app.updater.state == 'restart':
             running = False
             restart = True
-        app.draw(pygame.display.get_surface())
+        if app.mode == 'gas' and gas is not None and not modal:
+            gas.draw(pygame.display.get_surface())
+        else:
+            app.draw(pygame.display.get_surface())
         pygame.display.flip()
     if app.editing:
         app.finish_edit(True)
+    if gas is not None:
+        gas.save()
     app.save()
     pygame.quit()
     if restart:     # run the freshly installed version
