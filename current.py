@@ -183,6 +183,8 @@ DEFS = {
     'BUTTON':  ONE_IN,                                  # passes signal for 1 tick
     'GATE':    dict(w=3, h=2, pins=[(0, 1, 'in'), (3, 1, 'out'), (1, 0, 'in')]),  # EN on top
     'CLOCK':   dict(w=3, h=2, pins=[(3, 1, 'out')]),    # blinks, click to change speed
+    'GAS IN':  dict(w=3, h=2, pins=[(3, 1, 'out')]),    # signal from a gas lab link, click for its id
+    'GAS OUT': dict(w=3, h=2, pins=[(0, 1, 'in')]),     # sends its input to the gas lab link with the same id
     'DELAY':   dict(w=3, h=2, pins=[(0, 1, 'in'), (3, 1, 'out')]),    # same signal, N ticks late
     'EXTENDER': dict(w=3, h=2, pins=[(0, 1, 'in'), (3, 1, 'out')]),   # keeps it high N ticks longer
     'LAMP':    dict(w=2, h=2, pins=[(0, 1, 'in')]),
@@ -209,7 +211,7 @@ NAMES = {'DISPLAY': ['R', 'G', 'B'], 'TOUCH': ['R', 'G', 'B', 'OUT'], 'GATE': ['
 
 PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', 'TOUCH', '7SEG',
              'NOT', 'BUF', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
-             'SR LATCH', 'NV LATCH', 'PIN', 'LABEL']
+             'SR LATCH', 'NV LATCH', 'GAS IN', 'GAS OUT', 'PIN', 'LABEL']
 
 HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
         'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
@@ -229,9 +231,9 @@ WIDGET_KINDS = ('SWITCH', 'BUTTON')     # these draw a little control in the bod
 
 
 def cat_color(kind):
-    if kind in ('SOURCE', 'SWITCH', 'BUTTON', 'CLOCK'):
+    if kind in ('SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GAS IN'):
         return HDR_INPUT
-    if kind in ('LAMP', 'DISPLAY', 'TOUCH', '7SEG'):
+    if kind in ('LAMP', 'DISPLAY', 'TOUCH', '7SEG', 'GAS OUT'):
         return HDR_OUTPUT
     if kind in ('SR LATCH', 'NV LATCH'):
         return HDR_MEM
@@ -275,7 +277,7 @@ class Part:
         self.seg_glow = [0.0] * 7   # 7seg lit timers
         self.rgb = None         # display / 7seg color, None = default
         self.label = None       # custom text, None = default
-        self.pidx = 4           # clock speed (index into PERIODS)
+        self.pidx = 0 if kind in ('GAS IN', 'GAS OUT') else 4    # clock speed (index into PERIODS) / link id - 1
         self.counter = 0        # clock ticks since last flip
         self.label_on = None    # switch names, one per state
         self.label_off = None
@@ -698,6 +700,7 @@ class App:
 
         new = []
         passes = []
+        gas_rx = set()
         for p in self.sim_parts:
             k = p.kind
             if k == 'GATE':
@@ -739,6 +742,11 @@ class App:
             elif k in ('SR LATCH', 'NV LATCH'):
                 # reset wins if both are high
                 new.append((p, 0 if hi(p, 1) else (1 if hi(p, 0) else p.out)))
+            elif k == 'GAS IN':
+                new.append((p, int(GAS_TX.get(p.pidx + 1, 0))))
+            elif k == 'GAS OUT':
+                if hi(p, 0):
+                    gas_rx.add(p.pidx + 1)
             elif k == 'LAMP':
                 if hi(p, 0):
                     p.glow = GLOW
@@ -755,6 +763,9 @@ class App:
                 for i in range(7):
                     if hi(p, i):
                         p.seg_glow[i] = GLOW
+        if any(p.kind == 'GAS OUT' for p in self.sim_parts) or GAS_RX:
+            GAS_RX.clear()
+            GAS_RX.update({i: 1 for i in gas_rx})
         for p, drive, v in passes:
             p.drive, p.out = drive, v
         for p, v in new:
@@ -944,7 +955,7 @@ class App:
         else:
             p = Part(d['kind'], int(d['gx']), int(d['gy']))
         p.on = bool(d.get('on'))
-        p.pidx = max(0, min((len(DPER) if p.kind in ('DELAY', 'EXTENDER') else len(PERIODS)) - 1, int(d.get('pidx', 3 if p.kind in ('DELAY', 'EXTENDER') else 4))))
+        p.pidx = max(0, min((16 if p.kind in ('GAS IN', 'GAS OUT') else len(DPER) if p.kind in ('DELAY', 'EXTENDER') else len(PERIODS)) - 1, int(d.get('pidx', 3 if p.kind in ('DELAY', 'EXTENDER') else 4))))
         if p.kind == 'PIN':
             self.set_pin_dir(p, p.on)
             if d.get('label') in ('IN', 'OUT'):     # old saves pinned the default name
@@ -1305,6 +1316,9 @@ class App:
             elif h.kind in ('DELAY', 'EXTENDER'):
                 h.pidx = (h.pidx + 1) % len(DPER)
                 h.counter, h.buf = 0, None
+            elif h.kind in ('GAS IN', 'GAS OUT'):
+                h.pidx = (h.pidx + 1) % 16
+                self.dirty = True
             elif h.kind == 'PIN':
                 self.set_pin_dir(h, not h.on)
 
@@ -1585,6 +1599,8 @@ class App:
                 elif p.kind in ('DELAY', 'EXTENDER'):
                     p.pidx = (p.pidx - 1) % len(DPER)
                     p.counter, p.buf = 0, None
+                elif p.kind in ('GAS IN', 'GAS OUT'):
+                    p.pidx = (p.pidx - 1) % 16
                 elif p.kind == 'PIN':
                     self.set_pin_dir(p, not p.on)
                 body = p.kind in DESC_KINDS and e.pos[1] >= p.rect().y + sc(HDR)
@@ -1822,6 +1838,9 @@ class App:
                 b = pygame.Rect(cx - sc(10), cy - sc(5), sc(20), sc(10))
                 pygame.draw.rect(surf, ON if p.flash > 0 else PART_BG, b)
                 pygame.draw.rect(surf, TEXT_DIM, b, 1)
+            elif k in ('GAS IN', 'GAS OUT') and txt:
+                t = self.tiny.render(f'link {p.pidx + 1}', True, TEXT_DIM)
+                surf.blit(t, t.get_rect(center=(cx, cy)))
             elif k in ('CLOCK', 'DELAY', 'EXTENDER') and txt:
                 n = (PERIODS if k == 'CLOCK' else DPER)[p.pidx]
                 t = self.tiny.render(f'{n} ticks', True, TEXT_DIM)
@@ -2002,28 +2021,58 @@ class App:
 
 # ---------------------------------------------------------------- gas lab
 GW, GH = 224, 152           # gas grid size in cells
-G_SPECIES = ['N2', 'O2', 'H2', 'C3H8', 'CH4', 'CO2', 'H2O', 'He']
+G_SPECIES = ['N2', 'O2', 'H2', 'C3H8', 'CH4', 'CO2', 'H2O', 'He',
+             'Ar', 'Ne', 'NH3', 'CO', 'C4H10', 'C2H2', 'C2H5OH', 'Cl2', 'SF6']
 G_IDX = {s: i for i, s in enumerate(G_SPECIES)}
-G_MASS = [28, 32, 2, 44, 16, 44, 18, 4]                 # g/mol
-G_CV = [2.5, 2.5, 2.5, 8.0, 3.3, 3.5, 3.0, 1.5]         # heat capacity, in units of R
+G_MASS = [28, 32, 2, 44, 16, 44, 18, 4, 40, 20, 17, 28, 58, 26, 46, 71, 146]                 # g/mol
+G_CV = [2.5, 2.5, 2.5, 8.0, 3.3, 3.5, 3.0, 1.5, 1.5, 1.5, 3.4, 2.5, 10.5, 4.0, 8.0, 3.1, 10.0]         # heat capacity, in units of R
 G_COLOR = [(46, 66, 108), (60, 100, 160), (130, 70, 190), (170, 145, 40), (60, 140, 85),
-           (110, 110, 110), (90, 150, 180), (180, 100, 150)]
+           (110, 110, 110), (90, 150, 180), (180, 100, 150),
+           (120, 90, 200), (230, 90, 110), (200, 215, 110), (150, 120, 90), (205, 130, 60),
+           (240, 190, 90), (190, 120, 170), (150, 200, 60), (90, 205, 190)]
 G_NICE = {'N2': 'N2', 'O2': 'O2', 'H2': 'H2', 'C3H8': 'propane', 'CH4': 'methane',
-          'CO2': 'CO2', 'H2O': 'steam', 'He': 'He'}
+          'CO2': 'CO2', 'H2O': 'steam', 'He': 'He', 'Ar': 'argon', 'Ne': 'neon', 'NH3': 'ammonia',
+          'CO': 'CO', 'C4H10': 'butane', 'C2H2': 'acetylene', 'C2H5OH': 'ethanol', 'Cl2': 'chlorine',
+          'SF6': 'SF6'}
 # fuel: (O2 needed per fuel, products, heat released / R per mol, activation temp K)
 G_FUELS = {'H2': (0.5, {'H2O': 1}, 29100, 7000),
            'C3H8': (5, {'CO2': 3, 'H2O': 4}, 245800, 8500),
-           'CH4': (2, {'CO2': 1, 'H2O': 2}, 96460, 9500)}
+           'CH4': (2, {'CO2': 1, 'H2O': 2}, 96460, 9500),
+           'CO': (0.5, {'CO2': 1}, 34000, 8500),
+           'C4H10': (6.5, {'CO2': 4, 'H2O': 5}, 346000, 8500),
+           'C2H2': (2.5, {'CO2': 2, 'H2O': 1}, 156000, 7000),
+           'C2H5OH': (3, {'CO2': 2, 'H2O': 3}, 153600, 9000),
+           'NH3': (0.75, {'N2': 0.5, 'H2O': 1.5}, 38000, 11000)}
 G_AIR = {'N2': 0.79, 'O2': 0.21}
 # solid kinds: (name, strength in atm per cell of thickness (0 = never breaks), color)
 G_SOLIDS = [None, ('WALL', 60, (150, 160, 178)), ('STEEL', 0, (100, 108, 122)),
             ('GLASS', 4, (150, 210, 225)), ('IGNITER', 60, (235, 125, 30)),
-            ('VALVE', 60, (200, 60, 60)), ('SENSOR', 60, (150, 90, 200))]
+            ('VALVE', 60, (200, 60, 60)), ('SENSOR', 60, (150, 90, 200)),
+            ('FILTER', 60, (120, 200, 190)), ('CHECK VALVE', 60, (205, 175, 60)),
+            ('HEATER', 60, (240, 90, 40)), ('COOLER', 60, (80, 170, 240)),
+            ('PUMP', 60, (90, 200, 90)), ('SOURCE', 60, (230, 230, 110)),
+            ('VENT', 60, (70, 70, 80)), ('LINK', 60, (235, 235, 245))]
 G_WALL, G_STEEL, G_GLASS, G_IGNITER, G_VALVE, G_SENSOR = 1, 2, 3, 4, 5, 6
+G_FILTER, G_CHECK, G_HEATER, G_COOLER, G_PUMP, G_SOURCE, G_VENT, G_LINK = 7, 8, 9, 10, 11, 12, 13, 14
+G_PASS = (G_FILTER, G_CHECK, G_PUMP)    # gas flows through these cells
+G_HEAT_LEVELS = [400, 600, 900, 1400, 2200]     # K
+G_COOL_LEVELS = [270, 230, 180, 120, 77]        # K
+G_RATE = 0.12       # source emit rate per step
+G_PUMP_V = 0.15     # pump face speed
+# signals shared with the circuit side (GAS IN / GAS OUT parts): link id -> 0/1
+GAS_TX = {}         # gas lab -> circuits
+GAS_RX = {}         # circuits -> gas lab
 # sensors: palette name -> type. block sensors look 5 cells ahead, temp/pressure check the cells touching them
-G_SENSOR_TYPES = {'BLK SENSOR': 'block', 'TEMP SENSOR': 'temp', 'PRES SENSOR': 'press'}
-G_SENSOR_KINDS = ['block', 'temp', 'press']
-G_SENSOR_COLOR = {'block': (160, 95, 220), 'temp': (225, 85, 55), 'press': (70, 140, 235)}
+G_SENSOR_TYPES = {'BLK SENSOR': 'block', 'TEMP SENSOR': 'temp', 'PRES SENSOR': 'press', 'HINGE SENSOR': 'hinge', 'TIMER': 'timer'}
+G_SENSOR_KINDS = ['block', 'temp', 'press', 'hinge', 'timer']
+G_SENSOR_COLOR = {'block': (160, 95, 220), 'temp': (225, 85, 55), 'press': (70, 140, 235), 'hinge': (230, 200, 70), 'timer': (110, 210, 120)}
+G_TIMER_PERIODS = [20, 40, 80, 160, 320]      # sim steps
+G_TIMER_DUTY = [0.1, 0.25, 0.5, 0.75]
+G_STARTER_T = 3.0       # starter motor torque
+G_STARTER_MAX = 0.08    # ...stops pushing above this spin (rad / step)
+G_SHAFT_DENS = 0.25     # shaft mass per cell of area (inertia = half m r^2)
+G_SHAFT_DAMP = 0.9995   # bearing friction
+G_MECH = ('SHAFT', 'HINGE', 'ROD')
 G_TEMP_LEVELS = [100, 200, 400, 700, 1000]        # C
 G_PRES_LEVELS = [1.5, 2, 3, 5, 10]                # atm
 G_DIRS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
@@ -2032,13 +2081,25 @@ G_SENSE_RANGE = 5
 G_VALVE_OPEN = (70, 200, 100)
 G_BLOCK_COLOR, G_BLOCK_EDGE = (178, 130, 86), (120, 84, 52)
 G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('IGNITER', None),
-          ('VALVE', None), ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None),
+          ('VALVE', None), ('FILTER', None), ('CHECK VALVE', None), ('HEATER', None),
+          ('COOLER', None), ('PUMP', None), ('SOURCE', None), ('VENT', None), ('LINK', None),
+          ('SHAFT', None), ('HINGE', None), ('ROD', None),
+          ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None), ('HINGE SENSOR', None), ('TIMER', None),
           ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
           ('PROPANE', {'C3H8': 1}), ('METHANE', {'CH4': 1}), ('OXYGEN', {'O2': 1}),
-          ('HELIUM', {'He': 1}), ('CO2', {'CO2': 1}), ('VACUUM', None)]
+          ('HELIUM', {'He': 1}), ('CO2', {'CO2': 1}),
+          ('NITROGEN', {'N2': 1}), ('STEAM', {'H2O': 1}), ('ARGON', {'Ar': 1}), ('NEON', {'Ne': 1}),
+          ('AMMONIA', {'NH3': 1}), ('CO', {'CO': 1}), ('BUTANE', {'C4H10': 1}),
+          ('ACETYLENE', {'C2H2': 1}), ('ETHANOL', {'C2H5OH': 1}), ('CHLORINE', {'Cl2': 1}),
+          ('SF6', {'SF6': 1}),
+          ('H2+O2 2:1', {'H2': 2 / 3, 'O2': 1 / 3}), ('CH4+O2 1:2', {'CH4': 1 / 3, 'O2': 2 / 3}),
+          ('C3H8+O2 1:5', {'C3H8': 1 / 6, 'O2': 5 / 6}), ('CO+O2 2:1', {'CO': 2 / 3, 'O2': 1 / 3}),
+          ('VACUUM', None)]
 G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER,
-                'VALVE': G_VALVE}
-G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE']
+                'VALVE': G_VALVE, 'FILTER': G_FILTER, 'CHECK VALVE': G_CHECK, 'HEATER': G_HEATER,
+                'COOLER': G_COOLER, 'PUMP': G_PUMP, 'SOURCE': G_SOURCE, 'VENT': G_VENT}
+G_DEFAULT_AUX = {G_FILTER: G_IDX['H2'], G_CHECK: 0, G_HEATER: 2, G_COOLER: 2, G_PUMP: 0, G_SOURCE: G_IDX['H2']}
+G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE', 'SELECT']
 G_K = 0.08          # how hard pressure pushes
 G_DAMP = 0.985      # flow friction
 G_DIFF = 0.02       # gases mixing
@@ -2054,9 +2115,10 @@ G_BODY_G = 0.0015   # block gravity
 G_COOL = 0.0004     # hot gas slowly radiating heat away
 G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
 G_VISC = 0.03
-G_HELP = ['tab = circuits', 'lmb = use tool', 'rmb = erase', 'wheel = size',
-          'e = ignite', 'space = pause', 'up/dn = speed', 'o = open edges',
-          'g = gravity', 'hold p = valves', 'sensor+valve: click sensor first', 'a = reset air', 'clr: ctrl+sh+del']
+G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
+          'space = pause, . = step', 'up/dn = speed', 'o = open edges', 'g = gravity',
+          'hold p = valves', 'hold k = starter', 'i = pin readout', 'select + ctrl+c/v',
+          'click block = cycle it', 'a = reset air', 'clr: ctrl+sh+del']
 
 
 class GasSim:
@@ -2077,11 +2139,21 @@ class GasSim:
         self.ring[1:-1, 1:-1] = False
         self.open = True                        # edges open to the outside air
         self.gravity = True
+        self.starter = False                    # hold k: motor spins the shafts up
         self.manual_valves = False              # P held: opens valves that aren't linked to a sensor
         self.valve_open = np.zeros(shape, bool)
         self.link = np.full(shape, -1, np.int32)    # valve/igniter -> sensor key (x * H2 + y), -1 = manual
         self.sensors = {}                       # (x, y) -> dict(type, dir, level, on)
         self.spark_t = np.zeros(shape, np.int16)
+        self.aux = np.zeros(shape, np.int8)        # filter gas / direction / level / source gas
+        self.glinks = {}                        # (x, y) -> dict(id, tgt, role, on) circuit links
+        self.shafts = []                        # dict(x, y, R, th, om)
+        self.hinges = []                        # dict(kind, ref, ox, oy, cx, cy)
+        self.rods = []                          # dict(a, b, L) between two hinges
+        self.comp_cache = {}
+        self.has = set()
+        self.passable = np.zeros(256, bool)
+        self.passable[list(G_PASS)] = True
         self.near_wall = None
         self.active = {0, 1}                    # which gases exist (index into G_SPECIES)
         self.age = 0
@@ -2115,7 +2187,11 @@ class GasSim:
         self.active = {0, 1}
 
     def clear(self):
+        self.shafts, self.hinges, self.rods = [], [], []
         self.sensors = {}
+        self.glinks = {}
+        self.aux[:] = 0
+        self.comp_cache = {}
         self.link[:] = -1
         self.valve_open[:] = False
         self.spark_t[:] = 0
@@ -2127,7 +2203,8 @@ class GasSim:
         self.reset_air()
 
     def rebuild(self):
-        sol = (self.kind > 0) & ~self.valve_open
+        sol = (self.kind > 0) & ~self.valve_open & ~self.passable[self.kind]
+        self.has = set(np.unique(self.kind).tolist())
         for b in self.bodies:
             sol[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']] = True
         self.solid = sol
@@ -2157,9 +2234,105 @@ class GasSim:
         mask = mask & ~self.solid
         self.n[:, mask] *= keep
 
+    def component(self, x, y):
+        # all cells touching (x, y) with the same kind (so one click changes a whole filter / pump)
+        k = self.kind[x, y]
+        m = np.zeros(self.kind.shape, bool)
+        if k == 0:
+            return m
+        todo = [(x, y)]
+        m[x, y] = True
+        while todo and m.sum() < 4000:
+            cx, cy = todo.pop()
+            for dx, dy in G_DIRS:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < self.W2 and 0 <= ny < self.H2 and not m[nx, ny] and self.kind[nx, ny] == k:
+                    m[nx, ny] = True
+                    todo.append((nx, ny))
+        return m
+
+    def comp_mask(self, key):
+        m = self.comp_cache.get(key)
+        if m is None:
+            m = self.component(*key)
+            self.comp_cache[key] = m
+        return m
+
+    def cycle(self, x, y):
+        # click a placed filter / pump / heater ... to change its setting
+        k = int(self.kind[x, y])
+        m = self.component(x, y)
+        a = int(self.aux[x, y])
+        if k in (G_FILTER, G_SOURCE):
+            a = (a + 1) % len(G_SPECIES)
+        elif k in (G_CHECK, G_PUMP):
+            a = (a + 1) % 4
+        elif k in (G_HEATER, G_COOLER):
+            a = (a + 1) % 5
+        self.aux[m] = a
+        return self.describe(x, y)
+
+    def describe(self, x, y):
+        k = int(self.kind[x, y])
+        a = int(self.aux[x, y])
+        if k == G_FILTER:
+            return f'filter, only lets {G_NICE[G_SPECIES[a]]} through (click to change)'
+        if k == G_SOURCE:
+            return f'source of {G_NICE[G_SPECIES[a]]} (click to change)'
+        if k == G_CHECK:
+            return f'one-way valve, flows {G_DIR_NAMES[a]}'
+        if k == G_PUMP:
+            return f'pump, pushes {G_DIR_NAMES[a]}'
+        if k == G_HEATER:
+            return f'heater, {G_HEAT_LEVELS[a] - 273}C'
+        if k == G_COOLER:
+            return f'cooler, {G_COOL_LEVELS[a] - 273}C'
+        if k == G_VENT:
+            return 'vent, eats gas next to it'
+        if k == G_LINK:
+            lk = self.glinks.get((x, y))
+            if lk:
+                what = 'sensor reading' if lk['role'] == 'tx' else 'valve / igniter'
+                return f"link {lk['id']} ({what}), {'ON' if lk.get('on') else 'off'}"
+            return 'link'
+        return ''
+
+    def add_link(self, x, y, lid, tgt):
+        if self.kind[x, y] or self.solid[x, y] or self.ring[x, y]:
+            return False
+        role = 'tx' if tgt in self.sensors else 'rx'
+        self.kind[x, y] = G_LINK
+        self.strength[x, y] = G_SOLIDS[G_LINK][1]
+        self.n[:, x, y] = 0
+        self.glinks[(x, y)] = dict(id=lid, tgt=tgt, role=role, on=False)
+        self.rebuild()
+        return True
+
+    def links_tick(self):
+        tx = {}
+        changed = False
+        for key, lk in self.glinks.items():
+            tgt = lk['tgt']
+            if lk['role'] == 'tx':
+                sn = self.sensors.get(tgt)
+                tx[lk['id']] = tx.get(lk['id'], 0) | int(bool(sn and sn['on']))
+            else:
+                st = bool(GAS_RX.get(lk['id'], 0))
+                if st != lk['on']:
+                    lk['on'] = st
+                    changed = True
+                    if st and self.kind[tgt] == G_IGNITER:
+                        self.ignite(self.comp_mask(tgt))
+        GAS_TX.clear()
+        GAS_TX.update(tx)
+        if changed:
+            self.update_valves()
+
     def set_solid(self, mask, kind, link=-1):
-        mask = mask & ~self.ring & ~self.body_mask() & (self.kind != G_SENSOR)   # never paint over sensors
+        mask = mask & ~self.ring & ~self.body_mask() & (self.kind != G_SENSOR) & (self.kind != G_LINK)
+        self.comp_cache = {}
         self.kind[mask] = kind
+        self.aux[mask] = G_DEFAULT_AUX.get(kind, 0)
         self.strength[mask] = G_SOLIDS[kind][1]
         self.link[mask] = link if kind in (G_VALVE, G_IGNITER) else -1
         self.valve_open[mask] = False
@@ -2179,6 +2352,8 @@ class GasSim:
         return True
 
     def remove_sensors(self, mask):
+        for key in [k for k in self.glinks if mask[k]]:
+            del self.glinks[key]
         for key in [k for k in self.sensors if mask[k]]:
             del self.sensors[key]
             self.link[self.link == key[0] * self.H2 + key[1]] = -1
@@ -2201,6 +2376,19 @@ class GasSim:
                         break
                     if self.kind[cx, cy] and not self.valve_open[cx, cy]:
                         break       # can't see through walls
+            elif t == 'timer':
+                per = G_TIMER_PERIODS[sn['level']]
+                on = (self.age % per) < max(1, int(per * G_TIMER_DUTY[sn['dir'] % 4]))
+            elif t == 'hinge':
+                dx, dy = G_DIRS[sn['dir']]
+                on = False
+                for h in self.hinges:
+                    hx, hy = self.hinge_pos(h)[:2]
+                    tt = (hx - x - 0.5) * dx + (hy - y - 0.5) * dy
+                    pp = abs((hx - x - 0.5) * dy - (hy - y - 0.5) * dx)
+                    if 0.4 <= tt <= G_SENSE_RANGE + 0.6 and pp <= 0.8:
+                        on = True
+                        break
             else:
                 vals = []
                 for dx, dy in G_DIRS:
@@ -2221,6 +2409,9 @@ class GasSim:
         valve = self.kind == G_VALVE
         on_keys = [x * self.H2 + y for (x, y), sn in self.sensors.items() if sn['on']]
         want = valve & (((self.link < 0) & self.manual_valves) | np.isin(self.link, on_keys))
+        for lk in self.glinks.values():
+            if lk['role'] == 'rx' and lk['on'] and self.kind[lk['tgt']] == G_VALVE:
+                want |= self.comp_mask(lk['tgt'])
         if (want == self.valve_open).all():
             return
         closing = self.valve_open & ~want
@@ -2240,7 +2431,9 @@ class GasSim:
     def erase(self, mask):
         mask = mask & ~self.ring
         hit = mask & (self.kind > 0)
+        self.comp_cache = {}
         self.remove_sensors(hit)
+        self.aux[hit] = 0
         self.kind[hit] = 0
         self.strength[hit] = 0
         self.link[hit] = -1
@@ -2248,6 +2441,8 @@ class GasSim:
         self.T[hit] = 293      # the hole starts empty and gas rushes in
         self.bodies = [b for b in self.bodies
                        if not mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]
+        if self.shafts or self.hinges:
+            self.erase_mech(mask & ~self.ring)
         self.rebuild()
 
     def add_body(self, x0, y0, x1, y1):
@@ -2322,6 +2517,221 @@ class GasSim:
         self.near_wall = None
         return True
 
+    # ---- copy / paste of a region (cells, gas, blocks, sensors, links, shafts, hinges, rods)
+    def copy_region(self, x0, y0, x1, y1):
+        x0, x1 = sorted((max(1, x0), min(self.W2 - 2, x1)))
+        y0, y1 = sorted((max(1, y0), min(self.H2 - 2, y1)))
+        sl = (slice(x0, x1 + 1), slice(y0, y1 + 1))
+        inside = lambda x, y: x0 <= x <= x1 and y0 <= y <= y1
+        clip = dict(w=x1 - x0 + 1, h=y1 - y0 + 1, x0=x0, y0=y0,
+                    n=self.n[(slice(None),) + sl].copy(), T=self.T[sl].copy(), kind=self.kind[sl].copy(),
+                    strength=self.strength[sl].copy(), aux=self.aux[sl].copy(), link=self.link[sl].copy())
+        clip['sensors'] = {k: dict(v) for k, v in self.sensors.items() if inside(*k)}
+        clip['glinks'] = {k: dict(v) for k, v in self.glinks.items() if inside(*k)}
+        bodies = [b for b in self.bodies if inside(b['x'], b['y']) and inside(b['x'] + b['w'] - 1, b['y'] + b['h'] - 1)]
+        shafts = [q for q in self.shafts if inside(q['x'] - q['R'], q['y'] - q['R']) and inside(q['x'] + q['R'], q['y'] + q['R'])]
+        clip['bodies'], clip['shafts'] = bodies, shafts
+        hs = [h for h in self.hinges if any(h['ref'] is o for o in (bodies if h['kind'] == 'body' else shafts))]
+        clip['hinges'] = hs
+        clip['rods'] = [r for r in self.rods if any(r['a'] is h for h in hs) and any(r['b'] is h for h in hs)]
+        return clip
+
+    def paste(self, clip, ox, oy):
+        # ox, oy = where the top-left corner of the copy lands
+        dx, dy = ox - clip['x0'], oy - clip['y0']
+        w, h = clip['w'], clip['h']
+        if ox < 1 or oy < 1 or ox + w > self.W2 - 1 or oy + h > self.H2 - 1:
+            return False
+        sl = (slice(ox, ox + w), slice(oy, oy + h))
+        mask = np.zeros(self.kind.shape, bool)
+        mask[sl] = True
+        self.erase(mask)
+        for b in [b for b in self.bodies if mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]:
+            self.bodies.remove(b)
+        self.n[(slice(None),) + sl] = clip['n']
+        self.T[sl] = clip['T']
+        self.kind[sl] = clip['kind']
+        self.strength[sl] = clip['strength']
+        self.aux[sl] = clip['aux']
+        old_h2 = self.H2
+        lk = clip['link'].copy()
+        # valve / igniter -> sensor links point at cells, so shift them with the copy
+        for ix in range(w):
+            for iy in range(h):
+                v = lk[ix, iy]
+                if v >= 0:
+                    sx, sy = divmod(int(v), self.H2)
+                    lk[ix, iy] = (sx + dx) * self.H2 + (sy + dy) if (sx, sy) in clip['sensors'] else -1
+        self.link[sl] = lk
+        self.valve_open[sl] = False
+        for (x, y), v in clip['sensors'].items():
+            v = dict(v)
+            v['on'] = False
+            self.sensors[(x + dx, y + dy)] = v
+        for (x, y), v in clip['glinks'].items():
+            v = dict(v)
+            v['on'] = False
+            t = v['tgt']
+            v['tgt'] = (t[0] + dx, t[1] + dy) if t and clip['x0'] <= t[0] < clip['x0'] + w and clip['y0'] <= t[1] < clip['y0'] + h else None
+            if v['tgt']:
+                self.glinks[(x + dx, y + dy)] = v
+            else:
+                self.kind[x + dx, y + dy] = 0
+        newb, news = {}, {}
+        for b in clip['bodies']:
+            nb = dict(b)
+            nb['x'] += dx
+            nb['y'] += dy
+            nb['vx'] = nb['vy'] = 0.0
+            nb['fx'] = nb['fy'] = 0.0
+            self.bodies.append(nb)
+            newb[id(b)] = nb
+        for q in clip['shafts']:
+            nq = dict(q)
+            nq['x'] += dx
+            nq['y'] += dy
+            nq['om'] = 0.0
+            self.shafts.append(nq)
+            news[id(q)] = nq
+        newh = {}
+        for h_ in clip['hinges']:
+            nh = dict(h_)
+            nh['ref'] = (newb if h_['kind'] == 'body' else news)[id(h_['ref'])]
+            self.hinges.append(nh)
+            newh[id(h_)] = nh
+        for r in clip['rods']:
+            self.rods.append(dict(a=newh[id(r['a'])], b=newh[id(r['b'])], L=r['L']))
+        self.comp_cache = {}
+        self.rebuild()
+        self.update_valves()
+        self.active |= set(np.nonzero(clip['n'].reshape(clip['n'].shape[0], -1).max(1) > 1e-7)[0].tolist())
+        return True
+
+    # ---- crankshafts: shafts spin, hinges sit on blocks / shafts, rods hold two hinges a fixed distance apart
+    def shaft_inertia(self, sh):
+        return 0.5 * G_SHAFT_DENS * math.pi * sh['R'] ** 4
+
+    def hinge_pos(self, h):
+        # (x, y, vx, vy, rx, ry), r = lever arm from the shaft centre (None on blocks)
+        r = h['ref']
+        if h['kind'] == 'body':
+            return (r['x'] + r['fx'] + h['cx'] * r['w'], r['y'] + r['fy'] + h['cy'] * r['h'],
+                    r['vx'], r['vy'], None, None)
+        c, sn = math.cos(r['th']), math.sin(r['th'])
+        rx = h['ox'] * c - h['oy'] * sn
+        ry = h['ox'] * sn + h['oy'] * c
+        return (r['x'] + rx, r['y'] + ry, -r['om'] * ry, r['om'] * rx, rx, ry)
+
+    def add_shaft(self, x, y, R):
+        for sh in self.shafts:
+            if math.hypot(sh['x'] - x, sh['y'] - y) < 1:
+                return False
+        self.shafts.append(dict(x=x, y=y, R=max(3.0, R), th=0.0, om=0.0))
+        return True
+
+    def add_hinge(self, fx, fy):
+        # on a block: snaps to the closest corner. on a shaft: right where you clicked
+        for b in self.bodies:
+            if b['x'] <= fx < b['x'] + b['w'] and b['y'] <= fy < b['y'] + b['h']:
+                cx = 1 if fx - b['x'] > b['w'] / 2 else 0
+                cy = 1 if fy - b['y'] > b['h'] / 2 else 0
+                for h in self.hinges:
+                    if h['kind'] == 'body' and h['ref'] is b and h['cx'] == cx and h['cy'] == cy:
+                        return 'that corner already has a hinge'
+                self.hinges.append(dict(kind='body', ref=b, ox=0.0, oy=0.0, cx=cx, cy=cy))
+                return 'hinge on block'
+        for sh in self.shafts:
+            dx, dy = fx - sh['x'], fy - sh['y']
+            if math.hypot(dx, dy) <= sh['R']:
+                c, sn = math.cos(-sh['th']), math.sin(-sh['th'])
+                self.hinges.append(dict(kind='shaft', ref=sh, ox=dx * c - dy * sn, oy=dx * sn + dy * c, cx=0, cy=0))
+                return 'hinge on shaft'
+        return 'put hinges on a block or inside a shaft'
+
+    def near_hinge(self, fx, fy, reach=3.0):
+        best, bd = None, reach
+        for h in self.hinges:
+            hx, hy = self.hinge_pos(h)[:2]
+            d = math.hypot(hx - fx, hy - fy)
+            if d < bd:
+                best, bd = h, d
+        return best
+
+    def add_rod(self, ha, hb):
+        if ha is hb:
+            return False
+        for r in self.rods:
+            if (r['a'] is ha and r['b'] is hb) or (r['a'] is hb and r['b'] is ha):
+                return False
+        pa, pb = self.hinge_pos(ha), self.hinge_pos(hb)
+        self.rods.append(dict(a=ha, b=hb, L=max(1.0, math.hypot(pa[0] - pb[0], pa[1] - pb[1]))))
+        return True
+
+    def prune_mech(self):
+        live_b = {id(b) for b in self.bodies}
+        live_s = {id(sh) for sh in self.shafts}
+        self.hinges = [h for h in self.hinges
+                       if id(h['ref']) in (live_b if h['kind'] == 'body' else live_s)]
+        ids = {id(h) for h in self.hinges}
+        self.rods = [r for r in self.rods if id(r['a']) in ids and id(r['b']) in ids]
+
+    def erase_mech(self, mask):
+        keep = []
+        for sh in self.shafts:
+            x0, x1 = int(sh['x'] - sh['R']) - 1, int(sh['x'] + sh['R']) + 2
+            y0, y1 = int(sh['y'] - sh['R']) - 1, int(sh['y'] + sh['R']) + 2
+            sub = mask[max(0, x0):max(0, x1), max(0, y0):max(0, y1)]
+            hit = False
+            if sub.any():
+                xs, ys = np.nonzero(sub)
+                hit = bool((((xs + max(0, x0) + 0.5 - sh['x']) ** 2 + (ys + max(0, y0) + 0.5 - sh['y']) ** 2) <= sh['R'] ** 2).any())
+            if not hit:
+                keep.append(sh)
+        self.shafts = keep
+        self.hinges = [h for h in self.hinges
+                       if not mask[min(self.W2 - 1, max(0, int(self.hinge_pos(h)[0]))),
+                                   min(self.H2 - 1, max(0, int(self.hinge_pos(h)[1])))]
+                       or (h['kind'] == 'shaft' and h['ref'] in keep and False)]
+        self.prune_mech()
+
+    def solve_rods(self):
+        # velocity-level distance constraints (impulses), with a little push-back so errors don't pile up
+        for _ in range(6):
+            for r in self.rods:
+                A, B = self.hinge_pos(r['a']), self.hinge_pos(r['b'])
+                dx, dy = A[0] - B[0], A[1] - B[1]
+                dist = math.hypot(dx, dy)
+                if dist < 1e-6:
+                    continue
+                dx, dy = dx / dist, dy / dist
+                vrel = (A[2] - B[2]) * dx + (A[3] - B[3]) * dy
+                inv = []
+                for h, P in ((r['a'], A), (r['b'], B)):
+                    if h['kind'] == 'body':
+                        b = h['ref']
+                        m = b['w'] * b['h'] * G_BODY_DENSITY
+                        ix = 0.0 if b.get('lx', 0) > 0 else 1.0 / m
+                        iy = 0.0 if b.get('ly', 0) > 0 else 1.0 / m
+                        inv.append(dx * dx * ix + dy * dy * iy)
+                    else:
+                        cr = P[4] * dy - P[5] * dx
+                        inv.append(cr * cr / self.shaft_inertia(h['ref']))
+                tot = inv[0] + inv[1]
+                if tot < 1e-9:
+                    continue
+                lam = -(vrel + 0.25 * (dist - r['L'])) / tot
+                for h, P, sgn in ((r['a'], A, 1), (r['b'], B, -1)):
+                    if h['kind'] == 'body':
+                        b = h['ref']
+                        m = b['w'] * b['h'] * G_BODY_DENSITY
+                        if b.get('lx', 0) <= 0:
+                            b['vx'] += sgn * lam * dx / m
+                        if b.get('ly', 0) <= 0:
+                            b['vy'] += sgn * lam * dy / m
+                    else:
+                        cr = P[4] * dy - P[5] * dx
+                        h['ref']['om'] += sgn * lam * cr / self.shaft_inertia(h['ref'])
+
     def move_bodies(self, p):
         for b in self.bodies:
             x, y, w, h = b['x'], b['y'], b['w'], b['h']
@@ -2335,6 +2745,14 @@ class GasSim:
             b['vy'] = (b['vy'] + fy * G_PUSH / mass + (G_BODY_G if self.gravity else 0)) * 0.998
             b['vx'] = max(-0.9, min(0.9, b['vx']))
             b['vy'] = max(-0.9, min(0.9, b['vy']))
+        if self.rods:
+            self.solve_rods()
+            for b in self.bodies:
+                b['vx'] = max(-0.9, min(0.9, b['vx']))
+                b['vy'] = max(-0.9, min(0.9, b['vy']))
+        for b in self.bodies:
+            b['lx'] = max(0, b.get('lx', 0) - 1)
+            b['ly'] = max(0, b.get('ly', 0) - 1)
             for axis in ('x', 'y'):
                 vk, fk = 'v' + axis, 'f' + axis
                 b[fk] += b[vk]
@@ -2344,10 +2762,16 @@ class GasSim:
                     if not moved:
                         b[vk] *= -0.25          # bonk
                         b[fk] = 0.0
+                        b['l' + axis] = 3       # rods can't push a block into a wall
                         if axis == 'y':
                             b['vx'] *= 0.9      # friction on the floor
                         break
                     b[fk] -= d
+        for sh in self.shafts:
+            if self.starter and sh['om'] < G_STARTER_MAX:
+                sh['om'] += G_STARTER_T / self.shaft_inertia(sh)
+            sh['th'] = (sh['th'] + sh['om']) % (2 * math.pi)
+            sh['om'] *= G_SHAFT_DAMP
 
     # walls cracking
     def check_breaks(self, p):
@@ -2411,6 +2835,100 @@ class GasSim:
         self.debris = alive
 
     # physics
+    def shift(self, m, dx, dy):
+        # m moved so that out[x, y] = m[x + dx, y + dy] (False off the edge)
+        o = np.zeros_like(m)
+        xs = slice(max(0, -dx), m.shape[0] - max(0, dx))
+        xd = slice(max(0, dx), m.shape[0] - max(0, -dx))
+        ys = slice(max(0, -dy), m.shape[1] - max(0, dy))
+        yd = slice(max(0, dy), m.shape[1] - max(0, -dy))
+        o[xs, ys] = m[xd, yd]
+        return o
+
+    def flow_devices(self, u, v):
+        # one-way valves only let flow go their way, pumps push it
+        for kd, push in ((G_CHECK, False), (G_PUMP, True)):
+            if kd not in self.has:
+                continue
+            for d, (dx, dy) in enumerate(G_DIRS):
+                m = (self.kind == kd) & (self.aux == d)
+                if not m.any():
+                    continue
+                xs, ys = np.nonzero(m)
+                if dx:
+                    for fx in (xs - 1, xs):
+                        ok = (fx >= 0) & (fx < u.shape[0])
+                        a, b = fx[ok], ys[ok]
+                        u[a, b] = np.maximum(u[a, b], G_PUMP_V if push else 0) if dx > 0 \
+                            else np.minimum(u[a, b], -G_PUMP_V if push else 0)
+                    ok = (ys >= 0) & (ys < v.shape[1])
+                    v[xs[ok], ys[ok]] = 0
+                    ok = ys >= 1
+                    v[xs[ok], ys[ok] - 1] = 0
+                else:
+                    for fy in (ys - 1, ys):
+                        ok = (fy >= 0) & (fy < v.shape[1])
+                        a, b = xs[ok], fy[ok]
+                        v[a, b] = np.maximum(v[a, b], G_PUMP_V if push else 0) if dy > 0 \
+                            else np.minimum(v[a, b], -G_PUMP_V if push else 0)
+                    ok = (xs >= 0) & (xs < u.shape[0])
+                    u[xs[ok], ys[ok]] = 0
+                    ok = xs >= 1
+                    u[xs[ok] - 1, ys[ok]] = 0
+
+    def devices(self, n, T, sol):
+        S = n.shape[0]
+        ntot = n.sum(0)
+        p = ntot * T / 293
+        if G_FILTER in self.has:
+            f = self.kind == G_FILTER
+            # whatever isn't the allowed gas is pushed back out to the neighbour with the highest pressure
+            best = np.full(T.shape, -1.0, np.float32)
+            pick = np.full(T.shape, -1, np.int8)
+            for d, (dx, dy) in enumerate(G_DIRS):
+                pk = np.where(self.shift(~sol & ~f, dx, dy), self.shift(p, dx, dy), -1.0)
+                better = pk > best
+                best = np.where(better, pk, best)
+                pick = np.where(better, d, pick).astype(np.int8)
+            for d, (dx, dy) in enumerate(G_DIRS):
+                m = f & (pick == d)
+                if not m.any():
+                    continue
+                xs, ys = np.nonzero(m)
+                blocked = n[:, xs, ys].copy()
+                blocked[self.aux[xs, ys].astype(int), np.arange(len(xs))] = 0
+                n[:, xs, ys] -= blocked
+                n[:, xs + dx, ys + dy] += blocked
+        if G_HEATER in self.has or G_COOLER in self.has:
+            src = (self.kind == G_HEATER) | (self.kind == G_COOLER)
+            tv = np.where(self.kind == G_HEATER, np.array(G_HEAT_LEVELS, np.float32)[np.clip(self.aux, 0, 4)],
+                          np.array(G_COOL_LEVELS, np.float32)[np.clip(self.aux, 0, 4)])
+            acc = np.zeros(T.shape, np.float32)
+            cnt = np.zeros(T.shape, np.float32)
+            for dx, dy in G_DIRS:
+                sm = self.shift(src, dx, dy)
+                acc += np.where(sm, self.shift(tv, dx, dy), 0)
+                cnt += sm
+            m = (cnt > 0) & ~sol & (ntot > 1e-3)
+            T[m] += 0.25 * (acc[m] / cnt[m] - T[m])
+        if G_SOURCE in self.has:
+            for sp in np.unique(self.aux[self.kind == G_SOURCE]).tolist():
+                src = (self.kind == G_SOURCE) & (self.aux == sp)
+                adj = np.zeros(T.shape, bool)
+                for dx, dy in G_DIRS:
+                    adj |= self.shift(src, dx, dy)
+                adj &= ~sol
+                add = adj & (p < 4)
+                n[sp][add] += G_RATE
+                self.active.add(sp)
+        if G_VENT in self.has:
+            src = self.kind == G_VENT
+            adj = np.zeros(T.shape, bool)
+            for dx, dy in G_DIRS:
+                adj |= self.shift(src, dx, dy)
+            adj &= ~sol
+            n[:, adj] *= 0.85
+
     def step(self):
         n, T, sol = self.n, self.T, self.solid
         ring = self.ring
@@ -2423,9 +2941,9 @@ class GasSim:
             n[:, ring] = 0
         self.age += 1
         # blocks and cracking walls work on the whole grid before the gas moves
-        if self.bodies or self.sensors or (self.age % 4 == 0 and self.strength.any()):
+        if self.bodies or self.shafts or self.sensors or (self.age % 4 == 0 and self.strength.any()):
             p0 = n.sum(0) * T / 293
-            if self.bodies:
+            if self.bodies or self.shafts:
                 self.move_bodies(p0)
             if self.sensors:
                 self.sense(p0)
@@ -2433,6 +2951,8 @@ class GasSim:
                 self.check_breaks(p0)    # walls crack when the pressure across them is too much
             sol = self.solid
             n[:, sol] = 0
+        if self.glinks:
+            self.links_tick()
         # only push around the gases that actually exist right now (much faster)
         if self.age % 120 == 0:
             live = n.reshape(n.shape[0], -1).max(1) > 1e-7
@@ -2467,6 +2987,9 @@ class GasSim:
         v[:, 1:-1] += G_VISC * (vv[:, :-2] + vv[:, 2:] - 2 * vv[:, 1:-1])
         u *= G_DAMP * ox
         v *= G_DAMP * oy
+        chk = (self.kind == G_CHECK) if G_CHECK in self.has else None
+        if G_PUMP in self.has or chk is not None:
+            self.flow_devices(u, v)
         np.clip(u, -0.4, 0.4, out=u)
         np.clip(v, -0.4, 0.4, out=v)
         # never move more than 70% of a cell out in one step
@@ -2479,8 +3002,12 @@ class GasSim:
         out[:, 1:] -= vn
         s = np.minimum(1.0, 0.7 / (out + 1e-9))
         # flux = (what leaves the left cell) - (what leaves the right cell), upwind + mixing
-        dx = G_DIFF * ox
-        dy = G_DIFF * oy
+        if chk is not None:
+            dx = G_DIFF * (ox & ~(chk[:-1] | chk[1:]))      # no backwards leaking through one-way valves
+            dy = G_DIFF * (oy & ~(chk[:, :-1] | chk[:, 1:]))
+        else:
+            dx = G_DIFF * ox
+            dy = G_DIFF * oy
         al = up * s[:-1] + dx
         ar = un * s[1:] - dx
         bl = vp * s[:, :-1] + dy
@@ -2516,6 +3043,8 @@ class GasSim:
         full[idx] = n
         n = full
         S = n.shape[0]
+        if self.has & {G_FILTER, G_HEATER, G_COOLER, G_SOURCE, G_VENT}:
+            self.devices(n, T, sol)
         # sparks from igniters
         if self.spark_t.any():
             sm = (self.spark_t > 0) & ~sol
@@ -2571,6 +3100,25 @@ class GasSim:
         kind = self.kind[1:-1, 1:-1]
         for i in range(1, len(G_SOLIDS)):
             col[kind == i] = G_SOLIDS[i][2]
+        aux = self.aux[1:-1, 1:-1]
+        gx = np.arange(kind.shape[0])[:, None]
+        gy = np.arange(kind.shape[1])[None, :]
+        for kd in (G_CHECK, G_PUMP):
+            if kd in self.has:
+                for d, (dx, dy) in enumerate(G_DIRS):
+                    m = (kind == kd) & (aux == d) & (((gx * dx + gy * dy) % 3) == 0)
+                    col[m] = np.minimum(255, col[m] * 1.5 + 30)
+        if G_FILTER in self.has or G_SOURCE in self.has:
+            gc = np.array(G_COLOR, np.float32)
+            for kd in (G_FILTER, G_SOURCE):
+                m = kind == kd
+                if m.any():
+                    col[m] = np.minimum(255, gc[aux[m].astype(int)] * 1.6 + 40)
+        if G_HEATER in self.has or G_COOLER in self.has:
+            for kd, base in ((G_HEATER, (255, 70, 20)), (G_COOLER, (30, 140, 255))):
+                m = kind == kd
+                if m.any():
+                    col[m] = np.array(base, np.float32) * (0.45 + 0.14 * np.clip(aux[m], 0, 4))[:, None]
         col[self.valve_open[1:-1, 1:-1]] = G_VALVE_OPEN
         for (x, y), sn in self.sensors.items():
             c = G_SENSOR_COLOR[sn['type']]
@@ -2590,11 +3138,18 @@ class GasSim:
                 sn = self.sensors.get((x, y))
                 if sn:
                     st_ = 'ON' if sn['on'] else 'off'
+                    if sn['type'] == 'timer':
+                        per = G_TIMER_PERIODS[sn['level']]
+                        return f"timer, on {int(per * G_TIMER_DUTY[sn['dir'] % 4])} of every {per} steps, {st_} (click = period, ctrl+click = on time)"
+                    if sn['type'] == 'hinge':
+                        return f"hinge sensor, looks {G_DIR_NAMES[sn['dir']]} {G_SENSE_RANGE} cells, {st_}"
                     if sn['type'] == 'block':
                         return f"block sensor, looks {G_DIR_NAMES[sn['dir']]} {G_SENSE_RANGE} cells, {st_}"
                     if sn['type'] == 'temp':
                         return f"temp sensor, on above {G_TEMP_LEVELS[sn['level']]}C, {st_}"
                     return f"pressure sensor, on above {G_PRES_LEVELS[sn['level']]} atm, {st_}"
+            if self.kind[x, y] >= G_FILTER:
+                return self.describe(x, y)
             linked = '  (linked to a sensor)' if self.link[x, y] >= 0 else ''
             if self.kind[x, y] == G_VALVE:
                 return 'valve ' + ('open' if self.valve_open[x, y] else
@@ -2622,14 +3177,26 @@ class GasSim:
                              for (x, y), v in self.sensors.items()], np.int32).reshape(-1, 5)
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
                                 bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
-                                sensors=sens, link=self.link)
+                                sensors=sens, link=self.link, aux=self.aux,
+                                shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om']] for q in self.shafts],
+                                                np.float64).reshape(-1, 5),
+                                hinges=np.array([[int(h['kind'] == 'shaft'),
+                                                  (self.shafts if h['kind'] == 'shaft' else self.bodies).index(h['ref']),
+                                                  h['ox'], h['oy'], h['cx'], h['cy']] for h in self.hinges],
+                                                np.float64).reshape(-1, 6),
+                                rods=np.array([[self.hinges.index(r['a']), self.hinges.index(r['b']), r['L']]
+                                               for r in self.rods], np.float64).reshape(-1, 3),
+                                glinks=np.array([[x, y, v['id'], v['tgt'][0] if v['tgt'] else -1,
+                                                  v['tgt'][1] if v['tgt'] else -1, int(v['role'] == 'rx')]
+                                                 for (x, y), v in self.glinks.items()], np.int32).reshape(-1, 6))
         os.replace(tmp, path)
 
     def load(self, path):
         with np.load(path) as d:
-            if d['n'].shape != self.n.shape:
+            if d['n'].shape[1:] != self.n.shape[1:]:
                 return
-            self.n[:] = d['n']
+            self.n[:] = 0
+            self.n[:d['n'].shape[0]] = d['n'][:self.n.shape[0]]      # older saves have fewer gases
             self.T[:] = d['T']
             if 'kind' in d:
                 self.kind[:] = d['kind']
@@ -2648,6 +3215,29 @@ class GasSim:
                 for x, y, t, dr, lv in d['sensors'].tolist():
                     self.sensors[(x, y)] = dict(type=G_SENSOR_KINDS[t], dir=dr, level=lv, on=False)
                 self.link[:] = d['link']
+            self.shafts, self.hinges, self.rods = [], [], []
+            if 'shafts' in d:
+                for x, y, R, th, om in d['shafts'].tolist():
+                    self.shafts.append(dict(x=x, y=y, R=R, th=th, om=om))
+                for kd, ri, ox, oy, cx, cy in d['hinges'].tolist():
+                    lst = self.shafts if kd else self.bodies
+                    if int(ri) < len(lst):
+                        self.hinges.append(dict(kind='shaft' if kd else 'body', ref=lst[int(ri)],
+                                                ox=ox, oy=oy, cx=int(cx), cy=int(cy)))
+                    else:
+                        self.hinges.append(None)
+                for a_, b_, L in d['rods'].tolist():
+                    ha, hb = self.hinges[int(a_)], self.hinges[int(b_)]
+                    if ha and hb:
+                        self.rods.append(dict(a=ha, b=hb, L=L))
+                self.hinges = [h for h in self.hinges if h]
+            self.aux[:] = d['aux'] if 'aux' in d else 0
+            self.glinks = {}
+            if 'glinks' in d:
+                for x, y, lid, tx_, ty_, rx_ in d['glinks'].tolist():
+                    self.glinks[(x, y)] = dict(id=lid, tgt=(tx_, ty_) if tx_ >= 0 else None,
+                                               role='rx' if rx_ else 'tx', on=False)
+            self.comp_cache = {}
             self.open = bool(d['open'])
             if 'gravity' in d:
                 self.gravity = bool(d['gravity'])
@@ -2673,6 +3263,16 @@ class GasMode:
         self.path = os.path.join(os.path.dirname(save_path()), 'gas.npz')
         self.cs, self.x0, self.y0 = 5, PAL_W, 0
         self.link_sensor = None     # sensor that new valves / igniters get hooked to
+        self.link_target = None     # sensor / valve / igniter that the next LINK cell connects to
+        self.link_id = 1
+        self.rod_first = None       # first hinge of a rod being placed
+        self.sel = None             # SELECT tool rectangle (cell corners)
+        self.clip = None
+        self.pasting = False
+        self.pins = []              # cells with a live readout
+        self.sps, self._steps, self._t0 = 240.0, 0, time.time()
+        self.mat_scroll = 0
+        self.list_bottom = 560
         try:
             if os.path.exists(self.path):
                 self.sim.load(self.path)
@@ -2698,8 +3298,15 @@ class GasMode:
     def tool_rect(self, i):
         return pygame.Rect(12, 40 + i * 24, PAL_W - 24, 20)
 
+    def mat_top(self):
+        return 40 + len(G_TOOLS) * 24 + 26
+
     def mat_rect(self, i):
-        return pygame.Rect(12, 40 + len(G_TOOLS) * 24 + 26 + i * 21, PAL_W - 24, 19)
+        return pygame.Rect(12, self.mat_top() + i * 21 - self.mat_scroll, PAL_W - 24, 19)
+
+    def clamp_scroll(self):
+        room = self.list_bottom - self.mat_top()
+        self.mat_scroll = max(0, min(self.mat_scroll, len(G_MATS) * 21 - room))
 
     # masks over the padded grid
     def seg_mask(self, a, b, r):
@@ -2750,8 +3357,8 @@ class GasMode:
             if self.link_sensor and self.mat in ('VALVE', 'IGNITER'):
                 link = self.link_sensor[0] * sim.H2 + self.link_sensor[1]
             sim.set_solid(mask, G_SOLID_MATS[self.mat], link)
-        elif self.mat in G_SENSOR_TYPES:
-            pass        # sensors are placed one click at a time
+        elif self.mat in G_SENSOR_TYPES or self.mat in ('LINK',) + G_MECH:
+            pass        # sensors and links are placed one click at a time
         elif self.mat == 'BLOCK':
             self.app.say('draw blocks with RECT')
         elif self.mat == 'VACUUM':
@@ -2770,8 +3377,12 @@ class GasMode:
             if k == pygame.K_ESCAPE:
                 if self.drag:
                     self.drag = None
-                elif self.link_sensor:
-                    self.link_sensor = None
+                elif self.pasting:
+                    self.pasting = False
+                elif self.sel:
+                    self.sel = None
+                elif self.link_sensor or self.link_target or self.rod_first:
+                    self.link_sensor = self.link_target = self.rod_first = None
                     self.app.say('stopped linking')
                 else:
                     return 'quit'
@@ -2781,6 +3392,32 @@ class GasMode:
             elif ctrl and shift and k == pygame.K_DELETE:
                 self.sim.clear()
                 self.dirty = True
+            elif ctrl and k == pygame.K_c:
+                if self.sel:
+                    (ax, ay), (bx, by) = self.sel
+                    self.clip = self.sim.copy_region(ax + 1, ay + 1, bx + 1, by + 1)
+                    self.app.say(f"copied {self.clip['w']} x {self.clip['h']}, ctrl+v to paste")
+                else:
+                    self.app.say('use the SELECT tool first')
+            elif ctrl and k == pygame.K_v:
+                if self.clip:
+                    self.pasting = True
+                    self.app.say('click to paste, esc or rmb to stop')
+                else:
+                    self.app.say('nothing copied yet')
+            elif k == pygame.K_k:
+                self.sim.starter = True
+            elif k == pygame.K_PERIOD:
+                if self.paused:
+                    self.sim.step()
+                    self.sim.move_debris(1, 1 / 60)
+            elif k == pygame.K_i:
+                hv = self.cell(pygame.mouse.get_pos(), clamp=False)
+                if hv:
+                    if hv in self.pins:
+                        self.pins.remove(hv)
+                    elif len(self.pins) < 6:
+                        self.pins.append(hv)
             elif k == pygame.K_e:
                 self.sim.ignite()
             elif k == pygame.K_SPACE:
@@ -2807,24 +3444,95 @@ class GasMode:
                 self.size = max(0, self.size - 1)
         elif e.type == pygame.KEYUP and e.key == pygame.K_p:
             self.sim.set_valves(False)
+        elif e.type == pygame.KEYUP and e.key == pygame.K_k:
+            self.sim.starter = False
         elif e.type == pygame.MOUSEWHEEL:
-            self.size = max(0, min(12, self.size + e.y))
+            if pygame.mouse.get_pos()[0] < PAL_W:
+                self.mat_scroll -= e.y * 42
+                self.clamp_scroll()
+            else:
+                self.size = max(0, min(12, self.size + e.y))
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button in (1, 3):
             if e.pos[0] < PAL_W:
                 for i, t in enumerate(G_TOOLS):
                     if self.tool_rect(i).collidepoint(e.pos):
                         self.tool = t
                 for i, (m, _) in enumerate(G_MATS):
-                    if self.mat_rect(i).collidepoint(e.pos):
+                    r = self.mat_rect(i)
+                    if r.collidepoint(e.pos) and r.top >= self.mat_top() - 4 and r.bottom <= self.list_bottom + 2:
                         self.mat = m
                         if m not in ('VALVE', 'IGNITER'):
                             self.link_sensor = None
+                        if m != 'LINK':
+                            self.link_target = None
+                        if m != 'ROD':
+                            self.rod_first = None
                 return None
             c = self.cell(e.pos)
+            if self.pasting:
+                if e.button == 1:
+                    if self.sim.paste(self.clip, c[0] + 1, c[1] + 1):
+                        self.dirty = True
+                    else:
+                        self.app.say("doesn't fit there")
+                else:
+                    self.pasting = False
+                return None
             erase = e.button == 3
             key = (c[0] + 1, c[1] + 1)
             sn = self.sim.sensors.get(key)
+            kd = int(self.sim.kind[key])
+            fx = (e.pos[0] - self.x0) / self.cs + 1
+            fy = (e.pos[1] - self.y0) / self.cs + 1
+            if self.tool == 'SELECT' and not erase:
+                self.drag = dict(start=c, cur=c, last=c, erase=False, tool='SELECT')
+                return None
             if not erase and self.tool != 'ERASE':
+                if self.mat == 'SHAFT':
+                    self.drag = dict(start=c, cur=c, last=c, erase=False, tool='SHAFT')
+                    return None
+                if self.mat == 'HINGE':
+                    self.app.say(self.sim.add_hinge(fx, fy))
+                    self.dirty = True
+                    return None
+                if self.mat == 'ROD':
+                    h = self.sim.near_hinge(fx, fy)
+                    if h is None:
+                        self.app.say('click a hinge')
+                    elif self.rod_first is None:
+                        self.rod_first = h
+                        self.app.say('now click the other hinge (esc to cancel)')
+                    else:
+                        if self.sim.add_rod(self.rod_first, h):
+                            self.app.say('rod connected')
+                            self.dirty = True
+                        else:
+                            self.app.say('pick a different hinge')
+                        self.rod_first = None
+                    return None
+                if self.mat == 'LINK':
+                    if kd == G_LINK:
+                        lk = self.sim.glinks.get(key)
+                        if lk:
+                            lk['id'] = lk['id'] % 16 + 1
+                            self.link_id = lk['id']
+                            self.dirty = True
+                            self.app.say(self.sim.describe(*key))
+                    elif sn or kd in (G_VALVE, G_IGNITER):
+                        self.link_target = key
+                        self.app.say('now place a link cell, it connects to this (esc to stop)')
+                    elif self.link_target is None:
+                        self.app.say('click a sensor, valve or igniter first, then place the link')
+                    elif not self.sim.add_link(key[0], key[1], self.link_id, self.link_target):
+                        self.app.say('links go on empty cells')
+                    else:
+                        self.dirty = True
+                        self.app.say(f'link {self.link_id} placed (click it to change the id)')
+                    return None
+                if kd >= G_FILTER and kd != G_LINK and G_SOLID_MATS.get(self.mat) == kd and kd != G_VENT:
+                    self.app.say(self.sim.cycle(key[0], key[1]))
+                    self.dirty = True
+                    return None
                 if sn and self.mat in ('VALVE', 'IGNITER'):
                     # click a sensor first, then whatever valves / igniters you draw follow it
                     if self.link_sensor == key:
@@ -2836,7 +3544,11 @@ class GasMode:
                     return None
                 if sn and G_SENSOR_TYPES.get(self.mat) == sn['type']:
                     # clicking a sensor with its own type picked tweaks it
-                    if sn['type'] == 'block':
+                    if sn['type'] == 'timer' and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                        sn['dir'] = (sn['dir'] + 1) % 4
+                    elif sn['type'] == 'timer':
+                        sn['level'] = (sn['level'] + 1) % 5
+                    elif sn['type'] in ('block', 'hinge'):
                         sn['dir'] = (sn['dir'] + 1) % 4
                     else:
                         sn['level'] = (sn['level'] + 1) % 5
@@ -2858,7 +3570,15 @@ class GasMode:
             self.drag['cur'] = self.cell(e.pos)
         elif e.type == pygame.MOUSEBUTTONUP and self.drag and e.button in (1, 3):
             d, self.drag = self.drag, None
-            if d['tool'] == 'LINE':
+            if d['tool'] == 'SHAFT':
+                (ax, ay), (bx, by) = d['start'], d['cur']
+                R = math.hypot(bx - ax, by - ay)
+                if self.sim.add_shaft(ax + 1.5, ay + 1.5, R):
+                    self.app.say(f'shaft, radius {max(3, R):.0f}: bigger = heavier flywheel')
+                    self.dirty = True
+            elif d['tool'] == 'SELECT':
+                self.sel = (d['start'], d['cur'])
+            elif d['tool'] == 'LINE':
                 self.apply(self.seg_mask(d['start'], d['cur'], self.size), 1.0)
             elif d['tool'] == 'RECT':
                 if self.mat == 'BLOCK':
@@ -2886,6 +3606,10 @@ class GasMode:
                 if time.perf_counter() - t0 > 0.014:
                     break       # slow pc: keep the frame rate, run the sim slower
             self.sim.move_debris(done, dt)
+            self._steps += done
+            if time.time() - self._t0 >= 1.0:
+                self.sps = self._steps / (time.time() - self._t0)
+                self._steps, self._t0 = 0, time.time()
             self.dirty = True
 
     def save(self):
@@ -2922,17 +3646,70 @@ class GasMode:
             a = (self.x0 + d['start'][0] * cs + cs // 2, self.y0 + d['start'][1] * cs + cs // 2)
             b = (self.x0 + d['cur'][0] * cs + cs // 2, self.y0 + d['cur'][1] * cs + cs // 2)
             pygame.draw.line(surf, SEL, a, b, max(1, (2 * self.size + 1) * cs))
-        elif d and d['tool'] == 'RECT':
+        elif d and d['tool'] in ('RECT', 'SELECT'):
             (ax, ay), (bx, by) = d['start'], d['cur']
             r = pygame.Rect(self.x0 + min(ax, bx) * cs, self.y0 + min(ay, by) * cs,
                             (abs(bx - ax) + 1) * cs, (abs(by - ay) + 1) * cs)
             pygame.draw.rect(surf, SEL, r, 1)
+        # selection, paste ghost, pinned cells
+        if self.sel:
+            (ax, ay), (bx, by) = self.sel
+            pygame.draw.rect(surf, (120, 220, 255), pygame.Rect(self.x0 + min(ax, bx) * cs, self.y0 + min(ay, by) * cs,
+                                                                (abs(bx - ax) + 1) * cs, (abs(by - ay) + 1) * cs), 1)
+        if self.pasting and self.clip:
+            gc = self.cell(mp, clamp=False)
+            if gc:
+                pygame.draw.rect(surf, (120, 255, 160), pygame.Rect(self.x0 + gc[0] * cs, self.y0 + gc[1] * cs,
+                                                                    self.clip['w'] * cs, self.clip['h'] * cs), 1)
+        # shafts, rods and hinges
+        sim = self.sim
+        def scr(px, py):
+            return (int(self.x0 + (px - 1) * cs), int(self.y0 + (py - 1) * cs))
+        for sh in sim.shafts:
+            c0 = scr(sh['x'], sh['y'])
+            R = int(sh['R'] * cs)
+            pygame.draw.circle(surf, (52, 58, 76), c0, R)
+            pygame.draw.circle(surf, (150, 160, 182), c0, R, 2)
+            for k in range(4):
+                a_ = sh['th'] + k * math.pi / 2
+                pygame.draw.line(surf, (90, 98, 120), c0, (c0[0] + R * math.cos(a_), c0[1] + R * math.sin(a_)), 1)
+            pygame.draw.circle(surf, (150, 160, 182), c0, 3)
+            rpm = sh['om'] / (2 * math.pi) * self.sps * 60
+            t = self.app.tiny.render(f'{rpm:.0f} rpm', True, (200, 205, 220))
+            surf.blit(t, (c0[0] - t.get_width() // 2, c0[1] + R + 3))
+        for r in sim.rods:
+            pa, pb = sim.hinge_pos(r['a']), sim.hinge_pos(r['b'])
+            pygame.draw.line(surf, (30, 32, 40), scr(pa[0], pa[1]), scr(pb[0], pb[1]), max(4, cs + 1))
+            pygame.draw.line(surf, (200, 204, 214), scr(pa[0], pa[1]), scr(pb[0], pb[1]), max(2, cs - 1))
+        for h in sim.hinges:
+            hp = scr(*sim.hinge_pos(h)[:2])
+            pygame.draw.circle(surf, (20, 22, 28), hp, max(4, cs))
+            pygame.draw.circle(surf, SEL if h is self.rod_first else (235, 235, 245), hp, max(3, cs - 1))
+        d_ = self.drag
+        if d_ and d_['tool'] == 'SHAFT':
+            (ax, ay), (bx, by) = d_['start'], d_['cur']
+            pygame.draw.circle(surf, SEL, scr(ax + 1.5, ay + 1.5), int(max(3, math.hypot(bx - ax, by - ay)) * cs), 1)
+        # circuit links: line to whatever they're connected to, with their id
+        for (x, y), lk in self.sim.glinks.items():
+            if lk['tgt'] is None:
+                continue
+            a = (self.x0 + (x - 1) * cs + cs // 2, self.y0 + (y - 1) * cs + cs // 2)
+            b = (self.x0 + (lk['tgt'][0] - 1) * cs + cs // 2, self.y0 + (lk['tgt'][1] - 1) * cs + cs // 2)
+            colr = (90, 220, 255) if lk['role'] == 'tx' else (255, 120, 220)
+            if lk['on'] or (lk['role'] == 'tx' and (self.sim.sensors.get(lk['tgt']) or {}).get('on')):
+                colr = (255, 255, 120)
+            pygame.draw.line(surf, colr, a, b, 1)
+            t = self.app.tiny.render(str(lk['id']), True, colr)
+            surf.blit(t, (a[0] + cs, a[1] - cs - 4))
+        if self.link_target:
+            tx_, ty_ = self.link_target
+            pygame.draw.rect(surf, SEL, (self.x0 + (tx_ - 2) * cs, self.y0 + (ty_ - 2) * cs, cs * 3, cs * 3), 1)
         # sensor ranges and links
         hover = self.cell(mp, clamp=False)
         hkey = (hover[0] + 1, hover[1] + 1) if hover else None
         for (x, y), sn in self.sim.sensors.items():
             sx, sy = self.x0 + (x - 1) * cs + cs // 2, self.y0 + (y - 1) * cs + cs // 2
-            if sn['type'] == 'block':
+            if sn['type'] in ('block', 'hinge'):
                 dx, dy = G_DIRS[sn['dir']]
                 end = (sx + dx * G_SENSE_RANGE * cs, sy + dy * G_SENSE_RANGE * cs)
                 pygame.draw.line(surf, G_SENSOR_COLOR['block'] if not sn['on'] else SEL, (sx, sy), end, 1)
@@ -2963,15 +3740,39 @@ class GasMode:
             pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
             pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
             surf.blit(self.app.small.render(t, True, TEXT), (r.x + 8, r.y + 2))
-        y = self.mat_rect(0).y - 20
-        surf.blit(self.app.small.render('MATERIAL', True, TEXT_DIM), (12, y))
+        # pinned readouts
+        for i, pc in enumerate(self.pins):
+            px, py = self.x0 + pc[0] * cs + cs // 2, self.y0 + pc[1] * cs + cs // 2
+            pygame.draw.line(surf, SEL, (px - 4, py), (px + 4, py), 1)
+            pygame.draw.line(surf, SEL, (px, py - 4), (px, py + 4), 1)
+            surf.blit(self.app.tiny.render(str(i + 1), True, SEL), (px + 4, py - 14))
+        if self.pins:
+            lines = [f'{i + 1}: {self.sim.info(*pc)}' for i, pc in enumerate(self.pins)]
+            rs = [self.app.small.render(t, True, TEXT) for t in lines]
+            bw = max(r_.get_width() for r_ in rs) + 16
+            bh = len(rs) * 17 + 8
+            box = pygame.Rect(W - bw - 10, 10, bw, bh)
+            pygame.draw.rect(surf, PANEL, box)
+            pygame.draw.rect(surf, PANEL_LINE, box, 1)
+            for i, r_ in enumerate(rs):
+                surf.blit(r_, (box.x + 8, box.y + 5 + i * 17))
+        self.list_bottom = H - (len(G_HELP) * 15 + 30) - 6
+        self.clamp_scroll()
+        surf.blit(self.app.small.render('MATERIAL  (scroll)', True, TEXT_DIM), (12, self.mat_top() - 20))
+        surf.set_clip(pygame.Rect(0, self.mat_top() - 2, PAL_W - 1, self.list_bottom - self.mat_top() + 4))
         for i, (m, comp) in enumerate(G_MATS):
             r = self.mat_rect(i)
+            if r.bottom < self.mat_top() or r.top > self.list_bottom:
+                continue
             on = m == self.mat
             pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
             pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
             if m in G_SENSOR_TYPES:
                 sw = G_SENSOR_COLOR[G_SENSOR_TYPES[m]]
+            elif m == 'LINK':
+                sw = G_SOLIDS[G_LINK][2]
+            elif m in G_MECH:
+                sw = (200, 204, 214)
             elif comp:
                 sw = tuple(int(sum(G_COLOR[G_IDX[s]][ch] * f for s, f in comp.items()) * 1.4) for ch in range(3))
                 sw = tuple(min(255, x) for x in sw)
@@ -2980,6 +3781,7 @@ class GasMode:
                     (G_BLOCK_COLOR if m == 'BLOCK' else (6, 8, 16))
             pygame.draw.rect(surf, sw, (r.x, r.y, 4, r.h))
             surf.blit(self.app.small.render(m, True, TEXT), (r.x + 10, r.y + 2))
+        surf.set_clip(None)
         hy = H - (len(G_HELP) * 15 + 30)
         for i, t in enumerate(G_HELP):
             surf.blit(self.app.small.render(t, True, TEXT_DIM), (12, hy + i * 15))
@@ -3007,6 +3809,8 @@ def main():
     running = True
     restart = False
     gas = None
+    if np is not None and os.path.exists(os.path.join(os.path.dirname(save_path()), 'gas.npz')):
+        gas = GasMode(app)      # loaded now so its circuit links keep working from the circuit screen
     while running:
         dt = clock.tick(60) / 1000
         modal = app.updater.state in ('prompt', 'installing', 'failed')
@@ -3027,8 +3831,12 @@ def main():
         if in_gas and app.mode == 'gas':
             gas.update(dt)
             gas.autosave()
+            if gas.sim.glinks:
+                app.update(dt)      # circuits keep running so links work from here too
         else:
             app.update(dt)
+            if gas is not None and gas.sim.glinks and not modal:
+                gas.update(dt)      # ...and the gas keeps running behind the circuits
         app.autosave()
         if app.updater.state == 'restart':
             running = False
