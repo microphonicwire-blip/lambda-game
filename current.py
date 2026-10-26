@@ -2017,14 +2017,27 @@ G_FUELS = {'H2': (0.5, {'H2O': 1}, 29100, 7000),
 G_AIR = {'N2': 0.79, 'O2': 0.21}
 # solid kinds: (name, strength in atm per cell of thickness (0 = never breaks), color)
 G_SOLIDS = [None, ('WALL', 60, (150, 160, 178)), ('STEEL', 0, (100, 108, 122)),
-            ('GLASS', 4, (150, 210, 225)), ('IGNITER', 60, (235, 125, 30))]
-G_WALL, G_STEEL, G_GLASS, G_IGNITER = 1, 2, 3, 4
+            ('GLASS', 4, (150, 210, 225)), ('IGNITER', 60, (235, 125, 30)),
+            ('VALVE', 60, (200, 60, 60)), ('SENSOR', 60, (150, 90, 200))]
+G_WALL, G_STEEL, G_GLASS, G_IGNITER, G_VALVE, G_SENSOR = 1, 2, 3, 4, 5, 6
+# sensors: palette name -> type. block sensors look 5 cells ahead, temp/pressure check the cells touching them
+G_SENSOR_TYPES = {'BLK SENSOR': 'block', 'TEMP SENSOR': 'temp', 'PRES SENSOR': 'press'}
+G_SENSOR_KINDS = ['block', 'temp', 'press']
+G_SENSOR_COLOR = {'block': (160, 95, 220), 'temp': (225, 85, 55), 'press': (70, 140, 235)}
+G_TEMP_LEVELS = [100, 200, 400, 700, 1000]        # C
+G_PRES_LEVELS = [1.5, 2, 3, 5, 10]                # atm
+G_DIRS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+G_DIR_NAMES = ['right', 'down', 'left', 'up']
+G_SENSE_RANGE = 5
+G_VALVE_OPEN = (70, 200, 100)
 G_BLOCK_COLOR, G_BLOCK_EDGE = (178, 130, 86), (120, 84, 52)
 G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('IGNITER', None),
+          ('VALVE', None), ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None),
           ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
           ('PROPANE', {'C3H8': 1}), ('METHANE', {'CH4': 1}), ('OXYGEN', {'O2': 1}),
           ('HELIUM', {'He': 1}), ('CO2', {'CO2': 1}), ('VACUUM', None)]
-G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER}
+G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER,
+                'VALVE': G_VALVE}
 G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE']
 G_K = 0.08          # how hard pressure pushes
 G_DAMP = 0.985      # flow friction
@@ -2043,7 +2056,7 @@ G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
 G_VISC = 0.03
 G_HELP = ['tab = circuits', 'lmb = use tool', 'rmb = erase', 'wheel = size',
           'e = ignite', 'space = pause', 'up/dn = speed', 'o = open edges',
-          'g = gravity', 'a = reset air', 'clr: ctrl+sh+del']
+          'g = gravity', 'hold p = valves', 'sensor+valve: click sensor first', 'a = reset air', 'clr: ctrl+sh+del']
 
 
 class GasSim:
@@ -2064,8 +2077,11 @@ class GasSim:
         self.ring[1:-1, 1:-1] = False
         self.open = True                        # edges open to the outside air
         self.gravity = True
-        self.spark = 0
-        self.spark_mask = None
+        self.manual_valves = False              # P held: opens valves that aren't linked to a sensor
+        self.valve_open = np.zeros(shape, bool)
+        self.link = np.full(shape, -1, np.int32)    # valve/igniter -> sensor key (x * H2 + y), -1 = manual
+        self.sensors = {}                       # (x, y) -> dict(type, dir, level, on)
+        self.spark_t = np.zeros(shape, np.int16)
         self.near_wall = None
         self.active = {0, 1}                    # which gases exist (index into G_SPECIES)
         self.age = 0
@@ -2099,6 +2115,10 @@ class GasSim:
         self.active = {0, 1}
 
     def clear(self):
+        self.sensors = {}
+        self.link[:] = -1
+        self.valve_open[:] = False
+        self.spark_t[:] = 0
         self.kind[:] = 0
         self.strength[:] = 0
         self.bodies = []
@@ -2107,7 +2127,7 @@ class GasSim:
         self.reset_air()
 
     def rebuild(self):
-        sol = self.kind > 0
+        sol = (self.kind > 0) & ~self.valve_open
         for b in self.bodies:
             sol[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']] = True
         self.solid = sol
@@ -2137,19 +2157,94 @@ class GasSim:
         mask = mask & ~self.solid
         self.n[:, mask] *= keep
 
-    def set_solid(self, mask, kind):
-        mask = mask & ~self.ring & ~self.body_mask()
+    def set_solid(self, mask, kind, link=-1):
+        mask = mask & ~self.ring & ~self.body_mask() & (self.kind != G_SENSOR)   # never paint over sensors
         self.kind[mask] = kind
         self.strength[mask] = G_SOLIDS[kind][1]
+        self.link[mask] = link if kind in (G_VALVE, G_IGNITER) else -1
+        self.valve_open[mask] = False
         self.n[:, mask] = 0
         self.T[mask] = 293
         self.rebuild()
+        self.update_valves()
+
+    def add_sensor(self, x, y, typ):
+        if self.solid[x, y] or self.ring[x, y] or self.kind[x, y]:
+            return False
+        self.kind[x, y] = G_SENSOR
+        self.strength[x, y] = G_SOLIDS[G_SENSOR][1]
+        self.n[:, x, y] = 0
+        self.sensors[(x, y)] = dict(type=typ, dir=0, level=2, on=False)
+        self.rebuild()
+        return True
+
+    def remove_sensors(self, mask):
+        for key in [k for k in self.sensors if mask[k]]:
+            del self.sensors[key]
+            self.link[self.link == key[0] * self.H2 + key[1]] = -1
+
+    def sense(self, p):
+        # check every sensor; linked igniters fire when it turns on, linked valves follow it
+        bm = self.body_mask() if any(v['type'] == 'block' for v in self.sensors.values()) else None
+        changed = False
+        for (x, y), sn in self.sensors.items():
+            t = sn['type']
+            if t == 'block':
+                dx, dy = G_DIRS[sn['dir']]
+                on = False
+                for k in range(1, G_SENSE_RANGE + 1):
+                    cx, cy = x + dx * k, y + dy * k
+                    if not (0 <= cx < self.W2 and 0 <= cy < self.H2):
+                        break
+                    if bm[cx, cy]:
+                        on = True
+                        break
+                    if self.kind[cx, cy] and not self.valve_open[cx, cy]:
+                        break       # can't see through walls
+            else:
+                vals = []
+                for dx, dy in G_DIRS:
+                    cx, cy = x + dx, y + dy
+                    if not self.solid[cx, cy]:
+                        vals.append(float(self.T[cx, cy]) - 273 if t == 'temp' else float(p[cx, cy]))
+                lim = G_TEMP_LEVELS[sn['level']] if t == 'temp' else G_PRES_LEVELS[sn['level']]
+                on = bool(vals) and max(vals) > lim
+            if on != sn['on']:
+                sn['on'] = on
+                changed = True
+                if on:
+                    self.ignite(self.link == x * self.H2 + y)
+        if changed:
+            self.update_valves()
+
+    def update_valves(self):
+        valve = self.kind == G_VALVE
+        on_keys = [x * self.H2 + y for (x, y), sn in self.sensors.items() if sn['on']]
+        want = valve & (((self.link < 0) & self.manual_valves) | np.isin(self.link, on_keys))
+        if (want == self.valve_open).all():
+            return
+        closing = self.valve_open & ~want
+        self.valve_open = want
+        self.rebuild()
+        if closing.any():
+            # closing squeezes whatever gas was in the valve into the open cells next to it
+            xs, ys = np.nonzero(closing)
+            for dx, dy in G_DIRS:
+                nx, ny = xs + dx, ys + dy
+                ok = ~self.solid[nx, ny]
+                if ok.any():
+                    self.merge_gas(xs[ok], ys[ok], nx[ok], ny[ok])
+            self.n[:, closing] = 0
+            self.T[closing] = 293
 
     def erase(self, mask):
         mask = mask & ~self.ring
         hit = mask & (self.kind > 0)
+        self.remove_sensors(hit)
         self.kind[hit] = 0
         self.strength[hit] = 0
+        self.link[hit] = -1
+        self.valve_open[hit] = False
         self.T[hit] = 293      # the hole starts empty and gas rushes in
         self.bodies = [b for b in self.bodies
                        if not mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]
@@ -2166,8 +2261,15 @@ class GasSim:
         self.rebuild()
         return True
 
-    def ignite(self):
-        ign = self.kind == G_IGNITER
+    def set_valves(self, on):
+        self.manual_valves = on
+        self.update_valves()
+
+    def ignite(self, which=None):
+        # which = mask of igniters to fire; default = every igniter not linked to a sensor
+        ign = (self.kind == G_IGNITER) & ((self.link < 0) if which is None else which)
+        if not ign.any():
+            return
         m = ign.copy()
         for _ in range(2):
             g = m.copy()
@@ -2176,8 +2278,7 @@ class GasSim:
             g[:, 1:] |= m[:, :-1]
             g[:, :-1] |= m[:, 1:]
             m = g
-        self.spark_mask = m & ~self.solid
-        self.spark = 8
+        self.spark_t[m & ~self.solid] = 8
 
     # moving blocks
     def merge_gas(self, sx, sy, dx, dy):
@@ -2207,7 +2308,7 @@ class GasSim:
             lx, ly = cols, np.full(w, lead)
             tx, ty = cols, np.full(w, trail)
             bx, by = cols, np.full(w, lead + dy)
-        if (self.solid[lx, ly] | self.ring[lx, ly]).any():
+        if (self.solid[lx, ly] | self.ring[lx, ly] | (self.kind[lx, ly] > 0)).any():
             return False
         # free the trailing edge, push the gas in front ahead (or behind if it's boxed in)
         self.solid[tx, ty] = False
@@ -2250,7 +2351,7 @@ class GasSim:
 
     # walls cracking
     def check_breaks(self, p):
-        brk_full = self.strength > 0
+        brk_full = (self.strength > 0) & self.solid
         if not brk_full.any():
             return
         # only look at the area around breakable walls
@@ -2261,7 +2362,7 @@ class GasSim:
         p = p[box]
         brk = brk_full[box]
         gas = ~self.solid[box]
-        wall = self.kind[box] > 0
+        wall = (self.kind[box] > 0) & self.solid[box]
         load = np.zeros_like(p)
         for d, axis in ((1, 0), (-1, 0), (1, 1), (-1, 1)):
             pg = np.roll(p, d, axis)            # pressure on the near side
@@ -2322,10 +2423,12 @@ class GasSim:
             n[:, ring] = 0
         self.age += 1
         # blocks and cracking walls work on the whole grid before the gas moves
-        if self.bodies or (self.age % 4 == 0 and self.strength.any()):
+        if self.bodies or self.sensors or (self.age % 4 == 0 and self.strength.any()):
             p0 = n.sum(0) * T / 293
             if self.bodies:
                 self.move_bodies(p0)
+            if self.sensors:
+                self.sense(p0)
             if self.age % 4 == 0:
                 self.check_breaks(p0)    # walls crack when the pressure across them is too much
             sol = self.solid
@@ -2414,9 +2517,10 @@ class GasSim:
         n = full
         S = n.shape[0]
         # sparks from igniters
-        if self.spark > 0 and self.spark_mask is not None:
-            T[self.spark_mask] = np.maximum(T[self.spark_mask], 1900)
-            self.spark -= 1
+        if self.spark_t.any():
+            sm = (self.spark_t > 0) & ~sol
+            T[sm] = np.maximum(T[sm], 1900)
+            self.spark_t[self.spark_t > 0] -= 1
         # burning: reaction speed climbs steeply with temperature (arrhenius)
         if (T > 650).any():
             o2 = G_IDX['O2']
@@ -2467,6 +2571,10 @@ class GasSim:
         kind = self.kind[1:-1, 1:-1]
         for i in range(1, len(G_SOLIDS)):
             col[kind == i] = G_SOLIDS[i][2]
+        col[self.valve_open[1:-1, 1:-1]] = G_VALVE_OPEN
+        for (x, y), sn in self.sensors.items():
+            c = G_SENSOR_COLOR[sn['type']]
+            col[x - 1, y - 1] = tuple(min(255, v + 90) for v in c) if sn['on'] else c
         for b in self.bodies:
             x, y, w, h = b['x'] - 1, b['y'] - 1, b['w'], b['h']
             col[x:x + w, y:y + h] = G_BLOCK_EDGE
@@ -2478,6 +2586,21 @@ class GasSim:
         x, y = cx + 1, cy + 1
         if self.kind[x, y]:
             name, st, _ = G_SOLIDS[int(self.kind[x, y])]
+            if self.kind[x, y] == G_SENSOR:
+                sn = self.sensors.get((x, y))
+                if sn:
+                    st_ = 'ON' if sn['on'] else 'off'
+                    if sn['type'] == 'block':
+                        return f"block sensor, looks {G_DIR_NAMES[sn['dir']]} {G_SENSE_RANGE} cells, {st_}"
+                    if sn['type'] == 'temp':
+                        return f"temp sensor, on above {G_TEMP_LEVELS[sn['level']]}C, {st_}"
+                    return f"pressure sensor, on above {G_PRES_LEVELS[sn['level']]} atm, {st_}"
+            linked = '  (linked to a sensor)' if self.link[x, y] >= 0 else ''
+            if self.kind[x, y] == G_VALVE:
+                return 'valve ' + ('open' if self.valve_open[x, y] else
+                                   'closed' + (linked or ', hold p to open'))
+            if self.kind[x, y] == G_IGNITER:
+                return 'igniter' + (linked.strip() and ' ' + linked.strip() or ', e to spark')
             return name.lower() + (f'  holds {st:.0f} atm/cell' if st else '  unbreakable')
         if self.solid[x, y]:
             return 'block'
@@ -2495,8 +2618,11 @@ class GasSim:
         bodies = np.array([[b['x'], b['y'], b['w'], b['h'], b['vx'], b['vy']] for b in self.bodies],
                           np.float32).reshape(-1, 6)
         with open(tmp, 'wb') as f:
+            sens = np.array([[x, y, G_SENSOR_KINDS.index(v['type']), v['dir'], v['level']]
+                             for (x, y), v in self.sensors.items()], np.int32).reshape(-1, 5)
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
-                                bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity))
+                                bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
+                                sensors=sens, link=self.link)
         os.replace(tmp, path)
 
     def load(self, path):
@@ -2517,6 +2643,11 @@ class GasSim:
                 for x, y, w, h, vx, vy in d['bodies'].tolist():
                     self.bodies.append(dict(x=int(x), y=int(y), w=int(w), h=int(h), vx=vx, vy=vy,
                                             fx=0.0, fy=0.0))
+            self.sensors = {}
+            if 'sensors' in d:
+                for x, y, t, dr, lv in d['sensors'].tolist():
+                    self.sensors[(x, y)] = dict(type=G_SENSOR_KINDS[t], dir=dr, level=lv, on=False)
+                self.link[:] = d['link']
             self.open = bool(d['open'])
             if 'gravity' in d:
                 self.gravity = bool(d['gravity'])
@@ -2541,6 +2672,7 @@ class GasMode:
         self.last_save = time.time()
         self.path = os.path.join(os.path.dirname(save_path()), 'gas.npz')
         self.cs, self.x0, self.y0 = 5, PAL_W, 0
+        self.link_sensor = None     # sensor that new valves / igniters get hooked to
         try:
             if os.path.exists(self.path):
                 self.sim.load(self.path)
@@ -2567,7 +2699,7 @@ class GasMode:
         return pygame.Rect(12, 40 + i * 24, PAL_W - 24, 20)
 
     def mat_rect(self, i):
-        return pygame.Rect(12, 40 + len(G_TOOLS) * 24 + 26 + i * 24, PAL_W - 24, 20)
+        return pygame.Rect(12, 40 + len(G_TOOLS) * 24 + 26 + i * 21, PAL_W - 24, 19)
 
     # masks over the padded grid
     def seg_mask(self, a, b, r):
@@ -2614,7 +2746,12 @@ class GasMode:
         if erase or self.tool == 'ERASE':
             sim.erase(mask)
         elif self.mat in G_SOLID_MATS:
-            sim.set_solid(mask, G_SOLID_MATS[self.mat])
+            link = -1
+            if self.link_sensor and self.mat in ('VALVE', 'IGNITER'):
+                link = self.link_sensor[0] * sim.H2 + self.link_sensor[1]
+            sim.set_solid(mask, G_SOLID_MATS[self.mat], link)
+        elif self.mat in G_SENSOR_TYPES:
+            pass        # sensors are placed one click at a time
         elif self.mat == 'BLOCK':
             self.app.say('draw blocks with RECT')
         elif self.mat == 'VACUUM':
@@ -2633,6 +2770,9 @@ class GasMode:
             if k == pygame.K_ESCAPE:
                 if self.drag:
                     self.drag = None
+                elif self.link_sensor:
+                    self.link_sensor = None
+                    self.app.say('stopped linking')
                 else:
                     return 'quit'
             elif k == pygame.K_TAB:
@@ -2652,6 +2792,8 @@ class GasMode:
             elif k == pygame.K_o:
                 self.sim.open = not self.sim.open
                 self.dirty = True
+            elif k == pygame.K_p:
+                self.sim.set_valves(True)
             elif k == pygame.K_g:
                 self.sim.gravity = not self.sim.gravity
                 self.sim.update_ambient()
@@ -2663,6 +2805,8 @@ class GasMode:
                 self.size = min(12, self.size + 1)
             elif k == pygame.K_LEFTBRACKET:
                 self.size = max(0, self.size - 1)
+        elif e.type == pygame.KEYUP and e.key == pygame.K_p:
+            self.sim.set_valves(False)
         elif e.type == pygame.MOUSEWHEEL:
             self.size = max(0, min(12, self.size + e.y))
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button in (1, 3):
@@ -2673,9 +2817,37 @@ class GasMode:
                 for i, (m, _) in enumerate(G_MATS):
                     if self.mat_rect(i).collidepoint(e.pos):
                         self.mat = m
+                        if m not in ('VALVE', 'IGNITER'):
+                            self.link_sensor = None
                 return None
             c = self.cell(e.pos)
             erase = e.button == 3
+            key = (c[0] + 1, c[1] + 1)
+            sn = self.sim.sensors.get(key)
+            if not erase and self.tool != 'ERASE':
+                if sn and self.mat in ('VALVE', 'IGNITER'):
+                    # click a sensor first, then whatever valves / igniters you draw follow it
+                    if self.link_sensor == key:
+                        self.link_sensor = None
+                        self.app.say('stopped linking')
+                    else:
+                        self.link_sensor = key
+                        self.app.say(f'new {self.mat.lower()}s will follow this sensor (esc to stop)')
+                    return None
+                if sn and G_SENSOR_TYPES.get(self.mat) == sn['type']:
+                    # clicking a sensor with its own type picked tweaks it
+                    if sn['type'] == 'block':
+                        sn['dir'] = (sn['dir'] + 1) % 4
+                    else:
+                        sn['level'] = (sn['level'] + 1) % 5
+                    self.dirty = True
+                    self.app.say(self.sim.info(*c))
+                    return None
+                if self.mat in G_SENSOR_TYPES:
+                    if not self.sim.add_sensor(key[0], key[1], G_SENSOR_TYPES[self.mat]):
+                        self.app.say('sensors go on empty cells')
+                    self.dirty = True
+                    return None
             if self.tool == 'FILL' and not erase:
                 amount = 1.0
                 self.apply(self.flood(c), amount)
@@ -2755,6 +2927,21 @@ class GasMode:
             r = pygame.Rect(self.x0 + min(ax, bx) * cs, self.y0 + min(ay, by) * cs,
                             (abs(bx - ax) + 1) * cs, (abs(by - ay) + 1) * cs)
             pygame.draw.rect(surf, SEL, r, 1)
+        # sensor ranges and links
+        hover = self.cell(mp, clamp=False)
+        hkey = (hover[0] + 1, hover[1] + 1) if hover else None
+        for (x, y), sn in self.sim.sensors.items():
+            sx, sy = self.x0 + (x - 1) * cs + cs // 2, self.y0 + (y - 1) * cs + cs // 2
+            if sn['type'] == 'block':
+                dx, dy = G_DIRS[sn['dir']]
+                end = (sx + dx * G_SENSE_RANGE * cs, sy + dy * G_SENSE_RANGE * cs)
+                pygame.draw.line(surf, G_SENSOR_COLOR['block'] if not sn['on'] else SEL, (sx, sy), end, 1)
+            if (x, y) == self.link_sensor or (x, y) == hkey:
+                pygame.draw.rect(surf, SEL, (sx - cs, sy - cs, cs * 2 + 1, cs * 2 + 1), 1)
+                xs, ys = np.nonzero(self.sim.link == x * self.sim.H2 + y)
+                for lx, ly in zip(xs.tolist(), ys.tolist()):
+                    r = (self.x0 + (lx - 1) * cs, self.y0 + (ly - 1) * cs, cs, cs)
+                    pygame.draw.rect(surf, SEL, r, 1)
         if mp[0] >= PAL_W and self.tool != 'FILL':
             pygame.draw.circle(surf, SEL, mp, max(2, int((self.size + 0.5) * cs)), 1)
         # hover readout
@@ -2783,7 +2970,9 @@ class GasMode:
             on = m == self.mat
             pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
             pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
-            if comp:
+            if m in G_SENSOR_TYPES:
+                sw = G_SENSOR_COLOR[G_SENSOR_TYPES[m]]
+            elif comp:
                 sw = tuple(int(sum(G_COLOR[G_IDX[s]][ch] * f for s, f in comp.items()) * 1.4) for ch in range(3))
                 sw = tuple(min(255, x) for x in sw)
             else:
