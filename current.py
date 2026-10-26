@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import ssl
 import subprocess
 import sys
 import threading
@@ -283,6 +284,26 @@ def safe_repo_path(path):
     return all(p and p not in ('.', '..') and not p.startswith('.') for p in parts)
 
 
+def ssl_context():
+    # packaged linux builds can't always find the system certs, so try the usual spots
+    for f in ('/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt',
+              '/etc/ssl/cert.pem', '/etc/ca-certificates/extracted/tls-ca-bundle.pem'):
+        if os.path.exists(f):
+            try:
+                return ssl.create_default_context(cafile=f)
+            except (ssl.SSLError, OSError):
+                pass
+    return ssl.create_default_context()
+
+
+def log_update(msg):
+    try:
+        with open(os.path.join(os.path.dirname(save_path()), 'update.log'), 'a') as f:
+            f.write(time.strftime('%H:%M:%S ') + msg + '\n')
+    except OSError:
+        pass
+
+
 class Updater:
     # checks github on boot, installs the repo's files if they differ
     def __init__(self, start=True):
@@ -302,7 +323,7 @@ class Updater:
         tok = github_token()
         if tok:
             req.add_header('Authorization', 'Bearer ' + tok)
-        with urllib.request.urlopen(req, timeout=6) as r:
+        with urllib.request.urlopen(req, timeout=8, context=ssl_context()) as r:
             return r.read()
 
     def _write_version(self, sha):
@@ -349,7 +370,8 @@ class Updater:
                 return
             self.sha, self.message, self.todo = sha, msg, todo
             self.state = 'prompt'
-        except Exception:
+        except Exception as err:
+            log_update(f'check failed: {err!r}')
             self.state = 'idle'              # offline or no access, just play
 
     def install(self):
@@ -373,7 +395,8 @@ class Updater:
                 os.replace(dst + '.new', dst)
             self._write_version(self.sha)
             self.state = 'restart'
-        except Exception:
+        except Exception as err:
+            log_update(f'install failed: {err!r}')
             self.state = 'failed'
 
     def dismiss(self):
