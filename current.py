@@ -171,7 +171,9 @@ DEFS = {
     'CLOCK':   dict(w=3, h=2, pins=[(3, 1, 'out')]),    # blinks, click to change speed
     'LAMP':    dict(w=2, h=2, pins=[(0, 1, 'in')]),
     'LABEL':   dict(w=1, h=1, pins=[]),                 # just text, no ports
-    'DISPLAY': dict(w=1, h=1, pins=[(0, 0, 'in'), (1, 0, 'in'), (0, 1, 'in'), (1, 1, 'in')]),
+    # touch display: a display you can click, pulses OUT when clicked
+    'TOUCH':   dict(w=1, h=1, pins=[(0, 0, 'in'), (1, 0, 'in'), (0, 1, 'in'), (1, 1, 'out')]),
+    'DISPLAY': dict(w=1, h=1, pins=[(0, 0, 'in'), (1, 0, 'in'), (0, 1, 'in')]),
     # 7 segments on the left, then red green blue along the bottom
     '7SEG':    dict(w=5, h=8, pins=[(0, k, 'in') for k in range(1, 8)]
                     + [(1, 8, 'in'), (2, 8, 'in'), (3, 8, 'in')]),
@@ -184,12 +186,12 @@ DEFS = {
     'AND': TWO_IN, 'NAND': TWO_IN, 'OR': TWO_IN,
     'NOR': TWO_IN, 'XOR': TWO_IN, 'XNOR': TWO_IN,
 }
-NAMES = {'DISPLAY': ['R', 'G', 'B', 'ON'], 'GATE': ['IN', 'OUT', 'EN'],
+NAMES = {'DISPLAY': ['R', 'G', 'B'], 'TOUCH': ['R', 'G', 'B', 'OUT'], 'GATE': ['IN', 'OUT', 'EN'],
          'SR LATCH': ['S', 'R', 'Q'], 'NV LATCH': ['S', 'R', 'Q'],
          '7SEG': ['SEG A', 'SEG B', 'SEG C', 'SEG D', 'SEG E', 'SEG F', 'SEG G',
                   'RED', 'GREEN', 'BLUE']}
 
-PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', '7SEG',
+PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', 'TOUCH', '7SEG',
              'NOT', 'BUF', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
              'SR LATCH', 'NV LATCH', 'PIN', 'LABEL']
 
@@ -212,7 +214,7 @@ WIDGET_KINDS = ('SWITCH', 'BUTTON')     # these draw a little control in the bod
 def cat_color(kind):
     if kind in ('SOURCE', 'SWITCH', 'BUTTON', 'CLOCK'):
         return HDR_INPUT
-    if kind in ('LAMP', 'DISPLAY', '7SEG'):
+    if kind in ('LAMP', 'DISPLAY', 'TOUCH', '7SEG'):
         return HDR_OUTPUT
     if kind in ('SR LATCH', 'NV LATCH'):
         return HDR_MEM
@@ -676,10 +678,13 @@ class App:
             elif k == 'LAMP':
                 if hi(p, 0):
                     p.glow = GLOW
-            elif k == 'DISPLAY':
-                if hi(p, 3):
-                    p.rgb = tuple(255 if hi(p, i) else 0 for i in range(3))
+            elif k in ('DISPLAY', 'TOUCH'):
+                rgb = tuple(255 if hi(p, i) else 0 for i in range(3))
+                if any(rgb):
+                    p.rgb = rgb
                     p.glow = GLOW
+                if k == 'TOUCH':
+                    new.append((p, int(p.pulse)))
             elif k == '7SEG':
                 col = tuple(255 if hi(p, i) else 0 for i in (7, 8, 9))
                 p.rgb = col if any(col) else None
@@ -692,7 +697,7 @@ class App:
             if p.kind == 'NV LATCH' and p.out != v:
                 self.dirty = True
             p.out = v
-            if p.kind == 'BUTTON':
+            if p.kind in ('BUTTON', 'TOUCH'):
                 p.pulse = False
 
     def update(self, dt):
@@ -754,6 +759,8 @@ class App:
         p.pidx = max(0, min(len(PERIODS) - 1, int(d.get('pidx', 4))))
         if p.kind == 'PIN':
             self.set_pin_dir(p, p.on)
+            if d.get('label') in ('IN', 'OUT'):     # old saves pinned the default name
+                d = dict(d, label=None)
         if isinstance(d.get('label'), str):
             p.label = d['label'][:MAX_LABEL]
             if p.kind == 'SWITCH':      # old saves: one name for both states
@@ -1092,7 +1099,7 @@ class App:
             h = d['hit']
             if h.kind == 'SWITCH':
                 h.on = not h.on
-            elif h.kind == 'BUTTON':
+            elif h.kind in ('BUTTON', 'TOUCH'):
                 h.pulse = True
                 h.flash = 0.15
             elif h.kind == 'CLOCK':
@@ -1115,7 +1122,7 @@ class App:
             return 'BTN'
         if k == 'CLOCK':
             return f'CLK {PERIODS[p.pidx]}'
-        if k == 'DISPLAY':
+        if k in ('DISPLAY', 'TOUCH'):
             return ''
         if k == 'PIN':
             return 'OUT' if p.on else 'IN'
@@ -1169,7 +1176,9 @@ class App:
                 else:
                     p.label_off = self.edit_text
             else:
-                p.label = self.edit_text
+                p.label = None
+                if self.edit_text != self.base_label(p):    # untouched text stays default
+                    p.label = self.edit_text
             self.dirty = True
 
     def edit_key(self, e):
@@ -1362,7 +1371,7 @@ class App:
                 return
             now = pygame.time.get_ticks()
             if p is self.last_click[0] and now - self.last_click[1] < 400 \
-                    and p.kind != 'DISPLAY':
+                    and p.kind not in ('DISPLAY', 'TOUCH'):
                 self.last_click = (None, 0)
                 if p.kind == 'SWITCH':
                     p.on = not p.on     # undo the first click's toggle
@@ -1511,9 +1520,9 @@ class App:
                 self.label(surf, text, SEL if editing and self.edit_fresh else TEXT, r.center)
             return
         hdrh = sc(HDR)
-        if k == 'DISPLAY':
+        if k in ('DISPLAY', 'TOUCH'):
             pygame.draw.rect(surf, p.rgb if p.glow > 0 and p.rgb else PART_BG, r)
-            pygame.draw.rect(surf, SEL if editing else PART_LINE, r, 1)
+            pygame.draw.rect(surf, SEL if editing else (ON if p.flash > 0 else PART_LINE), r, 1)
         else:
             body = PART_BG
             if k == 'LAMP' and p.glow > 0:
@@ -1566,7 +1575,7 @@ class App:
             elif k == '7SEG':
                 self.draw_7seg(surf, p, r)
         # pins
-        small = k == 'DISPLAY'
+        small = k in ('DISPLAY', 'TOUCH')
         o, i_ = (sc(7, 3), sc(3, 2)) if small else (sc(9, 4), sc(5, 2))
         for i in range(len(p.d['pins'])):
             q = p.pin_pos(i)
