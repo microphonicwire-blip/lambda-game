@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# logic gate sandbox
+# KEATON
 import colorsys
 import hashlib
 import random
