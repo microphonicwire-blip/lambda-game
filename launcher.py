@@ -13,6 +13,10 @@ import typing, urllib.parse, urllib.request, zlib  # noqa
 import pygame  # noqa
 import numpy  # noqa  (gas lab)
 import pygame.surfarray  # noqa
+try:
+    import certifi  # noqa  (https certs for the updater)
+except ImportError:
+    pass
 
 
 def data_dir():
@@ -34,12 +38,16 @@ def run():
         try:
             runpy.run_path(ext, run_name='__main__')
             return
-        except (ImportError, SyntaxError):
-            # the downloaded version can't run in this exe, fall back to the bundled one
+        except Exception:
+            # the downloaded version crashed or can't run in this exe: log it, fall back to the bundled one
             try:
+                with open(os.path.join(data_dir(), 'crash.log'), 'w') as f:
+                    f.write(traceback.format_exc())
                 os.replace(ext, ext + '.bad')
+                os.remove(os.path.join(data_dir(), 'version.txt'))
             except OSError:
                 pass
+            sys.path.remove(code)
     import current
     current.main()
 
