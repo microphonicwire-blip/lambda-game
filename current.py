@@ -216,10 +216,12 @@ PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', '
              'NOT', 'BUF', 'TOGGLE', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
              'SR LATCH', 'NV LATCH', 'GAS IN', 'GAS OUT', 'PIN', 'LABEL']
 
-HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
+RUN_KEYS = {pygame.K_SPACE, pygame.K_UP, pygame.K_DOWN, pygame.K_l, pygame.K_t, pygame.K_x,
+            pygame.K_n, pygame.K_HOME, pygame.K_TAB, pygame.K_RETURN, pygame.K_KP_ENTER}
+HELP = ['enter = compile / build', 'drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
         'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
         'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
-        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes',
+        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes', 'x = instant logic',
         'clr: ctrl+sh+del', 'tab = gas lab', 'f5 = check update']
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
@@ -569,6 +571,299 @@ def wrap(font, text, width):
     return lines
 
 
+# ---------------------------------------------------------------- compiled circuit
+_TBL = None
+
+
+def _gate_table():
+    # rows: AND OR NAND NOR XOR XNOR NOT BUF, columns: a*2+b
+    return np.array([[0, 0, 0, 1], [0, 1, 1, 1], [1, 1, 1, 0], [1, 0, 0, 0],
+                     [0, 1, 1, 0], [1, 0, 0, 1], [1, 1, 0, 0], [0, 0, 1, 1]], np.int8)
+
+
+GATE_CODE = {'AND': 0, 'OR': 1, 'NAND': 2, 'NOR': 3, 'XOR': 4, 'XNOR': 5, 'NOT': 6, 'BUF': 7}
+
+
+class Compiled:
+    # the whole circuit as flat numpy arrays, one vectorised pass per tick
+    def __init__(self, app):
+        global _TBL
+        if _TBL is None:
+            _TBL = _gate_table()
+        if app.topo_key != app.topo_sig():
+            app.build_topo()
+        self.app = app
+        parts = self.parts = list(app.sim_parts)
+        P = len(parts)
+        roots = {}
+        root = app.root
+
+        def nid(p, i):
+            return roots.setdefault(root[(p.uid, i)], len(roots))
+
+        kinds = [p.kind for p in parts]
+
+        def of(*ks):
+            return [i for i, k in enumerate(kinds) if k in ks]
+
+        def arr(x, dt=np.int64):
+            return np.array(x, dt)
+
+        self.out = np.zeros(P, np.int8)
+        self.drive = np.ones(P, bool)
+        self.cnt = np.zeros(P, np.int32)
+        for i, p in enumerate(parts):
+            self.out[i] = 1 if p.kind == 'SOURCE' else int(p.out)
+            self.cnt[i] = p.counter
+            if p.kind == 'GATE':
+                self.drive[i] = p.drive
+        dp, dn = [], []
+        for i, p in enumerate(parts):
+            for j, (_, _, role) in enumerate(p.d['pins']):
+                if role == 'out':
+                    dp.append(i)
+                    dn.append(nid(p, j))
+        self.dp, self.dn = arr(dp), arr(dn)
+        # gates
+        self.ci = arr(of(*GATES))
+        self.ctype = arr([GATE_CODE[kinds[i]] for i in self.ci])
+        self.ca = arr([nid(parts[i], 0) for i in self.ci])
+        self.cb = arr([nid(parts[i], 1) if len(parts[i].d['pins']) > 2 else nid(parts[i], 0) for i in self.ci])
+        self.gi = arr(of('GATE'))
+        self.gst = arr([nid(parts[i], 0) for i in self.gi])
+        self.gen = arr([nid(parts[i], 2) for i in self.gi])
+        # inputs
+        self.si = arr(of('SWITCH'))
+        self.s_net = arr([nid(parts[i], 0) for i in self.si])
+        self.bi = arr(of('BUTTON'))
+        self.b_net = arr([nid(parts[i], 0) for i in self.bi])
+        self.ti = arr(of('TOUCH'))
+        self.ki = arr(of('CLOCK'))
+        self.kper = arr([PERIODS[parts[i].pidx] for i in self.ki])
+        # delay as a ring buffer
+        self.di = arr(of('DELAY'))
+        self.d_net = arr([nid(parts[i], 0) for i in self.di])
+        self.d_n = arr([DPER[parts[i].pidx] - 1 for i in self.di])
+        self.d_rows = np.flatnonzero(self.d_n > 0)
+        mx = int(self.d_n.max()) if self.di.size and self.d_n.max() > 0 else 1
+        self.d_buf = np.zeros((len(self.di), mx), np.int8)
+        self.d_ptr = np.zeros(len(self.di), np.int64)
+        for r, i in enumerate(self.di):
+            p = parts[i]
+            n = int(self.d_n[r])
+            if n > 0 and p.buf is not None and len(p.buf) == n:
+                self.d_buf[r, :n] = list(p.buf)
+        self.ei = arr(of('EXTENDER'))
+        self.e_net = arr([nid(parts[i], 0) for i in self.ei])
+        self.e_len = arr([DPER[parts[i].pidx] - 1 for i in self.ei], np.int32)
+        self.tgi = arr(of('TOGGLE'))
+        self.tg_net = arr([nid(parts[i], 0) for i in self.tgi])
+        self.li = arr(of('SR LATCH', 'NV LATCH'))
+        self.l_s = arr([nid(parts[i], 0) for i in self.li])
+        self.l_r = arr([nid(parts[i], 1) for i in self.li])
+        self.xi = arr(of('GAS IN'))
+        self.x_id = arr([parts[i].pidx + 1 for i in self.xi])
+        self.oi = arr(of('GAS OUT'))
+        self.o_net = arr([nid(parts[i], 0) for i in self.oi])
+        self.o_id = arr([parts[i].pidx + 1 for i in self.oi])
+        self.go_last = np.zeros(len(self.oi), bool)
+        # things that light up
+        self.mi = arr(of('LAMP'))
+        self.m_net = arr([nid(parts[i], 0) for i in self.mi])
+        self.m_lit = np.zeros(len(self.mi), bool)
+        self.pi = arr(of('DISPLAY', 'TOUCH'))
+        self.p_nets = arr([[nid(parts[i], j) for j in range(3)] for i in self.pi]).reshape(-1, 3)
+        self.p_lit = np.zeros((len(self.pi), 3), bool)
+        self.zi = arr(of('7SEG'))
+        self.z_seg = arr([[nid(parts[i], j) for j in range(7)] for i in self.zi]).reshape(-1, 7)
+        self.z_col = arr([[nid(parts[i], j) for j in (7, 8, 9)] for i in self.zi]).reshape(-1, 3)
+        self.z_slit = np.zeros((len(self.zi), 7), bool)
+        self.z_clit = np.zeros((len(self.zi), 3), bool)
+        self.N = max(1, len(roots))
+        self.roots = [None] * self.N
+        for r, n in roots.items():
+            self.roots[n] = r
+        self.sw_on = np.zeros(len(self.si), bool)
+        self.b_pulse = np.zeros(len(self.bi), bool)
+        self.t_pulse = np.zeros(len(self.ti), bool)
+        self.tx = np.zeros(17, np.int8)
+        self.prev = None
+        self.last_out = self.out.copy()
+        self.last_drive = self.drive.copy()
+        self.nparts = P
+
+    def nets(self):
+        val = self.out[self.dp]
+        act = self.drive[self.dp]
+        n1 = np.bincount(self.dn[act & (val == 1)], minlength=self.N)
+        n0 = np.bincount(self.dn[act & (val == 0)], minlength=self.N)
+        return (n1 > 0) & (n0 == 0), (n0 > 0) & (n1 == 0)
+
+    def settle(self):
+        # instant logic: gates resolve completely inside the tick
+        out, drive = self.out, self.drive
+        for _ in range(64):
+            hi, lo = self.nets()
+            h8 = hi.view(np.int8)
+            ch = False
+            if self.ci.size:
+                new = _TBL[self.ctype, h8[self.ca] * 2 + h8[self.cb]]
+                if (new != out[self.ci]).any():
+                    out[self.ci] = new
+                    ch = True
+            if self.gi.size:
+                st1 = hi[self.gst]
+                dr = hi[self.gen] & (st1 | lo[self.gst])
+                v = st1.astype(np.int8)
+                if (dr != drive[self.gi]).any() or (v != out[self.gi]).any():
+                    drive[self.gi] = dr
+                    out[self.gi] = v
+                    ch = True
+            if not ch:
+                return hi, lo
+        return self.nets()
+
+    def tick(self):
+        app = self.app
+        hi, lo = self.settle() if app.instant else self.nets()
+        out, cnt, drive = self.out, self.cnt, self.drive
+        if app.tubes:
+            st = np.where(hi, 1, np.where(lo, 0, -1)).astype(np.int8)
+            if self.prev is not None:
+                for n in np.flatnonzero((st != self.prev) & (st >= 0)):
+                    for wi in app.root_wires.get(self.roots[n], ()):
+                        q = app.pending.setdefault(wi, [])
+                        if len(q) < 6:
+                            q.append(int(st[n]))
+            self.prev = st
+        else:
+            self.prev = None
+        h8 = hi.view(np.int8)
+        if self.ci.size:
+            out[self.ci] = _TBL[self.ctype, h8[self.ca] * 2 + h8[self.cb]]
+        if self.gi.size:
+            st1 = hi[self.gst]
+            drive[self.gi] = hi[self.gen] & (st1 | lo[self.gst])
+            out[self.gi] = st1
+        if self.si.size:
+            out[self.si] = hi[self.s_net] & self.sw_on
+        if self.bi.size:
+            out[self.bi] = hi[self.b_net] & self.b_pulse
+        if self.ti.size:
+            out[self.ti] = self.t_pulse
+        if self.ki.size:
+            cnt[self.ki] += 1
+            m = self.ki[cnt[self.ki] >= self.kper]
+            cnt[m] = 0
+            out[m] = 1 - out[m]
+        if self.di.size:
+            v = hi[self.d_net].astype(np.int8)
+            res = v.copy()
+            r = self.d_rows
+            if r.size:
+                pt = self.d_ptr[r]
+                res[r] = self.d_buf[r, pt]
+                self.d_buf[r, pt] = v[r]
+                self.d_ptr[r] = (pt + 1) % self.d_n[r]
+            out[self.di] = res
+        if self.ei.size:
+            h = hi[self.e_net]
+            c = cnt[self.ei]
+            out[self.ei] = h | (c > 0)
+            cnt[self.ei] = np.where(h, self.e_len, np.maximum(c - 1, 0))
+        if self.tgi.size:
+            v = hi[self.tg_net].astype(np.int8)
+            c, o = cnt[self.tgi], out[self.tgi]
+            out[self.tgi] = np.where((v == 1) & (c == 0), 1 - o, o)
+            cnt[self.tgi] = v
+        if self.li.size:
+            out[self.li] = np.where(hi[self.l_r], 0, np.where(hi[self.l_s], 1, out[self.li]))
+        if self.xi.size:
+            out[self.xi] = self.tx[self.x_id]
+        if self.oi.size:
+            self.go_last = hi[self.o_net]
+        if self.mi.size:
+            self.m_lit |= hi[self.m_net]
+        if self.pi.size:
+            self.p_lit |= hi[self.p_nets]
+        if self.zi.size:
+            self.z_slit |= hi[self.z_seg]
+            self.z_clit |= hi[self.z_col]
+        self.b_pulse[:] = False
+        self.t_pulse[:] = False
+
+    def run(self, n):
+        if n <= 0:
+            return
+        parts = self.parts
+        for r, i in enumerate(self.si):
+            self.sw_on[r] = parts[i].on
+        for r, i in enumerate(self.bi):
+            self.b_pulse[r] = parts[i].pulse
+        for r, i in enumerate(self.ti):
+            self.t_pulse[r] = parts[i].pulse
+        if self.xi.size:
+            self.tx[:] = [GAS_TX.get(i, 0) for i in range(17)]
+        for _ in range(n):
+            self.tick()
+        self.sync()
+
+    def sync(self):
+        app, parts, out, drive = self.app, self.parts, self.out, self.drive
+        for i in np.flatnonzero((out != self.last_out) | (drive != self.last_drive)):
+            p = parts[i]
+            if p.kind == 'SOURCE':
+                continue
+            p.out = int(out[i])
+            if p.kind == 'GATE':
+                p.drive = bool(drive[i])
+            elif p.kind == 'NV LATCH':
+                app.dirty = True
+        self.last_out[:] = out
+        self.last_drive[:] = drive
+        for i in self.bi:
+            parts[i].pulse = False
+        for i in self.ti:
+            parts[i].pulse = False
+        for r in np.flatnonzero(self.m_lit):
+            parts[self.mi[r]].glow = GLOW
+        self.m_lit[:] = False
+        for r in np.flatnonzero(self.p_lit.any(axis=1)):
+            p = parts[self.pi[r]]
+            p.rgb = tuple(255 if x else 0 for x in self.p_lit[r])
+            p.glow = GLOW
+        self.p_lit[:] = False
+        for r in range(len(self.zi)):
+            p = parts[self.zi[r]]
+            col = tuple(255 if x else 0 for x in self.z_clit[r])
+            p.rgb = col if any(col) else None
+            for j in np.flatnonzero(self.z_slit[r]):
+                p.seg_glow[j] = GLOW
+        self.z_slit[:] = False
+        self.z_clit[:] = False
+        if self.oi.size or GAS_RX:
+            GAS_RX.clear()
+            GAS_RX.update({int(i): 1 for i in self.o_id[self.go_last]})
+
+    def stop(self):
+        # hand the state back to the parts (so build mode and saves see it)
+        parts = self.parts
+        for i, p in enumerate(parts):
+            if p.kind != 'SOURCE':
+                p.out = int(self.out[i])
+            if p.kind == 'GATE':
+                p.drive = bool(self.drive[i])
+            if p.kind in ('CLOCK', 'EXTENDER', 'TOGGLE'):
+                p.counter = int(self.cnt[i])
+            if p.kind in ('BUTTON', 'TOUCH'):
+                p.pulse = False
+        for r, i in enumerate(self.di):
+            n = int(self.d_n[r])
+            if n > 0:
+                pt = int(self.d_ptr[r])
+                parts[i].buf = deque(int(self.d_buf[r, (pt + k) % n]) for k in range(n))
+
+
 # ---------------------------------------------------------------- app
 class App:
     def __init__(self):
@@ -592,6 +887,9 @@ class App:
         FONT = self.font
         self.light = False
         self.tubes = True
+        self.instant = False    # gates settle inside one tick (no race glitches)
+        self.running = False    # False = build mode (frozen, editable), True = compiled and running
+        self.cmp = None
         self.updater = None
         self.editing = None     # part being renamed
         self.edit_on = False
@@ -751,8 +1049,35 @@ class App:
                 self.pulses.pop(wi, None)
                 self.pending.pop(wi, None)
 
-    def step(self):
+    def settle(self):
+        # instant logic: gates (and the send gate) resolve fully inside the tick, only
+        # delays, latches, clocks etc. still cost a tick. Capped so loops can't hang.
+        comb = [p for p in self.sim_parts if p.kind in GATES or p.kind == 'GATE']
         find, drv = self.netstate()
+        for _ in range(64):
+            ch = []
+            for p in comb:
+                if p.kind == 'GATE':
+                    st = drv.get(find((p.uid, 0)))
+                    en = drv.get(find((p.uid, 2))) == {1}
+                    dr, v = en and st in ({0}, {1}), 1 if st == {1} else 0
+                    if dr != p.drive or v != p.out:
+                        ch.append((p, dr, v))
+                else:
+                    ins = [drv.get(find((p.uid, i))) == {1}
+                           for i, (_, _, r) in enumerate(p.d['pins']) if r == 'in']
+                    v = int(GATES[p.kind](ins))
+                    if v != p.out:
+                        ch.append((p, p.drive, v))
+            if not ch:
+                break
+            for p, dr, v in ch:
+                p.drive, p.out = dr, v
+            find, drv = self.netstate()
+        return find, drv
+
+    def step(self):
+        find, drv = self.settle() if self.instant else self.netstate()
         self.track_changes(drv)
 
         def hi(p, i):
@@ -846,7 +1171,7 @@ class App:
             self.routes.clear()
         for p in self.parts:
             p.flash = max(0.0, p.flash - dt)
-        if self.paused:
+        if self.paused or not self.running:
             return
         self.anim += dt
         if self.topo_key == self.topo_sig():
@@ -860,11 +1185,49 @@ class App:
         tick = 1.0 / self.rate
         n = 0
         while self.acc >= tick and n < 400:
-            self.step()
             self.acc -= tick
             n += 1
         if n == 400:
             self.acc = 0.0
+        self.advance(n)
+
+    def advance(self, n):
+        if self.cmp:
+            self.cmp.run(n)
+        else:
+            for _ in range(n):
+                self.step()
+
+    def toggle_run(self):
+        if self.running:
+            if self.cmp:
+                self.cmp.stop()
+                self.cmp = None
+            self.running = False
+            self.drag = None
+            self.say('build mode, enter to compile and run')
+            return
+        self.drag = None
+        self.sel.clear()
+        self.build_topo()
+        if np is not None:
+            try:
+                self.cmp = Compiled(self)
+                self.say(f'compiled: {self.cmp.nparts} parts, {self.cmp.N} nets')
+            except Exception as ex:
+                self.cmp = None
+                self.say(f'compile failed ({type(ex).__name__}), running slow engine')
+        else:
+            self.say('running (no numpy, slow engine)')
+        self.running = True
+        self.acc = 0.0
+
+    def run_click(self, p):
+        if p.kind == 'SWITCH':
+            p.on = not p.on
+        elif p.kind in ('BUTTON', 'TOUCH'):
+            p.pulse = True
+            p.flash = 0.15
 
     # ------------------------------------------------------------ wire routing
     def update_obstacles(self):
@@ -1084,7 +1447,7 @@ class App:
     def save(self):
         idx = {p.uid: i for i, p in enumerate(self.parts)}
         data = dict(
-            version=2, rate=self.rate, light=self.light, tubes=self.tubes,
+            version=2, rate=self.rate, light=self.light, tubes=self.tubes, instant=self.instant,
             view=[CAMX, CAMY, ZOOM],
             parts=[self.part_to_dict(p) for p in self.parts],
             wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires])
@@ -1127,6 +1490,7 @@ class App:
             self.rate = max(1, min(MAX_RATE, int(data.get('rate', self.rate))))
             self.light = bool(data.get('light'))
             self.tubes = bool(data.get('tubes', True))
+            self.instant = bool(data.get('instant', False))
             v = data.get('view')
             if isinstance(v, list) and len(v) == 3:
                 CAMX, CAMY = float(v[0]), float(v[1])
@@ -1498,6 +1862,20 @@ class App:
                 if ok:
                     u.install() if u.state == 'prompt' else u.dismiss()
             return
+        if self.running:
+            # run mode: nothing can be edited, only clicked
+            if e.type == pygame.KEYDOWN:
+                if e.key in RUN_KEYS and not (e.mod & pygame.KMOD_CTRL):
+                    self.on_key(e)
+                return
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                if e.pos[0] >= PAL_W:
+                    p = self.part_at(e.pos)
+                    if p:
+                        self.run_click(p)
+                return
+            if e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                return
         if e.type == pygame.KEYDOWN and self.editing:
             self.edit_key(e)
             return
@@ -1538,7 +1916,7 @@ class App:
         if not d or d['kind'] != 'pan':
             return
         self.drag = None
-        if d['moved'] or d['button'] != 3:
+        if d['moved'] or d['button'] != 3 or self.running:
             return
         p = self.part_at(d['start'])        # rmb click without moving = delete
         if p:
@@ -1592,17 +1970,23 @@ class App:
         elif k == pygame.K_t:
             self.tubes = not self.tubes
             self.dirty = True
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER) and not ctrl:
+            self.toggle_run()
+        elif k == pygame.K_x and not ctrl:
+            self.instant = not self.instant
+            self.say('instant logic ' + ('on: gates settle in one tick' if self.instant else 'off: 1 tick per gate'))
+            self.dirty = True
         elif k == pygame.K_UP:
             self.rate = min(MAX_RATE, self.rate * 2)
             self.dirty = True
         elif k == pygame.K_DOWN:
             self.rate = max(1, self.rate // 2)
             self.dirty = True
-        elif k == pygame.K_n and self.paused:
+        elif k == pygame.K_n and self.paused and self.running:
             for p in self.sim_parts:
                 p.glow = 0.0
                 p.seg_glow = [0.0] * 7
-            self.step()
+            self.advance(1)
 
     def on_down(self, e):
         mx, my = e.pos
@@ -2029,6 +2413,13 @@ class App:
         for i, t in enumerate(HELP):
             surf.blit(self.small.render(t, True, TEXT_DIM), (12, hy + 8 + i * 15))
         surf.blit(self.small.render(f"{self.rate} ticks/s", True, TEXT), (12, H - 22))
+        W_ = surf.get_width()
+        mt = self.font.render('RUN (compiled)' if self.running and self.cmp else 'RUN' if self.running else 'BUILD, enter = run',
+                              True, ON if self.running else SEL)
+        mr = pygame.Rect(W_ - mt.get_width() - 24, 8, mt.get_width() + 14, mt.get_height() + 6)
+        pygame.draw.rect(surf, PANEL, mr)
+        pygame.draw.rect(surf, ON if self.running else SEL, mr, 1)
+        surf.blit(mt, (mr.x + 7, mr.y + 3))
         if self.paused:
             t = self.font.render('PAUSED', True, SEL)
             pr = pygame.Rect(PAL_W + 10, 8, t.get_width() + 14, t.get_height() + 6)
@@ -2841,6 +3232,14 @@ class GasSim:
                 return False
         self.shafts.append(dict(x=x, y=y, R=max(3.0, R), th=0.0, om=0.0))
         return True
+
+    def mirror_pts(self, x, y, sym):
+        W2, H2 = self.W2, self.H2
+        out = [(x, y)]
+        if sym in (1, 3): out.append((W2 - x, y))
+        if sym in (2, 3): out.append((x, H2 - y))
+        if sym == 3: out.append((W2 - x, H2 - y))
+        return out
 
     def add_hinge(self, fx, fy):
         # on a block: snaps to the middle of the closest side. on a shaft: 4 spots on the rim and 4 halfway in
@@ -3744,7 +4143,7 @@ class GasMode:
                 self.sim.reset_air()
                 self.dirty = True
             elif k == pygame.K_RIGHTBRACKET:
-                self.size = min(12, self.size + 1)
+                self.size = min(36, self.size + 1)
             elif k == pygame.K_LEFTBRACKET:
                 self.size = max(0, self.size - 1)
         elif e.type == pygame.KEYUP and e.key == pygame.K_p:
@@ -3758,7 +4157,7 @@ class GasMode:
                 self.mat_scroll -= e.y * 42
                 self.clamp_scroll()
             else:
-                self.size = max(0, min(12, self.size + e.y))
+                self.size = max(0, min(36, self.size + e.y))
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button in (1, 3):
             if e.pos[0] < PAL_W:
                 for i, t in enumerate(G_TOOLS):
@@ -3794,7 +4193,7 @@ class GasMode:
             if self.cog_prev:
                 cp_ = self.cog_prev
                 if e.button == 1:
-                    if self.sim.add_cog(cp_['x'], cp_['y'], cp_['R'], cp_['tl'], cp_['n']):
+                    if any([self.sim.add_cog(px, py, cp_['R'], cp_['tl'], cp_['n']) for px, py in self.sim.mirror_pts(cp_['x'], cp_['y'], self.sym)]):
                         self.dirty = True
                         self.app.say(f"cog: {cp_['n']} teeth")
                     else:
@@ -3907,7 +4306,7 @@ class GasMode:
             elif d['tool'] == 'SHAFT':
                 (ax, ay), (bx, by) = d['start'], d['cur']
                 R = math.hypot(bx - ax, by - ay)
-                if self.sim.add_shaft(ax + 1.5, ay + 1.5, R):
+                if any([self.sim.add_shaft(px, py, R) for px, py in self.sim.mirror_pts(ax + 1.5, ay + 1.5, self.sym)]):
                     self.app.say(f'shaft, radius {max(3, R):.0f}: bigger = heavier flywheel')
                     self.dirty = True
             elif d['tool'] == 'SELECT':
