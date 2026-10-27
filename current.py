@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# KEATON
+# logic gate sandbox
 import colorsys
 import hashlib
 import random
@@ -195,6 +195,7 @@ DEFS = {
     'TOUCH':   dict(w=1, h=1, pins=[(0, 0, 'in'), (1, 0, 'in'), (0, 1, 'in'), (1, 1, 'out')]),
     'DISPLAY': dict(w=1, h=1, pins=[(0, 0, 'in'), (1, 0, 'in'), (0, 1, 'in')]),
     # 7 segments on the left, then red green blue along the bottom
+    'SCOPE':   dict(w=7, h=4, pins=[(0, 2, 'in')]),     # draws what its input did lately
     '7SEG':    dict(w=5, h=8, pins=[(0, k, 'in') for k in range(1, 8)]
                     + [(1, 8, 'in'), (2, 8, 'in'), (3, 8, 'in')]),
     # PIN = the port of a chip. PIN_O is the same part flipped (chip output)
@@ -212,7 +213,7 @@ NAMES = {'DISPLAY': ['R', 'G', 'B'], 'TOUCH': ['R', 'G', 'B', 'OUT'], 'GATE': ['
          '7SEG': ['SEG A', 'SEG B', 'SEG C', 'SEG D', 'SEG E', 'SEG F', 'SEG G',
                   'RED', 'GREEN', 'BLUE']}
 
-PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', 'TOUCH', '7SEG',
+PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', 'TOUCH', '7SEG', 'SCOPE',
              'NOT', 'BUF', 'TOGGLE', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
              'SR LATCH', 'NV LATCH', 'GAS IN', 'GAS OUT', 'PIN', 'LABEL']
 
@@ -220,6 +221,7 @@ RUN_KEYS = {pygame.K_SPACE, pygame.K_UP, pygame.K_DOWN, pygame.K_l, pygame.K_t,
             pygame.K_n, pygame.K_HOME, pygame.K_TAB, pygame.K_RETURN, pygame.K_KP_ENTER}
 HELP = ['enter = compile / build', 'drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
         'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
+        'ctrl+s = chip to file',
         'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
         'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes',
         'clr: ctrl+sh+del', 'tab = gas lab', 'f5 = check update']
@@ -233,19 +235,20 @@ DEFAULT_DESC = {'AND': 'both high', 'OR': 'any high', 'NAND': 'not both', 'NOR':
                 'SR LATCH': 'S sets, R resets', 'NV LATCH': 'remembers', 'BUTTON': '1 pulse',
                 'TOGGLE': 'flips each pulse'}
 IND_KINDS = ('LAMP', 'DISPLAY', 'TOUCH', '7SEG')
+SCOPE_LEN = 160
 WIDGET_KINDS = ('SWITCH', 'BUTTON')     # these draw a little control in the body
 
 
 def cat_color(kind):
     if kind in ('SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GAS IN'):
         return HDR_INPUT
-    if kind in ('LAMP', 'DISPLAY', 'TOUCH', '7SEG', 'GAS OUT'):
+    if kind in ('LAMP', 'DISPLAY', 'TOUCH', '7SEG', 'GAS OUT', 'SCOPE'):
         return HDR_OUTPUT
     if kind in ('SR LATCH', 'NV LATCH'):
         return HDR_MEM
     if kind == 'LABEL':
         return TEXT_DIM
-    if kind in ('CHIP', 'PIN'):
+    if kind in ('CHIP', 'PIN') or kind.startswith('CHIP:'):
         return HDR_CHIP
     return HDR_LOGIC
 
@@ -288,6 +291,7 @@ class Part:
         self.label_on = None    # switch names, one per state
         self.label_off = None
         self.buf = None         # delay: the signals still on their way
+        self.trace = None       # scope: the last few ticks of its input, oldest first
         self.inds = []          # chip: lamps/displays inside that it shows
         self.lw = self.rw = 0   # chip: widest pin names, left and right
         self.desc = None        # body text, None = default
@@ -668,6 +672,14 @@ class Compiled:
         self.o_id = arr([parts[i].pidx + 1 for i in self.oi])
         self.go_last = np.zeros(len(self.oi), bool)
         # things that light up
+        self.sci = arr(of('SCOPE'))
+        self.sc_net = arr([nid(parts[i], 0) for i in self.sci])
+        self.sc_hist = np.zeros((len(self.sci), SCOPE_LEN), np.int8)
+        for r, i in enumerate(self.sci):
+            if parts[i].trace is not None:
+                t_ = np.asarray(parts[i].trace, np.int8)[-SCOPE_LEN:]
+                self.sc_hist[r, SCOPE_LEN - len(t_):] = t_
+        self.sc_ptr = 0
         self.mi = arr(of('LAMP'))
         self.m_net = arr([nid(parts[i], 0) for i in self.mi])
         self.m_lit = np.zeros(len(self.mi), bool)
@@ -782,6 +794,9 @@ class Compiled:
             out[self.xi] = self.tx[self.x_id]
         if self.oi.size:
             self.go_last = hi[self.o_net]
+        if self.sci.size:
+            self.sc_hist[:, self.sc_ptr] = hi[self.sc_net]
+            self.sc_ptr = (self.sc_ptr + 1) % SCOPE_LEN
         if self.mi.size:
             self.m_lit |= hi[self.m_net]
         if self.pi.size:
@@ -825,6 +840,8 @@ class Compiled:
             parts[i].pulse = False
         for i in self.ti:
             parts[i].pulse = False
+        for r, i in enumerate(self.sci):
+            parts[i].trace = np.roll(self.sc_hist[r], -self.sc_ptr)
         for r in np.flatnonzero(self.m_lit):
             parts[self.mi[r]].glow = GLOW
         self.m_lit[:] = False
@@ -857,6 +874,8 @@ class Compiled:
                 p.counter = int(self.cnt[i])
             if p.kind in ('BUTTON', 'TOUCH'):
                 p.pulse = False
+        for r, i in enumerate(self.sci):
+            parts[i].trace = np.roll(self.sc_hist[r], -self.sc_ptr)
         for r, i in enumerate(self.di):
             n = int(self.d_n[r])
             if n > 0:
@@ -919,6 +938,7 @@ class App:
         self.route_budget = 12
         self.tint_cache = {}
         self.sim_parts = []     # every real part, chip insides included
+        self.chip_defs = {}     # chips saved as files, name -> circuit
         self.toast = ('', 0.0)
         self.mode = 'circuit'   # or 'gas'
         self.view_moved = False
@@ -1149,6 +1169,8 @@ class App:
                     p.glow = GLOW
                 if k == 'TOUCH':
                     new.append((p, int(p.pulse)))
+            elif k == 'SCOPE':
+                p.trace = ((list(p.trace) if p.trace is not None else [])[-(SCOPE_LEN - 1):]) + [int(hi(p, 0))]
             elif k == '7SEG':
                 col = tuple(255 if hi(p, i) else 0 for i in (7, 8, 9))
                 p.rgb = col if any(col) else None
@@ -1554,13 +1576,70 @@ class App:
     def pal_area(self, H):
         return 36, H - HELP_H
 
+    def pal_items(self):
+        return PAL_ITEMS + ['CHIP: ' + n for n in self.chip_defs]
+
+    def chips_dir(self):
+        return os.path.join(os.path.dirname(self.path), 'chips')
+
+    def scan_chips(self):
+        self.chip_defs = {}
+        try:
+            names = sorted(os.listdir(self.chips_dir()))
+        except OSError:
+            return
+        for fn in names:
+            if not fn.endswith('.chip.json'):
+                continue
+            try:
+                with open(os.path.join(self.chips_dir(), fn)) as f:
+                    d = json.load(f)
+                if isinstance(d, dict) and 'parts' in d and 'wires' in d:
+                    self.chip_defs[str(d.get('name') or fn[:-10])[:MAX_LABEL]] = d
+            except (OSError, ValueError):
+                pass
+
+    def save_chip(self):
+        chips = [p for p in self.parts if p in self.sel and p.kind == 'CHIP']
+        if len(chips) != 1:
+            self.say('select one chip, then ctrl+s')
+            return
+        p = chips[0]
+        name = (p.label or 'CHIP')[:MAX_LABEL]
+        safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in name).strip('_') or 'chip'
+        d = json.loads(json.dumps(p.defn))
+        d['name'] = name
+        try:
+            os.makedirs(self.chips_dir(), exist_ok=True)
+            tmp = os.path.join(self.chips_dir(), safe + '.tmp')
+            with open(tmp, 'w') as f:
+                json.dump(d, f)
+            os.replace(tmp, os.path.join(self.chips_dir(), safe + '.chip.json'))
+        except OSError as err:
+            self.say(f'could not save chip ({err.__class__.__name__})')
+            return
+        self.scan_chips()
+        self.say(f'chip saved, find it in the parts list as CHIP: {name}')
+
+    def new_part(self, k):
+        if k.startswith('CHIP: '):
+            d = self.chip_defs.get(k[6:])
+            if d is None:
+                return None
+            try:
+                return self.build_chip(json.loads(json.dumps(d)), 0, 0)
+            except (ValueError, KeyError, TypeError):
+                self.say("that chip file is broken")
+                return None
+        return Part(k)
+
     def pal_rect(self, i):
         return pygame.Rect(12, 40 + i * 26 - self.pal_scroll, PAL_W - 24, 22)
 
     def scroll_palette(self, dy):
         _, H = pygame.display.get_surface().get_size()
         top, bot = self.pal_area(H)
-        most = max(0, 40 + len(PAL_ITEMS) * 26 - bot)
+        most = max(0, 40 + len(self.pal_items()) * 26 - bot)
         self.pal_scroll = max(0, min(most, self.pal_scroll + dy))
 
     def pin_at(self, pos, r=6):
@@ -1983,6 +2062,8 @@ class App:
             self.delete_sel()
         elif ctrl and k == pygame.K_v:
             self.paste()
+        elif ctrl and k == pygame.K_s:
+            self.save_chip()
         elif ctrl and k == pygame.K_a:
             self.sel = set(self.parts)
         elif ctrl and shift and k == pygame.K_DELETE:
@@ -2048,9 +2129,11 @@ class App:
         if mx < PAL_W:
             top, bot = self.pal_area(H)
             if top <= my <= bot:
-                for i, k in enumerate(PAL_ITEMS):
+                for i, k in enumerate(self.pal_items()):
                     if self.pal_rect(i).collidepoint(e.pos):
-                        p = Part(k)
+                        p = self.new_part(k)
+                        if p is None:
+                            break
                         d = dict(kind='part', parts=[p], rel=[(0, 0)],
                                  ox=p.d['w'] * C * ZOOM // 2, oy=p.d['h'] * C * ZOOM // 2, start=e.pos,
                                  moved=True, new=True, carry=False, hit=None, orig=None)
@@ -2338,6 +2421,23 @@ class App:
                                     [(cx - a, cy - a), (cx + a, cy), (cx - a, cy + a)])
             elif k == '7SEG':
                 self.draw_7seg(surf, p, r)
+            elif k == 'SCOPE':
+                scr = pygame.Rect(r.x + 4, r.y + hdrh + 3, r.w - 8, r.h - hdrh - 7)
+                pygame.draw.rect(surf, BG, scr)
+                tr = p.trace
+                if tr is not None and len(tr) > 1 and scr.h > 6:
+                    n_ = len(tr)
+                    hi_y, lo_y = scr.y + 3, scr.bottom - 4
+                    pts, last = [], None
+                    for j in range(n_):
+                        x_ = scr.x + 1 + j * (scr.w - 2) / (n_ - 1)
+                        y_ = hi_y if tr[j] else lo_y
+                        if last is not None and y_ != last:
+                            pts.append((x_, last))
+                        pts.append((x_, y_))
+                        last = y_
+                    pygame.draw.lines(surf, ON if tr[-1] else TEXT_DIM, False, pts, 1)
+                pygame.draw.rect(surf, PANEL_LINE, scr, 1)
             elif k == 'CHIP' and p.inds:
                 self.draw_chip_body(surf, p, r, hdrh)
         # pins
@@ -2436,7 +2536,7 @@ class App:
         top, bot = self.pal_area(H)
         self.scroll_palette(0)
         surf.set_clip(pygame.Rect(0, top, PAL_W - 1, bot - top))
-        for i, k in enumerate(PAL_ITEMS):
+        for i, k in enumerate(self.pal_items()):
             r = self.pal_rect(i)
             if r.bottom < top or r.top > bot:
                 continue
@@ -2547,10 +2647,21 @@ G_SOLIDS = [None, ('WALL', 60, (150, 160, 178)), ('STEEL', 0, (100, 108, 122)),
             ('FILTER', 60, (120, 200, 190)), ('CHECK VALVE', 60, (205, 175, 60)),
             ('HEATER', 60, (240, 90, 40)), ('COOLER', 60, (80, 170, 240)),
             ('PUMP', 60, (90, 200, 90)), ('SOURCE', 60, (230, 230, 110)),
-            ('VENT', 60, (70, 70, 80)), ('LINK', 60, (235, 235, 245))]
+            ('VENT', 60, (70, 70, 80)), ('LINK', 60, (235, 235, 245)),
+            ('RELIEF VALVE', 60, (215, 110, 170)), ('EXCHANGER', 60, (150, 152, 168)),
+            ('TURBINE', 60, (215, 205, 90))]
 G_WALL, G_STEEL, G_GLASS, G_IGNITER, G_VALVE, G_SENSOR = 1, 2, 3, 4, 5, 6
 G_FILTER, G_CHECK, G_HEATER, G_COOLER, G_PUMP, G_SOURCE, G_VENT, G_LINK = 7, 8, 9, 10, 11, 12, 13, 14
-G_PASS = (G_FILTER, G_CHECK, G_PUMP)    # gas flows through these cells
+G_RELIEF, G_EXCH, G_TURB = 15, 16, 17
+G_PASS = (G_FILTER, G_CHECK, G_PUMP, G_TURB)    # gas flows through these cells
+G_LAT = 4896.0          # latent heat of water / R, in K (boils at 373K at 1 atm)
+G_LIQ_CAP = 4.0         # liquid water a cell can hold
+G_PHASE = 0.3           # how fast steam condenses / water evaporates toward equilibrium
+G_EXCH_C = 3.0          # heat capacity of an exchanger wall cell
+G_EXCH_K = 0.2          # how well exchanger walls conduct heat
+G_TURB_P = 0.4          # pressure across the blades turns the rotor
+G_TURB_D = 0.1          # gas drag on the blades (what limits the spin)
+G_TURB_COUPLE = 0.3     # how hard the rotor drags the gas along (and the gas drags it)
 G_HEAT_LEVELS = [400, 600, 900, 1400, 2200]     # K
 G_COOL_LEVELS = [270, 230, 180, 120, 77]        # K
 G_RATE = 0.12       # source emit rate per step
@@ -2584,6 +2695,7 @@ G_BLOCK_COLOR, G_BLOCK_EDGE = (178, 130, 86), (120, 84, 52)
 G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('IGNITER', None),
           ('VALVE', None), ('FILTER', None), ('CHECK VALVE', None), ('HEATER', None),
           ('COOLER', None), ('PUMP', None), ('SOURCE', None), ('VENT', None), ('LINK', None),
+          ('RELIEF VALVE', None), ('EXCHANGER', None), ('TURBINE', None),
           ('SHAFT', None), ('COG', None), ('HINGE', None), ('ROD', None),
           ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None), ('HINGE SENSOR', None), ('TIMER', None),
           ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
@@ -2592,30 +2704,34 @@ G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('I
           ('NITROGEN', {'N2': 1}), ('STEAM', {'H2O': 1}), ('ARGON', {'Ar': 1}), ('NEON', {'Ne': 1}),
           ('AMMONIA', {'NH3': 1}), ('CO', {'CO': 1}), ('BUTANE', {'C4H10': 1}),
           ('ACETYLENE', {'C2H2': 1}), ('ETHANOL', {'C2H5OH': 1}), ('CHLORINE', {'Cl2': 1}),
-          ('SF6', {'SF6': 1}),
+          ('SF6', {'SF6': 1}), ('WATER', None),
           ('H2+O2 2:1', {'H2': 2 / 3, 'O2': 1 / 3}), ('CH4+O2 1:2', {'CH4': 1 / 3, 'O2': 2 / 3}),
           ('C3H8+O2 1:5', {'C3H8': 1 / 6, 'O2': 5 / 6}), ('CO+O2 2:1', {'CO': 2 / 3, 'O2': 1 / 3}),
           ('VACUUM', None)]
 G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER,
                 'VALVE': G_VALVE, 'FILTER': G_FILTER, 'CHECK VALVE': G_CHECK, 'HEATER': G_HEATER,
-                'COOLER': G_COOLER, 'PUMP': G_PUMP, 'SOURCE': G_SOURCE, 'VENT': G_VENT}
-G_DEFAULT_AUX = {G_FILTER: G_IDX['H2'], G_CHECK: 0, G_HEATER: 2, G_COOLER: 2, G_PUMP: 0, G_SOURCE: G_IDX['H2']}
+                'COOLER': G_COOLER, 'PUMP': G_PUMP, 'SOURCE': G_SOURCE, 'VENT': G_VENT,
+                'RELIEF VALVE': G_RELIEF, 'EXCHANGER': G_EXCH, 'TURBINE': G_TURB}
+G_DEFAULT_AUX = {G_FILTER: G_IDX['H2'], G_CHECK: 0, G_HEATER: 2, G_COOLER: 2, G_PUMP: 0, G_SOURCE: G_IDX['H2'],
+                 G_RELIEF: 2, G_TURB: 0}
 G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE', 'SELECT']
 G_K = 0.08          # how hard pressure pushes
-G_DAMP = 0.985      # flow friction
+G_DAMP = 0.998      # flow friction
 G_DIFF = 0.02       # gases mixing
 G_HEAT = 0.05       # heat conduction
 G_BURN = 0.35       # burn speed once lit
 G_EFF = 0.6         # share of the reaction heat that stays (real flames lose some)
 G_BURN_A = {f: 0.25 / math.exp(-v[3] / 1500) for f, v in G_FUELS.items()}   # 0.25/step at 1500K
-G_BUOY = 1e-3       # how fast light / hot gas rises and heavy gas sinks
+G_BUOY = 4e-4       # how fast light / hot gas rises and heavy gas sinks
 G_PDV = 0.35         # compression heating / expansion cooling
 G_PUSH = 0.01       # how hard pressure shoves blocks
 G_BODY_DENSITY = 1.0
 G_BODY_G = 0.0015   # block gravity
 G_COOL = 0.0004     # hot gas slowly radiating heat away
 G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
-G_VISC = 0.03
+G_VISC = 0.02
+G_UMAX = 0.65        # fastest flow on a cell face (cells / step)
+G_COLL = 5.0         # how much fast flow ignores sideways pressure (keeps jets narrow), 0 = off
 G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, pressure drops there (bernoulli)
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
           'space = pause, . = step', 'up/dn = speed', 'o = open edges', 'g = gravity',
@@ -2645,6 +2761,8 @@ class GasSim:
         self.starter = False                    # hold k: motor spins the shafts up
         self.manual_valves = False              # P held: opens valves that aren't linked to a sensor
         self.valve_open = np.zeros(shape, bool)
+        self.relief_open = np.zeros(shape, bool)    # relief valves that popped open
+        self.liq = np.zeros(shape, np.float32)      # liquid water in each cell
         self.link = np.full(shape, -1, np.int32)    # valve/igniter -> sensor key (x * H2 + y), -1 = manual
         self.sensors = {}                       # (x, y) -> dict(type, dir, level, on)
         self.spark_t = np.zeros(shape, np.int16)
@@ -2686,6 +2804,7 @@ class GasSim:
     def reset_air(self):
         self.n[:] = self.amb_field
         self.T[:] = 293
+        self.liq[:] = 0
         self.n[:, self.solid] = 0
         self.u[:] = 0
         self.v[:] = 0
@@ -2700,6 +2819,7 @@ class GasSim:
         self.comp_cache = {}
         self.link[:] = -1
         self.valve_open[:] = False
+        self.relief_open[:] = False
         self.spark_t[:] = 0
         self.kind[:] = 0
         self.strength[:] = 0
@@ -2709,7 +2829,7 @@ class GasSim:
         self.reset_air()
 
     def rebuild(self):
-        sol = (self.kind > 0) & ~self.valve_open & ~self.passable[self.kind]
+        sol = (self.kind > 0) & ~self.valve_open & ~self.relief_open & ~self.passable[self.kind]
         self.has = set(np.unique(self.kind).tolist())
         for b in self.bodies:
             sol[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']] = True
@@ -2740,6 +2860,7 @@ class GasSim:
     def drain(self, mask, keep):
         mask = mask & ~self.solid
         self.n[:, mask] *= keep
+        self.liq[mask] *= keep
 
     def component(self, x, y):
         # all cells touching (x, y) with the same kind (so one click changes a whole filter / pump)
@@ -2774,7 +2895,7 @@ class GasSim:
             a = (a + 1) % len(G_SPECIES)
         elif k in (G_CHECK, G_PUMP):
             a = (a + 1) % 4
-        elif k in (G_HEATER, G_COOLER):
+        elif k in (G_HEATER, G_COOLER, G_RELIEF):
             a = (a + 1) % 5
         self.aux[m] = a
         return self.describe(x, y)
@@ -2796,6 +2917,12 @@ class GasSim:
             return f'cooler, {G_COOL_LEVELS[a] - 273}C'
         if k == G_VENT:
             return 'vent, eats gas next to it'
+        if k == G_RELIEF:
+            return f'relief valve, pops open above {G_PRES_LEVELS[a]} atm, shuts again below 90% (click to change)'
+        if k == G_EXCH:
+            return f'heat exchanger wall, {float(self.T[x, y]) - 273:.0f}C, passes heat but no gas'
+        if k == G_TURB:
+            return f'turbine, flow {G_DIR_NAMES[a]} (click to turn), touch a shaft to drive it, or spin the shaft to push gas'
         if k == G_LINK:
             lk = self.glinks.get((x, y))
             if lk:
@@ -2843,6 +2970,8 @@ class GasSim:
         self.strength[mask] = G_SOLIDS[kind][1]
         self.link[mask] = link if kind in (G_VALVE, G_IGNITER) else -1
         self.valve_open[mask] = False
+        self.relief_open[mask] = False
+        self.liq[mask] = 0
         self.n[:, mask] = 0
         self.T[mask] = 293
         self.rebuild()
@@ -2945,6 +3074,8 @@ class GasSim:
         self.strength[hit] = 0
         self.link[hit] = -1
         self.valve_open[hit] = False
+        self.relief_open[hit] = False
+        self.liq[mask] = 0
         self.T[hit] = 293      # the hole starts empty and gas rushes in
         self.bodies = [b for b in self.bodies
                        if not mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]
@@ -3520,6 +3651,128 @@ class GasSim:
         o[xs, ys] = m[xd, yd]
         return o
 
+    def update_relief(self, p0):
+        r = self.kind == G_RELIEF
+        thr = np.array(G_PRES_LEVELS, np.float32)[np.clip(self.aux, 0, 4)]
+        mx = np.zeros_like(p0)
+        for dx, dy in G_DIRS:
+            mx = np.maximum(mx, self.shift(p0, dx, dy))
+        new = r & ((mx > thr) | (self.relief_open & (mx > 0.9 * thr)))
+        if (new == self.relief_open).all():
+            return
+        closing = self.relief_open & ~new
+        self.relief_open = new
+        self.rebuild()
+        if closing.any():
+            xs, ys = np.nonzero(closing)
+            for dx, dy in G_DIRS:
+                nx, ny = xs + dx, ys + dy
+                ok = ~self.solid[nx, ny]
+                if ok.any():
+                    self.merge_gas(xs[ok], ys[ok], nx[ok], ny[ok])
+            self.n[:, closing] = 0
+            self.T[closing] = 293
+
+    def exchange(self, n, T):
+        # exchanger walls pass heat between whatever touches them, but no gas
+        S = n.shape[0]
+        ex = self.kind == G_EXCH
+        Cg = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
+        Cc = np.where(ex, G_EXCH_C, Cg)
+        part = ~self.solid | ex
+        E = Cc * T
+        dx_ = G_EXCH_K * np.minimum(Cc[:-1], Cc[1:]) * (T[:-1] - T[1:]) * (part[:-1] & part[1:] & (ex[:-1] | ex[1:]))
+        E[:-1] -= dx_
+        E[1:] += dx_
+        dy_ = G_EXCH_K * np.minimum(Cc[:, :-1], Cc[:, 1:]) * (T[:, :-1] - T[:, 1:]) * (part[:, :-1] & part[:, 1:] & (ex[:, :-1] | ex[:, 1:]))
+        E[:, :-1] -= dy_
+        E[:, 1:] += dy_
+        m = part & (Cc > 1e-5)
+        T[m] = E[m] / Cc[m]
+
+    def turbines(self, u, v, p):
+        # blades turn a shaft they touch from the pressure across them, and a spinning shaft drags the gas along
+        if not self.shafts:
+            return
+        kx, ky = np.nonzero(self.kind == G_TURB)
+        if not len(kx):
+            return
+        rho = self.n.sum(0)
+        dirs = self.aux[kx, ky].astype(int) & 3
+        dxs = np.array([g[0] for g in G_DIRS])[dirs]
+        dys = np.array([g[1] for g in G_DIRS])[dirs]
+        pg = p[kx - dxs, ky - dys] - p[kx + dxs, ky + dys]          # upstream minus downstream
+        taken = np.zeros(len(kx), bool)
+        for sh in self.shafts:
+            if sh.get('teeth'):
+                continue
+            R = sh['R']
+            m = (np.hypot(kx + 0.5 - sh['x'], ky + 0.5 - sh['y']) <= R + 1.5) & ~taken
+            if not m.any():
+                continue
+            taken |= m
+            Reff = 0.7 * R
+            I = self.shaft_inertia(sh)
+            rr = np.minimum(rho[kx[m], ky[m]], 8.0)
+            A = G_TURB_P * R * float(pg[m].sum())
+            B = G_TURB_D * R * Reff * float(rr.sum())
+            om2 = (sh['om'] + A / I) / (1 + B / I)
+            sh['om'] = om2
+            vt = om2 * Reff
+            for d, (dx, dy) in enumerate(G_DIRS):
+                mm = m & (dirs == d)
+                if not mm.any():
+                    continue
+                x, y = kx[mm], ky[mm]
+                if dx:
+                    for fx in (x - 1, x):
+                        u[fx, y] += G_TURB_COUPLE * (dx * vt - u[fx, y])
+                else:
+                    for fy in (y - 1, y):
+                        v[x, fy] += G_TURB_COUPLE * (dy * vt - v[x, fy])
+
+    def liquid_step(self, n, T):
+        liq = self.liq
+        h = G_IDX['H2O']
+        free = ~self.solid
+        liq[~free] = 0
+        liq[self.ring] = 0
+        if not liq.any() and n[h].max() < 1e-4:
+            return
+        S = n.shape[0]
+        Tc = np.maximum(T, 1.0)
+        nsat = np.exp(G_LAT * (1 / 373.0 - 1 / Tc)) * 293 / Tc          # steam the cell can hold at this temperature
+        nh = n[h]
+        C = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
+        E = C * T
+        cond = np.where(free, np.maximum(nh - nsat, 0) * G_PHASE, 0)
+        cond = np.minimum(cond, G_LIQ_CAP - liq).clip(0)
+        evap = np.where(free & (liq > 0), np.minimum(liq, np.maximum(nsat - nh, 0) * G_PHASE), 0)
+        evap = np.minimum(evap, 0.5 * E / G_LAT)          # boiling can't cool the gas below half its heat
+        d = cond - evap
+        if d.any():
+            n[h] -= d
+            liq += d
+            E += d * G_LAT
+            C2 = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
+            m = (d != 0) & (C2 > 1e-5)
+            T[m] = E[m] / C2[m]
+            self.active.add(h)
+        np.maximum(n[h], 0, out=n[h])
+        if self.gravity and liq.any():
+            amt = np.minimum(liq[:, :-1], np.maximum(G_LIQ_CAP - liq[:, 1:], 0)) * 0.6 * (free[:, :-1] & free[:, 1:])
+            liq[:, :-1] -= amt
+            liq[:, 1:] += amt
+            sup = np.ones(liq.shape, bool)           # rests on something: floor or a full cell
+            sup[:, :-1] = ~free[:, 1:] | (liq[:, 1:] >= G_LIQ_CAP - 0.05)
+            diff = liq[:-1] - liq[1:]
+            ok = free[:-1] & free[1:] & np.where(diff > 0, sup[:-1], sup[1:])
+            fl = 0.25 * diff * ok
+            liq[:-1] -= fl
+            liq[1:] += fl
+        np.clip(liq, 0, G_LIQ_CAP, out=liq)
+        liq[liq < 1e-4] = 0
+
     def flow_devices(self, u, v):
         # one-way valves only let flow go their way, pumps push it
         for kd, push in ((G_CHECK, False), (G_PUMP, True)):
@@ -3616,7 +3869,8 @@ class GasSim:
             n[:, ring] = 0
         self.age += 1
         # blocks and cracking walls work on the whole grid before the gas moves
-        if self.bodies or self.shafts or self.cogmask.any() or self.sensors or (self.age % 4 == 0 and self.strength.any()):
+        if self.bodies or self.shafts or self.cogmask.any() or self.sensors or G_RELIEF in self.has \
+                or (self.age % 4 == 0 and self.strength.any()):
             p0 = n.sum(0) * T / 293
             if self.bodies or self.shafts:
                 self.move_bodies(p0)
@@ -3624,6 +3878,8 @@ class GasSim:
                 self.sense(p0)
             if self.age % 4 == 0:
                 self.check_breaks(p0)    # walls crack when the pressure across them is too much
+            if G_RELIEF in self.has:
+                self.update_relief(p0)
             sol = self.solid
             n[:, sol] = 0
         if self.glinks:
@@ -3647,6 +3903,14 @@ class GasSim:
         # pressure pushes the flow (capped so it can't overshoot into a checkerboard)
         ku = np.minimum(G_K / (0.5 * (rho[:-1] + rho[1:])), 0.25 / (np.maximum(p[:-1], p[1:]) + 1e-3))
         kv = np.minimum(G_K / (0.5 * (rho[:, :-1] + rho[:, 1:])), 0.25 / (np.maximum(p[:, :-1], p[:, 1:]) + 1e-3))
+        if G_COLL:
+            # fast flow barely feels pressure sideways, so jets keep their shape instead of ballooning at the exit
+            ub = np.zeros_like(v)
+            ub[1:-1] = 0.25 * (u[:-1, :-1] + u[1:, :-1] + u[:-1, 1:] + u[1:, 1:])
+            vb = np.zeros_like(u)
+            vb[:, 1:-1] = 0.25 * (v[:-1, :-1] + v[:-1, 1:] + v[1:, :-1] + v[1:, 1:])
+            ku = ku / (1 + G_COLL * vb * vb / 0.08)
+            kv = kv / (1 + G_COLL * ub * ub / 0.08)
         u += ku * (p[:-1] - p[1:])
         v += kv * (p[:, :-1] - p[:, 1:])
         if self.gravity:
@@ -3677,8 +3941,10 @@ class GasSim:
         chk = (self.kind == G_CHECK) if G_CHECK in self.has else None
         if G_PUMP in self.has or chk is not None:
             self.flow_devices(u, v)
-        np.clip(u, -0.4, 0.4, out=u)
-        np.clip(v, -0.4, 0.4, out=v)
+        if G_TURB in self.has:
+            self.turbines(u, v, p)
+        np.clip(u, -G_UMAX, G_UMAX, out=u)
+        np.clip(v, -G_UMAX, G_UMAX, out=v)
         # never move more than 70% of a cell out in one step
         up, un = np.maximum(u, 0), np.minimum(u, 0)
         vp, vn = np.maximum(v, 0), np.minimum(v, 0)
@@ -3699,6 +3965,8 @@ class GasSim:
         ar = un * s[1:] - dx
         bl = vp * s[:, :-1] + dy
         br = vn * s[:, 1:] - dy
+        exm = (self.kind == G_EXCH) if G_EXCH in self.has else None
+        exT = T[exm].copy() if exm is not None else None
         E = C * T
         # squeezing gas heats it, letting it expand cools it (p dV work)
         ue = up * s[:-1] + un * s[1:]
@@ -3727,11 +3995,15 @@ class GasSim:
         np.maximum(n, 0, out=n)
         C = (cvv @ n.reshape(S, -1)).reshape(T.shape)
         T[:] = np.where(C > 1e-5, E / np.maximum(C, 1e-5), 293)
+        if exm is not None:
+            T[exm] = exT
         full[idx] = n
         n = full
         S = n.shape[0]
         if self.has & {G_FILTER, G_HEATER, G_COOLER, G_SOURCE, G_VENT}:
             self.devices(n, T, sol)
+        if G_EXCH in self.has:
+            self.exchange(n, T)
         # sparks from igniters
         if self.spark_t.any():
             sm = (self.spark_t > 0) & ~sol
@@ -3755,6 +4027,7 @@ class GasSim:
                     self.active.add(G_IDX[pr])
                 C = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
                 T[:] = np.where(C > 1e-5, e / np.maximum(C, 1e-5), 293)
+        self.liquid_step(n, T)
         T += (293 - T) * G_COOL
         if self.near_wall is None:
             w = np.zeros_like(sol)
@@ -3766,7 +4039,13 @@ class GasSim:
         T[self.near_wall] += (293 - T[self.near_wall]) * G_WALLCOOL
         np.clip(T, 20, 5000, out=T)
         n[:, sol] = 0
-        T[sol] = 293
+        if G_EXCH in self.has:
+            keep = sol & (self.kind == G_EXCH)
+            exT2 = T[keep].copy()
+            T[sol] = 293
+            T[keep] = exT2
+        else:
+            T[sol] = 293
 
     def render(self):
         # pressure: dark = thin, normal = gas color, high = red. hot = flame glow
@@ -3784,13 +4063,15 @@ class GasSim:
         flame = np.array([255, 120, 20], np.float32) * (1 - hot) + np.array([255, 235, 170], np.float32) * hot
         col = col * (1 - heat) + flame * heat
         col[ntot < 1e-3] = (6, 8, 16)
+        wl = np.clip(self.liq[1:-1, 1:-1] / 1.5, 0, 0.9)[..., None]
+        col = col * (1 - wl) + np.array([45, 115, 225], np.float32) * wl
         kind = self.kind[1:-1, 1:-1]
         for i in range(1, len(G_SOLIDS)):
             col[kind == i] = G_SOLIDS[i][2]
         aux = self.aux[1:-1, 1:-1]
         gx = np.arange(kind.shape[0])[:, None]
         gy = np.arange(kind.shape[1])[None, :]
-        for kd in (G_CHECK, G_PUMP):
+        for kd in (G_CHECK, G_PUMP, G_TURB):
             if kd in self.has:
                 for d, (dx, dy) in enumerate(G_DIRS):
                     m = (kind == kd) & (aux == d) & (((gx * dx + gy * dy) % 3) == 0)
@@ -3807,6 +4088,13 @@ class GasSim:
                 if m.any():
                     col[m] = np.array(base, np.float32) * (0.45 + 0.14 * np.clip(aux[m], 0, 4))[:, None]
         col[self.valve_open[1:-1, 1:-1]] = G_VALVE_OPEN
+        col[self.relief_open[1:-1, 1:-1]] = (240, 170, 210)
+        if G_EXCH in self.has:
+            m = kind == G_EXCH
+            tt = np.clip((self.T[1:-1, 1:-1][m] - 293) / 600, -1, 1)[:, None]
+            base = np.array(G_SOLIDS[G_EXCH][2], np.float32)
+            col[m] = np.where(tt > 0, base * (1 - tt) + np.array([255, 90, 40], np.float32) * tt,
+                              base * (1 + tt) + np.array([40, 120, 255], np.float32) * -tt)
         col[self.cogmask[1:-1, 1:-1]] = (70, 78, 100)      # cog body, the drawn outline goes on top
         for (x, y), sn in self.sensors.items():
             c = G_SENSOR_COLOR[sn['type']]
@@ -3851,12 +4139,13 @@ class GasSim:
             return 'block'
         n = self.n[:, x, y]
         tot = float(n.sum())
+        wtxt = f'water {float(self.liq[x, y]):.1f}  ' if self.liq[x, y] > 0.05 else ''
         if tot < 1e-3:
-            return 'vacuum'
+            return wtxt + 'vacuum'
         p = tot * float(self.T[x, y]) / 293
         parts = sorted(((float(a) / tot, G_NICE[s]) for s, a in zip(G_SPECIES, n)), reverse=True)
         mix = ' '.join(f'{name} {f * 100:.0f}%' for f, name in parts[:3] if f > 0.03)
-        return f'{p:.2f} atm  {float(self.T[x, y]) - 273:.0f}C  {mix}'
+        return wtxt + f'{p:.2f} atm  {float(self.T[x, y]) - 273:.0f}C  {mix}'
 
     def save(self, path):
         tmp = path + '.tmp'
@@ -3867,7 +4156,7 @@ class GasSim:
                              for (x, y), v in self.sensors.items()], np.int32).reshape(-1, 5)
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
                                 bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
-                                sensors=sens, link=self.link, aux=self.aux,
+                                sensors=sens, link=self.link, aux=self.aux, liq=self.liq,
                                 shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0)]
                                                  for q in self.shafts], np.float64).reshape(-1, 7),
                                 meshes=np.array([[self.shafts.index(m['a']), self.shafts.index(m['b']), m['k']]
@@ -3933,6 +4222,8 @@ class GasSim:
                         self.rods.append(dict(a=ha, b=hb, L=L))
                 self.hinges = [h for h in self.hinges if h]
             self.aux[:] = d['aux'] if 'aux' in d else 0
+            self.liq[:] = d['liq'] if 'liq' in d else 0
+            self.relief_open[:] = False
             self.glinks = {}
             if 'glinks' in d:
                 for x, y, lid, tx_, ty_, rx_ in d['glinks'].tolist():
@@ -3973,6 +4264,8 @@ class GasMode:
         self.clip = None
         self.pasting = False
         self.pins = []              # cells with a live readout
+        self.hist = {}              # pinned cell -> recent (pressure, temp) for the graphs
+        self.hist_n = 0
         self.sps, self._steps, self._t0 = 240.0, 0, time.time()
         self.mat_scroll = 0
         self.list_bottom = 560
@@ -4101,6 +4394,9 @@ class GasMode:
             self.app.say('draw blocks with RECT')
         elif self.mat == 'VACUUM':
             sim.drain(mask, 0.5 if amount < 1 else 0.0)
+        elif self.mat == 'WATER':
+            m = mask & ~sim.solid
+            sim.liq[m] = np.minimum(G_LIQ_CAP, sim.liq[m] + amount * 6)
         else:
             sim.add_gas(mask, dict(G_MATS)[self.mat], amount)
         self.dirty = True
@@ -4387,6 +4683,14 @@ class GasMode:
                 if time.perf_counter() - t0 > 0.014:
                     break       # slow pc: keep the frame rate, run the sim slower
             self.sim.move_debris(done, dt)
+            self.hist_n += 1
+            if self.pins and self.hist_n % 4 == 0:
+                for pc in self.pins:
+                    x, y = pc[0] + 1, pc[1] + 1
+                    tot = float(self.sim.n[:, x, y].sum())
+                    T_ = float(self.sim.T[x, y])
+                    h = self.hist.setdefault(pc, deque(maxlen=200))
+                    h.append((tot * T_ / 293, T_ - 273))
             self._steps += done
             if time.time() - self._t0 >= 1.0:
                 self.sps = self._steps / (time.time() - self._t0)
@@ -4572,6 +4876,26 @@ class GasMode:
             pygame.draw.rect(surf, PANEL_LINE, box, 1)
             for i, r_ in enumerate(rs):
                 surf.blit(r_, (box.x + 8, box.y + 5 + i * 17))
+            gy = box.bottom + 8
+            for i, pc in enumerate(self.pins):
+                h = self.hist.get(pc)
+                if not h or len(h) < 2:
+                    continue
+                gw, gh = 240, 58
+                gr = pygame.Rect(W - gw - 10, gy, gw, gh)
+                pygame.draw.rect(surf, PANEL, gr)
+                pygame.draw.rect(surf, PANEL_LINE, gr, 1)
+                for col_, idx, nm in (((110, 180, 255), 0, 'atm'), ((255, 140, 90), 1, 'C')):
+                    vals = [q[idx] for q in h]
+                    lo_, hi_ = min(vals), max(vals)
+                    span = max(hi_ - lo_, 1e-6 if idx == 0 else 5.0)
+                    pts = [(gr.x + 4 + k * (gw - 8) / (len(vals) - 1), gr.bottom - 4 - (v_ - lo_) / span * (gh - 18))
+                           for k, v_ in enumerate(vals)]
+                    pygame.draw.lines(surf, col_, False, pts, 1)
+                    t_ = self.app.tiny.render(f'{vals[-1]:.2f} {nm}' if idx == 0 else f'{vals[-1]:.0f} {nm}', True, col_)
+                    surf.blit(t_, (gr.x + 6 + idx * 110, gr.y + 3))
+                surf.blit(self.app.tiny.render(str(i + 1), True, SEL), (gr.right - 12, gr.y + 3))
+                gy += gh + 6
         self.list_bottom = H - (len(G_HELP) * 15 + 30) - 6
         self.clamp_scroll()
         surf.blit(self.app.small.render('MATERIAL  (scroll)', True, TEXT_DIM), (12, self.mat_top() - 20))
@@ -4587,6 +4911,8 @@ class GasMode:
                 sw = G_SENSOR_COLOR[G_SENSOR_TYPES[m]]
             elif m == 'LINK':
                 sw = G_SOLIDS[G_LINK][2]
+            elif m == 'WATER':
+                sw = (60, 130, 230)
             elif m in G_MECH:
                 sw = (200, 204, 214)
             elif comp:
@@ -4621,6 +4947,7 @@ def main():
     clock = pygame.time.Clock()
     app = App()
     app.load()
+    app.scan_chips()
     app.updater = Updater()
     running = True
     restart = False
