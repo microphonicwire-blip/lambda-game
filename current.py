@@ -2649,13 +2649,22 @@ G_SOLIDS = [None, ('WALL', 60, (150, 160, 178)), ('STEEL', 0, (100, 108, 122)),
             ('PUMP', 60, (90, 200, 90)), ('SOURCE', 60, (230, 230, 110)),
             ('VENT', 60, (70, 70, 80)), ('LINK', 60, (235, 235, 245)),
             ('RELIEF VALVE', 60, (215, 110, 170)), ('EXCHANGER', 60, (150, 152, 168)),
-            ('TURBINE', 60, (215, 205, 90))]
+            ('TURBINE', 60, (215, 205, 90)), ('URANIUM', 60, (110, 190, 70)),
+            ('CONTROL ROD', 60, (70, 72, 92))]
 G_WALL, G_STEEL, G_GLASS, G_IGNITER, G_VALVE, G_SENSOR = 1, 2, 3, 4, 5, 6
 G_FILTER, G_CHECK, G_HEATER, G_COOLER, G_PUMP, G_SOURCE, G_VENT, G_LINK = 7, 8, 9, 10, 11, 12, 13, 14
 G_RELIEF, G_EXCH, G_TURB = 15, 16, 17
+G_URAN, G_CTRL = 18, 19
+G_THERM = (G_EXCH, G_URAN, G_CTRL)      # solid parts that keep their own temperature and trade heat with the gas
+G_THERM_C = np.zeros(256, np.float32)
+G_THERM_C[G_EXCH], G_THERM_C[G_URAN], G_THERM_C[G_CTRL] = 3.0, 6.0, 3.0
+G_LIQ_C = 9.0           # heat capacity of liquid water per unit
+G_REACT = dict(D=0.22, LOSS=0.012, ABS_W=0.01, ROD=0.9, K=3.4, GAIN=0.3, F0=0.38, DOPP=5000.0, PHI_MAX=12.0,
+               SRC=0.003, POWER=6.0, DECAY_K=0.9, DECAY_T=0.0007, MELT=1300.0)
 G_PASS = (G_FILTER, G_CHECK, G_PUMP, G_TURB)    # gas flows through these cells
 G_LAT = 4896.0          # latent heat of water / R, in K (boils at 373K at 1 atm)
 G_LIQ_CAP = 4.0         # liquid water a cell can hold
+G_LIQ_ITERS = 5       # quick water moves per sim step
 G_PHASE = 0.3           # how fast steam condenses / water evaporates toward equilibrium
 G_EXCH_C = 3.0          # heat capacity of an exchanger wall cell
 G_EXCH_K = 0.2          # how well exchanger walls conduct heat
@@ -2695,7 +2704,7 @@ G_BLOCK_COLOR, G_BLOCK_EDGE = (178, 130, 86), (120, 84, 52)
 G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('IGNITER', None),
           ('VALVE', None), ('FILTER', None), ('CHECK VALVE', None), ('HEATER', None),
           ('COOLER', None), ('PUMP', None), ('SOURCE', None), ('VENT', None), ('LINK', None),
-          ('RELIEF VALVE', None), ('EXCHANGER', None), ('TURBINE', None),
+          ('RELIEF VALVE', None), ('EXCHANGER', None), ('TURBINE', None), ('URANIUM', None), ('CONTROL ROD', None),
           ('SHAFT', None), ('COG', None), ('HINGE', None), ('ROD', None),
           ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None), ('HINGE SENSOR', None), ('TIMER', None),
           ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
@@ -2711,9 +2720,10 @@ G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('I
 G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER,
                 'VALVE': G_VALVE, 'FILTER': G_FILTER, 'CHECK VALVE': G_CHECK, 'HEATER': G_HEATER,
                 'COOLER': G_COOLER, 'PUMP': G_PUMP, 'SOURCE': G_SOURCE, 'VENT': G_VENT,
-                'RELIEF VALVE': G_RELIEF, 'EXCHANGER': G_EXCH, 'TURBINE': G_TURB}
+                'RELIEF VALVE': G_RELIEF, 'EXCHANGER': G_EXCH, 'TURBINE': G_TURB,
+                'URANIUM': G_URAN, 'CONTROL ROD': G_CTRL}
 G_DEFAULT_AUX = {G_FILTER: G_IDX['H2'], G_CHECK: 0, G_HEATER: 2, G_COOLER: 2, G_PUMP: 0, G_SOURCE: G_IDX['H2'],
-                 G_RELIEF: 2, G_TURB: 0}
+                 G_RELIEF: 2, G_TURB: 0, G_CTRL: 4}
 G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE', 'SELECT']
 G_K = 0.08          # how hard pressure pushes
 G_DAMP = 0.998      # flow friction
@@ -2763,6 +2773,10 @@ class GasSim:
         self.valve_open = np.zeros(shape, bool)
         self.relief_open = np.zeros(shape, bool)    # relief valves that popped open
         self.liq = np.zeros(shape, np.float32)      # liquid water in each cell
+        self.phi = np.zeros(shape, np.float32)      # neutron flux
+        self.decay = np.zeros(shape, np.float32)    # decay heat stored in fuel
+        self.scram = np.zeros(shape, bool)          # control rods slammed in by a sensor / circuit
+        self.news = []                              # messages for the ui (meltdowns)
         self.link = np.full(shape, -1, np.int32)    # valve/igniter -> sensor key (x * H2 + y), -1 = manual
         self.sensors = {}                       # (x, y) -> dict(type, dir, level, on)
         self.spark_t = np.zeros(shape, np.int16)
@@ -2805,6 +2819,8 @@ class GasSim:
         self.n[:] = self.amb_field
         self.T[:] = 293
         self.liq[:] = 0
+        self.phi[:] = 0
+        self.decay[:] = 0
         self.n[:, self.solid] = 0
         self.u[:] = 0
         self.v[:] = 0
@@ -2897,6 +2913,8 @@ class GasSim:
             a = (a + 1) % 4
         elif k in (G_HEATER, G_COOLER, G_RELIEF):
             a = (a + 1) % 5
+        elif k == G_CTRL:
+            a = (a + 1) % 5
         self.aux[m] = a
         return self.describe(x, y)
 
@@ -2923,6 +2941,12 @@ class GasSim:
             return f'heat exchanger wall, {float(self.T[x, y]) - 273:.0f}C, passes heat but no gas'
         if k == G_TURB:
             return f'turbine, flow {G_DIR_NAMES[a]} (click to turn), touch a shaft to drive it, or spin the shaft to push gas'
+        if k == G_URAN:
+            return (f'uranium fuel, {float(self.T[x, y]) - 273:.0f}C, flux {float(self.phi[x, y]):.1f}, '
+                    f'decay heat {float(self.decay[x, y]):.2f}. needs water around it to go critical')
+        if k == G_CTRL:
+            sc = ', SCRAMMED' if self.scram[x, y] else ''
+            return f'control rod, {a * 25}% in{sc} (click to change, link a sensor to scram it)'
         if k == G_LINK:
             lk = self.glinks.get((x, y))
             if lk:
@@ -2968,10 +2992,12 @@ class GasSim:
         self.kind[mask] = kind
         self.aux[mask] = G_DEFAULT_AUX.get(kind, 0)
         self.strength[mask] = G_SOLIDS[kind][1]
-        self.link[mask] = link if kind in (G_VALVE, G_IGNITER) else -1
+        self.link[mask] = link if kind in (G_VALVE, G_IGNITER, G_CTRL) else -1
         self.valve_open[mask] = False
         self.relief_open[mask] = False
         self.liq[mask] = 0
+        self.phi[mask] = 0
+        self.decay[mask] = 0
         self.n[:, mask] = 0
         self.T[mask] = 293
         self.rebuild()
@@ -3044,6 +3070,12 @@ class GasSim:
     def update_valves(self):
         valve = self.kind == G_VALVE
         on_keys = [x * self.H2 + y for (x, y), sn in self.sensors.items() if sn['on']]
+        if G_CTRL in self.has:
+            sc = (self.kind == G_CTRL) & np.isin(self.link, on_keys)
+            for lk in self.glinks.values():
+                if lk['role'] == 'rx' and lk['on'] and lk['tgt'] and self.kind[lk['tgt']] == G_CTRL:
+                    sc |= self.comp_mask(lk['tgt'])
+            self.scram = sc
         want = valve & (((self.link < 0) & self.manual_valves) | np.isin(self.link, on_keys))
         for lk in self.glinks.values():
             if lk['role'] == 'rx' and lk['on'] and self.kind[lk['tgt']] == G_VALVE:
@@ -3673,22 +3705,76 @@ class GasSim:
             self.n[:, closing] = 0
             self.T[closing] = 293
 
+    def thermal(self):
+        return G_THERM_C[self.kind] > 0
+
     def exchange(self, n, T):
-        # exchanger walls pass heat between whatever touches them, but no gas
+        # exchanger walls / fuel / rods pass heat between whatever touches them, but no gas
         S = n.shape[0]
-        ex = self.kind == G_EXCH
-        Cg = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
-        Cc = np.where(ex, G_EXCH_C, Cg)
+        ex = self.thermal()
+        Cg = (self.cvv @ n.reshape(S, -1)).reshape(T.shape) + G_LIQ_C * self.liq
+        Cc = np.where(ex, G_THERM_C[self.kind], Cg)
         part = ~self.solid | ex
         E = Cc * T
-        dx_ = G_EXCH_K * np.minimum(Cc[:-1], Cc[1:]) * (T[:-1] - T[1:]) * (part[:-1] & part[1:] & (ex[:-1] | ex[1:]))
+        fu = self.kind == G_URAN
+        Kc = np.where(fu, 0.004, G_EXCH_K)       # bare fuel sheds heat into gas badly, but wet fuel (boiling contact) well
+        wet = np.clip(self.liq, 0, 1)
+        Kx = np.minimum(Kc[:-1], Kc[1:]) + 0.3 * np.maximum(wet[:-1], wet[1:]) * (fu[:-1] | fu[1:])
+        Ky = np.minimum(Kc[:, :-1], Kc[:, 1:]) + 0.3 * np.maximum(wet[:, :-1], wet[:, 1:]) * (fu[:, :-1] | fu[:, 1:])
+        dx_ = Kx * np.minimum(Cc[:-1], Cc[1:]) * (T[:-1] - T[1:]) * (part[:-1] & part[1:] & (ex[:-1] | ex[1:]))
         E[:-1] -= dx_
         E[1:] += dx_
-        dy_ = G_EXCH_K * np.minimum(Cc[:, :-1], Cc[:, 1:]) * (T[:, :-1] - T[:, 1:]) * (part[:, :-1] & part[:, 1:] & (ex[:, :-1] | ex[:, 1:]))
+        dy_ = Ky * np.minimum(Cc[:, :-1], Cc[:, 1:]) * (T[:, :-1] - T[:, 1:]) * (part[:, :-1] & part[:, 1:] & (ex[:, :-1] | ex[:, 1:]))
         E[:, :-1] -= dy_
         E[:, 1:] += dy_
         m = part & (Cc > 1e-5)
         T[m] = E[m] / Cc[m]
+
+    def reactor(self, n, T):
+        # neutron flux diffuses through everything, water slows neutrons so fuel can catch them, control rods soak them up.
+        # hot fuel catches fewer (doppler), fuel makes heat and keeps making some after shutdown (decay heat)
+        R = G_REACT
+        kind = self.kind
+        fuel = kind == G_URAN
+        rod = kind == G_CTRL
+        phi = self.phi
+        h = G_IDX['H2O']
+        md = np.clip(self.liq, 0, 2) * 0.5 + np.clip(n[h], 0, 3) * 0.05
+        md[self.solid] = 0
+        mb = md.copy()
+        mb[1:-1, 1:-1] = (md[1:-1, 1:-1] * 2 + md[:-2, 1:-1] + md[2:, 1:-1] + md[1:-1, :-2] + md[1:-1, 2:]) / 6
+        mb = np.clip(mb, 0, 1)
+        ins = np.where(self.scram, 1.0, self.aux * 0.25).astype(np.float32) * rod
+        ab = R['LOSS'] + R['ABS_W'] * mb + R['ROD'] * ins
+        ab = np.minimum(ab, 0.9)
+        keff = R['K'] * (R['F0'] + (1 - R['F0']) * mb) / (1 + np.maximum(T - 293, 0) / R['DOPP'])
+        gain = np.where(fuel, R['GAIN'] * (keff - 1), 0)
+        src = np.where(fuel, R['SRC'], 0)
+        for _ in range(2):
+            lap = np.zeros_like(phi)
+            lap[1:-1, 1:-1] = phi[:-2, 1:-1] + phi[2:, 1:-1] + phi[1:-1, :-2] + phi[1:-1, 2:] - 4 * phi[1:-1, 1:-1]
+            phi += R['D'] * lap
+            phi *= (1 - ab * 0.5)
+            phi *= (1 + gain * 0.5)
+            phi += src * 0.5
+        phi[self.ring] = 0
+        np.clip(phi, 0, R['PHI_MAX'], out=phi)
+        if fuel.any():
+            pw = np.where(fuel, R['POWER'] * phi, 0)
+            self.decay += np.where(fuel, (R['DECAY_K'] * pw - self.decay) * R['DECAY_T'], 0)
+            T += (pw + self.decay) / G_THERM_C[kind].clip(1)  * fuel
+            melt = fuel & (T > R['MELT'])
+            if melt.any():
+                kind[melt] = 0
+                self.strength[melt] = 0
+                self.aux[melt] = 0
+                self.comp_cache = {}
+                self.decay[melt] = 0
+                self.rebuild()
+                self.melted = getattr(self, 'melted', 0) + int(melt.sum())
+                if self.age - getattr(self, 'melt_t', -999) > 40:
+                    self.news.append('MELTDOWN, the fuel is melting!')
+                self.melt_t = self.age
 
     def turbines(self, u, v, p):
         # blades turn a shaft they touch from the pressure across them, and a spinning shaft drags the gas along
@@ -3731,6 +3817,18 @@ class GasSim:
                     for fy in (y - 1, y):
                         v[x, fy] += G_TURB_COUPLE * (dy * vt - v[x, fy])
 
+    def mist(self, up, un, vp, vn, s):
+        # thin liquid (spray, fog) rides along with the gas, thick pools stay put
+        liq = self.liq
+        m = liq * np.clip(1 - liq / 1.5, 0, 1)
+        fx = m[:-1] * up * s[:-1] + m[1:] * un * s[1:]
+        fy = m[:, :-1] * vp * s[:, :-1] + m[:, 1:] * vn * s[:, 1:]
+        liq[:-1] -= fx
+        liq[1:] += fx
+        liq[:, :-1] -= fy
+        liq[:, 1:] += fy
+        np.clip(liq, 0, G_LIQ_CAP, out=liq)
+
     def liquid_step(self, n, T):
         liq = self.liq
         h = G_IDX['H2O']
@@ -3743,7 +3841,7 @@ class GasSim:
         Tc = np.maximum(T, 1.0)
         nsat = np.exp(G_LAT * (1 / 373.0 - 1 / Tc)) * 293 / Tc          # steam the cell can hold at this temperature
         nh = n[h]
-        C = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
+        C = (self.cvv @ n.reshape(S, -1)).reshape(T.shape) + G_LIQ_C * liq
         E = C * T
         cond = np.where(free, np.maximum(nh - nsat, 0) * G_PHASE, 0)
         cond = np.minimum(cond, G_LIQ_CAP - liq).clip(0)
@@ -3754,22 +3852,44 @@ class GasSim:
             n[h] -= d
             liq += d
             E += d * G_LAT
-            C2 = (self.cvv @ n.reshape(S, -1)).reshape(T.shape)
+            C2 = (self.cvv @ n.reshape(S, -1)).reshape(T.shape) + G_LIQ_C * liq
             m = (d != 0) & (C2 > 1e-5)
             T[m] = E[m] / C2[m]
             self.active.add(h)
         np.maximum(n[h], 0, out=n[h])
         if self.gravity and liq.any():
-            amt = np.minimum(liq[:, :-1], np.maximum(G_LIQ_CAP - liq[:, 1:], 0)) * 0.6 * (free[:, :-1] & free[:, 1:])
-            liq[:, :-1] -= amt
-            liq[:, 1:] += amt
-            sup = np.ones(liq.shape, bool)           # rests on something: floor or a full cell
-            sup[:, :-1] = ~free[:, 1:] | (liq[:, 1:] >= G_LIQ_CAP - 0.05)
-            diff = liq[:-1] - liq[1:]
-            ok = free[:-1] & free[1:] & np.where(diff > 0, sup[:-1], sup[1:])
-            fl = 0.25 * diff * ok
-            liq[:-1] -= fl
-            liq[1:] += fl
+            # water gets several quick moves per sim step: fall, slide down diagonals, then level out sideways.
+            # only the part of the grid that has water in it is touched
+            xs = np.flatnonzero(liq.any(1))
+            ys = np.flatnonzero(liq.any(0))
+            x0, x1 = max(0, xs[0] - 2), min(liq.shape[0], xs[-1] + 3)
+            y0, y1 = max(0, ys[0] - 2), min(liq.shape[1], ys[-1] + 3)
+            L = liq[x0:x1, y0:y1]
+            F = free[x0:x1, y0:y1]
+            ff = F[:, :-1] & F[:, 1:]
+            fx = F[:-1] & F[1:]
+            fd1 = F[:-1, :-1] & F[1:, 1:]       # down-right
+            fd2 = F[1:, :-1] & F[:-1, 1:]       # down-left
+            for it in range(G_LIQ_ITERS):
+                amt = np.minimum(L[:, :-1], np.maximum(G_LIQ_CAP - L[:, 1:], 0)) * ff
+                L[:, :-1] -= amt
+                L[:, 1:] += amt
+                stuck = ~F[:, 1:] | (L[:, 1:] >= G_LIQ_CAP - 0.05)
+                for sx in ((1, -1) if it % 2 == 0 else (-1, 1)):
+                    if sx == 1:
+                        src, dst, ok = L[:-1, :-1], L[1:, 1:], fd1 & stuck[:-1]
+                    else:
+                        src, dst, ok = L[1:, :-1], L[:-1, 1:], fd2 & stuck[1:]
+                    a2 = np.minimum(src, np.maximum(G_LIQ_CAP - dst, 0)) * 0.5 * ok
+                    src -= a2
+                    dst += a2
+                sup = np.ones(L.shape, bool)
+                sup[:, :-1] = ~F[:, 1:] | (L[:, 1:] >= G_LIQ_CAP - 0.05)
+                diff = L[:-1] - L[1:]
+                ok = fx & (((diff > 0) & sup[:-1]) | ((diff < 0) & sup[1:]))
+                fl = 0.5 * diff * ok
+                L[:-1] -= fl
+                L[1:] += fl
         np.clip(liq, 0, G_LIQ_CAP, out=liq)
         liq[liq < 1e-4] = 0
 
@@ -3965,7 +4085,7 @@ class GasSim:
         ar = un * s[1:] - dx
         bl = vp * s[:, :-1] + dy
         br = vn * s[:, 1:] - dy
-        exm = (self.kind == G_EXCH) if G_EXCH in self.has else None
+        exm = self.thermal() if self.has & set(G_THERM) else None
         exT = T[exm].copy() if exm is not None else None
         E = C * T
         # squeezing gas heats it, letting it expand cools it (p dV work)
@@ -3988,6 +4108,8 @@ class GasSim:
         n[:, 1:] += fx
         n[:, :, :-1] -= fy
         n[:, :, 1:] += fy
+        if self.liq.any():
+            self.mist(up, un, vp, vn, s)
         E[:-1] -= ex
         E[1:] += ex
         E[:, :-1] -= ey
@@ -4002,7 +4124,9 @@ class GasSim:
         S = n.shape[0]
         if self.has & {G_FILTER, G_HEATER, G_COOLER, G_SOURCE, G_VENT}:
             self.devices(n, T, sol)
-        if G_EXCH in self.has:
+        if G_URAN in self.has:
+            self.reactor(n, T)
+        if self.has & set(G_THERM):
             self.exchange(n, T)
         # sparks from igniters
         if self.spark_t.any():
@@ -4039,8 +4163,8 @@ class GasSim:
         T[self.near_wall] += (293 - T[self.near_wall]) * G_WALLCOOL
         np.clip(T, 20, 5000, out=T)
         n[:, sol] = 0
-        if G_EXCH in self.has:
-            keep = sol & (self.kind == G_EXCH)
+        if self.has & set(G_THERM):
+            keep = sol & self.thermal()
             exT2 = T[keep].copy()
             T[sol] = 293
             T[keep] = exT2
@@ -4089,12 +4213,31 @@ class GasSim:
                     col[m] = np.array(base, np.float32) * (0.45 + 0.14 * np.clip(aux[m], 0, 4))[:, None]
         col[self.valve_open[1:-1, 1:-1]] = G_VALVE_OPEN
         col[self.relief_open[1:-1, 1:-1]] = (240, 170, 210)
-        if G_EXCH in self.has:
+        if self.has & set(G_THERM):
             m = kind == G_EXCH
             tt = np.clip((self.T[1:-1, 1:-1][m] - 293) / 600, -1, 1)[:, None]
             base = np.array(G_SOLIDS[G_EXCH][2], np.float32)
             col[m] = np.where(tt > 0, base * (1 - tt) + np.array([255, 90, 40], np.float32) * tt,
                               base * (1 + tt) + np.array([40, 120, 255], np.float32) * -tt)
+        if G_URAN in self.has:
+            ph = np.clip(self.phi[1:-1, 1:-1] * 0.35, 0, 1)
+            Ti = self.T[1:-1, 1:-1]
+            lw = np.clip(self.liq[1:-1, 1:-1] / 1.0, 0, 1)
+            col += np.array([20, 70, 255], np.float32) * (ph * lw * 0.9)[..., None]       # cherenkov glow in water
+            m = kind == G_URAN
+            if m.any():
+                base = np.array(G_SOLIDS[G_URAN][2], np.float32)
+                g = np.clip((Ti[m] - 600) / 1800, 0, 1)[:, None]
+                glow = np.array([255, 150, 40], np.float32) * (1 - g) + np.array([255, 245, 200], np.float32) * g
+                k = np.clip(ph[m] * 0.6 + g[:, 0], 0, 1)[:, None]
+                col[m] = base * (1 - k) + glow * k + 25
+        if G_CTRL in self.has:
+            m = kind == G_CTRL
+            if m.any():
+                lv = np.where(self.scram[1:-1, 1:-1], 4, aux).astype(np.float32)[m]
+                col[m] = np.array([200, 200, 90], np.float32) * (0.2 + 0.18 * lv)[:, None] * 0.6 + np.array([40, 42, 55], np.float32)
+                hot = np.clip((self.T[1:-1, 1:-1][m] - 600) / 1500, 0, 1)[:, None]
+                col[m] = col[m] * (1 - hot) + np.array([255, 120, 40], np.float32) * hot
         col[self.cogmask[1:-1, 1:-1]] = (70, 78, 100)      # cog body, the drawn outline goes on top
         for (x, y), sn in self.sensors.items():
             c = G_SENSOR_COLOR[sn['type']]
@@ -4156,7 +4299,7 @@ class GasSim:
                              for (x, y), v in self.sensors.items()], np.int32).reshape(-1, 5)
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
                                 bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
-                                sensors=sens, link=self.link, aux=self.aux, liq=self.liq,
+                                sensors=sens, link=self.link, aux=self.aux, liq=self.liq, phi=self.phi, decay=self.decay,
                                 shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0)]
                                                  for q in self.shafts], np.float64).reshape(-1, 7),
                                 meshes=np.array([[self.shafts.index(m['a']), self.shafts.index(m['b']), m['k']]
@@ -4223,6 +4366,9 @@ class GasSim:
                 self.hinges = [h for h in self.hinges if h]
             self.aux[:] = d['aux'] if 'aux' in d else 0
             self.liq[:] = d['liq'] if 'liq' in d else 0
+            self.phi[:] = d['phi'] if 'phi' in d else 0
+            self.decay[:] = d['decay'] if 'decay' in d else 0
+            self.scram[:] = False
             self.relief_open[:] = False
             self.glinks = {}
             if 'glinks' in d:
@@ -4385,7 +4531,7 @@ class GasMode:
             sim.erase(mask)
         elif self.mat in G_SOLID_MATS:
             link = -1
-            if self.link_sensor and self.mat in ('VALVE', 'IGNITER'):
+            if self.link_sensor and self.mat in ('VALVE', 'IGNITER', 'CONTROL ROD'):
                 link = self.link_sensor[0] * sim.H2 + self.link_sensor[1]
             sim.set_solid(mask, G_SOLID_MATS[self.mat], link)
         elif self.mat in G_SENSOR_TYPES or self.mat in ('LINK',) + G_MECH:
@@ -4502,7 +4648,7 @@ class GasMode:
                     r = self.mat_rect(i)
                     if r.collidepoint(e.pos) and r.top >= self.mat_top() - 4 and r.bottom <= self.list_bottom + 2:
                         self.mat = m
-                        if m not in ('VALVE', 'IGNITER'):
+                        if m not in ('VALVE', 'IGNITER', 'CONTROL ROD'):
                             self.link_sensor = None
                         if m != 'LINK':
                             self.link_target = None
@@ -4572,7 +4718,7 @@ class GasMode:
                             self.link_id = lk['id']
                             self.dirty = True
                             self.app.say(self.sim.describe(*key))
-                    elif sn or kd in (G_VALVE, G_IGNITER):
+                    elif sn or kd in (G_VALVE, G_IGNITER, G_CTRL):
                         self.link_target = key
                         self.app.say('now place a link cell, it connects to this (esc to stop)')
                     elif self.link_target is None:
@@ -4587,7 +4733,7 @@ class GasMode:
                     self.app.say(self.sim.cycle(key[0], key[1]))
                     self.dirty = True
                     return None
-                if sn and self.mat in ('VALVE', 'IGNITER'):
+                if sn and self.mat in ('VALVE', 'IGNITER', 'CONTROL ROD'):
                     # click a sensor first, then whatever valves / igniters you draw follow it
                     if self.link_sensor == key:
                         self.link_sensor = None
@@ -4683,6 +4829,8 @@ class GasMode:
                 if time.perf_counter() - t0 > 0.014:
                     break       # slow pc: keep the frame rate, run the sim slower
             self.sim.move_debris(done, dt)
+            while self.sim.news:
+                self.app.say(self.sim.news.pop(0))
             self.hist_n += 1
             if self.pins and self.hist_n % 4 == 0:
                 for pc in self.pins:
