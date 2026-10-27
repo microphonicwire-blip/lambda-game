@@ -217,7 +217,7 @@ HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = ad
         'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
         'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
         'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes',
-        'clr: ctrl+sh+del', 'tab = gas lab']
+        'clr: ctrl+sh+del', 'tab = gas lab', 'f5 = check update']
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
 # kinds with an editable description in the body (double-click the empty space)
@@ -377,7 +377,12 @@ def safe_repo_path(path):
 
 
 def ssl_context():
-    # packaged linux builds can't always find the system certs, so try the usual spots
+    # packaged builds can't always find the system certs: certifi first (bundled in the exe), then the usual spots
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
     for f in ('/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt',
               '/etc/ssl/cert.pem', '/etc/ca-certificates/extracted/tls-ca-bundle.pem'):
         if os.path.exists(f):
@@ -390,6 +395,7 @@ def ssl_context():
 
 def log_update(msg):
     try:
+        os.makedirs(os.path.dirname(save_path()), exist_ok=True)
         with open(os.path.join(os.path.dirname(save_path()), 'update.log'), 'a') as f:
             f.write(time.strftime('%H:%M:%S ') + msg + '\n')
     except OSError:
@@ -397,26 +403,36 @@ def log_update(msg):
 
 
 class Updater:
-    # checks github on boot, installs the repo's files if they differ
-    def __init__(self, start=True):
+    # checks github on boot (and on F5), installs the repo's files if they differ
+    def __init__(self, start=True, manual=False):
         self.state = 'off'      # off idle checking prompt installing failed restart
         self.message = ''
         self.sha = ''
         self.todo = []
+        self.raw = {}           # files already downloaded by the fallback check
+        self.note = ''          # one-line status for the toast
+        self.manual = manual
         if GITHUB_REPO:
             self.state = 'checking'
             if start:
                 threading.Thread(target=self._check, daemon=True).start()
 
-    def _get(self, url, raw=False):
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'logicsim',
-            'Accept': 'application/vnd.github.raw' if raw else 'application/vnd.github+json'})
-        tok = github_token()
-        if tok:
-            req.add_header('Authorization', 'Bearer ' + tok)
-        with urllib.request.urlopen(req, timeout=8, context=ssl_context()) as r:
-            return r.read()
+    def _get(self, url, raw=False, tries=2):
+        err = None
+        for _ in range(tries):
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'logicsim', 'Cache-Control': 'no-cache',
+                'Accept': 'application/vnd.github.raw' if raw else 'application/vnd.github+json'})
+            tok = github_token()
+            if tok and 'api.github.com' in url:
+                req.add_header('Authorization', 'Bearer ' + tok)
+            try:
+                with urllib.request.urlopen(req, timeout=10, context=ssl_context()) as r:
+                    return r.read()
+            except Exception as e:
+                err = e
+                time.sleep(0.5)
+        raise err
 
     def _write_version(self, sha):
         try:
@@ -427,55 +443,87 @@ class Updater:
             pass
 
     def _check(self):
-        api = f'https://api.github.com/repos/{GITHUB_REPO}'
         try:
-            head = json.loads(self._get(f'{api}/commits/{GITHUB_BRANCH}'))
-            sha = head['sha']
-            msg = head['commit']['message'].strip().split('\n')[0]
-            try:
-                with open(version_path()) as f:
-                    cur = f.read().strip()
-            except OSError:
-                cur = ''
-            if cur == sha:
-                self.state = 'idle'
-                return
-            tree = json.loads(self._get(f"{api}/git/trees/{head['commit']['tree']['sha']}?recursive=1"))
-            todo = []
-            has_main = any(t['path'] == REPO_MAIN for t in tree['tree'])
-            for t in tree['tree']:
-                path = t['path']
-                ext = os.path.splitext(path)[1].lower()
-                if t['type'] != 'blob' or ext not in SYNC_EXT or not safe_repo_path(path) \
-                        or os.path.basename(path) in SKIP:
-                    continue
-                if has_main and path != REPO_MAIN and local_path(path) == MAIN_LOCAL:
-                    continue        # same file as current.py, current.py wins
-                local = read_local(path)
-                if local is not None and ext in TEXT_EXT:
-                    local = local.replace(b'\r\n', b'\n')
-                if local is None or git_blob_sha(local) != t['sha']:
-                    todo.append(path)
-            if not todo:
-                self._write_version(sha)     # already matches, nothing to say
-                self.state = 'idle'
-                return
-            self.sha, self.message, self.todo = sha, msg, todo
-            self.state = 'prompt'
+            self._check_api()
         except Exception as err:
-            log_update(f'check failed: {err!r}')
-            self.state = 'idle'              # offline or no access, just play
+            log_update(f'api check failed: {err!r}, trying raw file')
+            try:
+                self._check_raw()
+            except Exception as err2:
+                log_update(f'raw check failed: {err2!r}')
+                self.note = f'update check failed ({type(err2).__name__}), f5 to retry'
+                self.state = 'idle'
+                return
+        if self.manual and self.state == 'idle' and not self.note:
+            self.note = 'up to date'
+
+    def _check_api(self):
+        api = f'https://api.github.com/repos/{GITHUB_REPO}'
+        head = json.loads(self._get(f'{api}/commits/{GITHUB_BRANCH}'))
+        sha = head['sha']
+        msg = head['commit']['message'].strip().split('\n')[0]
+        try:
+            with open(version_path()) as f:
+                cur = f.read().strip()
+        except OSError:
+            cur = ''
+        if cur == sha and read_local(REPO_MAIN) is not None:
+            self.state = 'idle'
+            return
+        tree = json.loads(self._get(f"{api}/git/trees/{head['commit']['tree']['sha']}?recursive=1"))
+        todo = []
+        has_main = any(t['path'] == REPO_MAIN for t in tree['tree'])
+        for t in tree['tree']:
+            path = t['path']
+            ext = os.path.splitext(path)[1].lower()
+            if t['type'] != 'blob' or ext not in SYNC_EXT or not safe_repo_path(path) \
+                    or os.path.basename(path) in SKIP:
+                continue
+            if has_main and path != REPO_MAIN and local_path(path) == MAIN_LOCAL:
+                continue        # same file as current.py, current.py wins
+            local = read_local(path)
+            if local is not None and ext in TEXT_EXT:
+                local = local.replace(b'\r\n', b'\n')
+            if local is None or git_blob_sha(local) != t['sha']:
+                todo.append(path)
+        if not todo:
+            self._write_version(sha)     # already matches, nothing to say
+            self.state = 'idle'
+            return
+        self.sha, self.message, self.todo = sha, msg, todo
+        self.state = 'prompt'
+
+    def _check_raw(self):
+        # api down or rate limited (60 checks an hour): just compare the main file straight from github
+        url = f'https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{REPO_MAIN}?t={int(time.time())}'
+        data = self._get(url, raw=True)
+        local = read_local(REPO_MAIN)
+        if local is not None and local.replace(b'\r\n', b'\n') == data.replace(b'\r\n', b'\n'):
+            self.state = 'idle'
+            return
+        self.sha, self.message, self.todo = '', 'new version of the game', [REPO_MAIN]
+        self.raw = {REPO_MAIN: data}
+        self.state = 'prompt'
 
     def install(self):
         self.state = 'installing'
         threading.Thread(target=self._install, daemon=True).start()
 
+    def _fetch(self, path):
+        if path in self.raw:
+            return self.raw[path]
+        q = urllib.parse.quote(path)
+        try:
+            return self._get(f'https://api.github.com/repos/{GITHUB_REPO}/contents/{q}?ref={self.sha}', raw=True)
+        except Exception as err:
+            log_update(f'api download of {path} failed: {err!r}, trying raw')
+            return self._get(f'https://raw.githubusercontent.com/{GITHUB_REPO}/{self.sha or GITHUB_BRANCH}/{q}', raw=True)
+
     def _install(self):
-        api = f'https://api.github.com/repos/{GITHUB_REPO}'
         try:
             files = []
             for path in self.todo:
-                data = self._get(f'{api}/contents/{urllib.parse.quote(path)}?ref={self.sha}', raw=True)
+                data = self._fetch(path)
                 if path.endswith('.py'):
                     compile(data, path, 'exec')      # don't install something that can't even parse
                 files.append((path, data))
@@ -485,10 +533,18 @@ class Updater:
                 with open(dst + '.new', 'wb') as f:
                     f.write(data)
                 os.replace(dst + '.new', dst)
-            self._write_version(self.sha)
+                log_update(f'installed {path} -> {dst}')
+            if self.sha:
+                self._write_version(self.sha)
+            else:
+                try:
+                    os.remove(version_path())   # unknown commit, let the next api check sort it out
+                except OSError:
+                    pass
             self.state = 'restart'
         except Exception as err:
             log_update(f'install failed: {err!r}')
+            self.message = f'{type(err).__name__}: {err}'[:80]
             self.state = 'failed'
 
     def dismiss(self):
@@ -2012,7 +2068,9 @@ class App:
             elif u.state == 'installing':
                 self.label(surf, 'installing...', TEXT, (box.centerx, box.centery))
             else:
-                self.label(surf, 'update failed, keeping this version', TEXT, (box.centerx, box.y + 80))
+                self.label(surf, 'update failed, keeping this version', TEXT, (box.centerx, box.y + 70))
+                for i, line in enumerate(wrap(self.font, u.message, box.w - 40)[:2]):
+                    self.label(surf, line, TEXT_DIM, (box.centerx, box.y + 96 + i * 20))
             if u.state != 'installing':
                 pygame.draw.rect(surf, PART_BG, btn)
                 pygame.draw.rect(surf, PART_LINE, btn, 2)
@@ -2069,10 +2127,15 @@ G_SENSOR_COLOR = {'block': (160, 95, 220), 'temp': (225, 85, 55), 'press': (70, 
 G_TIMER_PERIODS = [20, 40, 80, 160, 320]      # sim steps
 G_TIMER_DUTY = [0.1, 0.25, 0.5, 0.75]
 G_STARTER_T = 3.0       # starter motor torque
-G_STARTER_MAX = 0.08    # ...stops pushing above this spin (rad / step)
+G_STARTER_MAX = 0.04    # ...stops pushing above this spin (rad / step)
 G_SHAFT_DENS = 0.25     # shaft mass per cell of area (inertia = half m r^2)
 G_SHAFT_DAMP = 0.9995   # bearing friction
-G_MECH = ('SHAFT', 'HINGE', 'ROD')
+G_MECH = ('SHAFT', 'COG', 'HINGE', 'ROD')
+G_COG_DENS = 0.05       # cogs weigh much less than shafts, so gas can actually turn them
+G_COG_FRICTION = 0.995  # extra bearing friction on cogs
+G_COG_PUSH = 1.0        # pressure on the teeth
+G_COG_DAMP = 0.005       # gas drag on spinning cogs (keeps them from spinning themselves up)
+G_COG_FLOW = 0.05       # how hard moving gas turns cogs (and how hard they feel it back)
 G_TEMP_LEVELS = [100, 200, 400, 700, 1000]        # C
 G_PRES_LEVELS = [1.5, 2, 3, 5, 10]                # atm
 G_DIRS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
@@ -2083,7 +2146,7 @@ G_BLOCK_COLOR, G_BLOCK_EDGE = (178, 130, 86), (120, 84, 52)
 G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('IGNITER', None),
           ('VALVE', None), ('FILTER', None), ('CHECK VALVE', None), ('HEATER', None),
           ('COOLER', None), ('PUMP', None), ('SOURCE', None), ('VENT', None), ('LINK', None),
-          ('SHAFT', None), ('HINGE', None), ('ROD', None),
+          ('SHAFT', None), ('COG', None), ('HINGE', None), ('ROD', None),
           ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None), ('HINGE SENSOR', None), ('TIMER', None),
           ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
           ('PROPANE', {'C3H8': 1}), ('METHANE', {'CH4': 1}), ('OXYGEN', {'O2': 1}),
@@ -2115,6 +2178,7 @@ G_BODY_G = 0.0015   # block gravity
 G_COOL = 0.0004     # hot gas slowly radiating heat away
 G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
 G_VISC = 0.03
+G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, pressure drops there (bernoulli)
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
           'space = pause, . = step', 'up/dn = speed', 'o = open edges', 'g = gravity',
           'hold p = valves', 'hold k = starter', 'i = pin readout', 'select + ctrl+c/v',
@@ -2150,6 +2214,8 @@ class GasSim:
         self.shafts = []                        # dict(x, y, R, th, om)
         self.hinges = []                        # dict(kind, ref, ox, oy, cx, cy)
         self.rods = []                          # dict(a, b, L) between two hinges
+        self.meshes = []                        # dict(a, b, k): two cogs whose teeth touch turn together
+        self.cogmask = np.zeros(shape, bool)    # cells covered by cog bases and teeth right now
         self.comp_cache = {}
         self.has = set()
         self.passable = np.zeros(256, bool)
@@ -2187,7 +2253,8 @@ class GasSim:
         self.active = {0, 1}
 
     def clear(self):
-        self.shafts, self.hinges, self.rods = [], [], []
+        self.shafts, self.hinges, self.rods, self.meshes = [], [], [], []
+        self.cogmask[:] = False
         self.sensors = {}
         self.glinks = {}
         self.aux[:] = 0
@@ -2207,6 +2274,7 @@ class GasSim:
         self.has = set(np.unique(self.kind).tolist())
         for b in self.bodies:
             sol[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']] = True
+        sol |= self.cogmask
         self.solid = sol
         self.near_wall = None
 
@@ -2529,11 +2597,13 @@ class GasSim:
         clip['sensors'] = {k: dict(v) for k, v in self.sensors.items() if inside(*k)}
         clip['glinks'] = {k: dict(v) for k, v in self.glinks.items() if inside(*k)}
         bodies = [b for b in self.bodies if inside(b['x'], b['y']) and inside(b['x'] + b['w'] - 1, b['y'] + b['h'] - 1)]
-        shafts = [q for q in self.shafts if inside(q['x'] - q['R'], q['y'] - q['R']) and inside(q['x'] + q['R'], q['y'] + q['R'])]
+        shafts = [q for q in self.shafts if inside(q['x'] - q['R'] - q.get('tl', 0), q['y'] - q['R'] - q.get('tl', 0))
+                  and inside(q['x'] + q['R'] + q.get('tl', 0), q['y'] + q['R'] + q.get('tl', 0))]
         clip['bodies'], clip['shafts'] = bodies, shafts
         hs = [h for h in self.hinges if any(h['ref'] is o for o in (bodies if h['kind'] == 'body' else shafts))]
         clip['hinges'] = hs
         clip['rods'] = [r for r in self.rods if any(r['a'] is h for h in hs) and any(r['b'] is h for h in hs)]
+        clip['meshes'] = [m for m in self.meshes if any(m['a'] is q for q in shafts) and any(m['b'] is q for q in shafts)]
         return clip
 
     def paste(self, clip, ox, oy):
@@ -2591,6 +2661,7 @@ class GasSim:
             nq['x'] += dx
             nq['y'] += dy
             nq['om'] = 0.0
+            nq['grace'] = 200
             self.shafts.append(nq)
             news[id(q)] = nq
         newh = {}
@@ -2601,6 +2672,8 @@ class GasSim:
             newh[id(h_)] = nh
         for r in clip['rods']:
             self.rods.append(dict(a=newh[id(r['a'])], b=newh[id(r['b'])], L=r['L']))
+        for m in clip['meshes']:
+            self.meshes.append(dict(a=news[id(m['a'])], b=news[id(m['b'])], k=m['k']))
         self.comp_cache = {}
         self.rebuild()
         self.update_valves()
@@ -2609,7 +2682,138 @@ class GasSim:
 
     # ---- crankshafts: shafts spin, hinges sit on blocks / shafts, rods hold two hinges a fixed distance apart
     def shaft_inertia(self, sh):
-        return 0.5 * G_SHAFT_DENS * math.pi * sh['R'] ** 4
+        R = sh['R']
+        n = sh.get('teeth', 0)
+        dens = G_COG_DENS if n else G_SHAFT_DENS      # cogs are light, shafts are the flywheels
+        I = 0.5 * dens * math.pi * R ** 4
+        if n:
+            tl = sh['tl']
+            I += dens * n * tl * (math.pi * R / n) * (R + tl / 2) ** 2     # the teeth
+        return I
+
+    def cog_cells(self, sh):
+        # (x0, y0, mask) of the cells a cog covers: base disk plus teeth (half of each tooth period)
+        R, tl, n = sh['R'], sh['tl'], sh['teeth']
+        Ro = R + tl
+        x0, x1 = max(1, int(sh['x'] - Ro) - 1), min(self.W2 - 2, int(sh['x'] + Ro) + 2)
+        y0, y1 = max(1, int(sh['y'] - Ro) - 1), min(self.H2 - 2, int(sh['y'] + Ro) + 2)
+        if x1 < x0 or y1 < y0:
+            return x0, y0, np.zeros((0, 0), bool)
+        rx = np.arange(x0, x1 + 1)[:, None] + 0.5 - sh['x']
+        ry = np.arange(y0, y1 + 1)[None, :] + 0.5 - sh['y']
+        r = np.hypot(rx, ry)
+        P = 2 * math.pi / n
+        ph = np.mod(np.arctan2(ry, rx) - sh['th'], P)
+        return x0, y0, (r <= R) | ((r <= Ro) & (ph < P / 2))
+
+    def update_cogs(self):
+        # rotating cogs are solid: cells they sweep over push their gas out of the way, cells they leave are empty
+        cogs = [sh for sh in self.shafts if sh.get('teeth')]
+        cm = np.zeros(self.kind.shape, bool)
+        for sh in cogs:
+            x0, y0, m = self.cog_cells(sh)
+            cm[x0:x0 + m.shape[0], y0:y0 + m.shape[1]] |= m
+        if (cm == self.cogmask).all():
+            return
+        new = cm & ~self.cogmask & ~self.solid
+        self.cogmask = cm
+        self.rebuild()
+        if new.any():
+            # squeeze the gas of newly covered cells evenly into the open cells around them (energy kept)
+            xs, ys = np.nonzero(new)
+            S = self.n.shape[0]
+            amt = self.n[:, xs, ys].copy()
+            es = (self.cvv @ amt) * self.T[xs, ys]
+            oks = [~self.solid[xs + dx, ys + dy] for dx, dy in G_DIRS]
+            cnt = np.maximum(sum(o.astype(np.int32) for o in oks), 1)
+            e_before = (self.cvv @ self.n.reshape(S, -1)).reshape(self.T.shape) * self.T
+            e_add = np.zeros(self.T.shape, np.float32)
+            touched = np.zeros(self.T.shape, bool)
+            for (dx, dy), ok in zip(G_DIRS, oks):
+                if not ok.any():
+                    continue
+                tx, ty = xs[ok] + dx, ys[ok] + dy
+                for sp in range(S):
+                    if amt[sp, ok].any():
+                        np.add.at(self.n[sp], (tx, ty), amt[sp, ok] / cnt[ok])
+                np.add.at(e_add, (tx, ty), es[ok] / cnt[ok])
+                touched[tx, ty] = True
+            self.n[:, new] = 0
+            c_new = (self.cvv @ self.n.reshape(S, -1)).reshape(self.T.shape)
+            m = touched & ~self.solid & (c_new > 1e-6)
+            self.T[m] = (e_before[m] + e_add[m]) / c_new[m]
+        self.T[self.solid] = 293
+
+    def cog_torque(self, p):
+        # gas pushes on the teeth with its flow: force ~ density x (gas speed - surface speed) on every exposed face.
+        # the surface speed part is solved implicitly, so it can only ever slow a cog down toward the gas speed
+        ucell = np.zeros(self.kind.shape, np.float32)
+        vcell = np.zeros(self.kind.shape, np.float32)
+        ucell[1:-1, :] = 0.5 * (self.u[:-1] + self.u[1:])
+        vcell[:, 1:-1] = 0.5 * (self.v[:, :-1] + self.v[:, 1:])
+        rho = self.n.sum(0)
+        for sh in self.shafts:
+            if not sh.get('teeth'):
+                continue
+            x0, y0, m = self.cog_cells(sh)
+            if not m.any():
+                continue
+            xs, ys = np.nonzero(m)
+            gx, gy = xs + x0, ys + y0
+            rx, ry = gx + 0.5 - sh['x'], gy + 0.5 - sh['y']
+            tau = D = 0.0
+            om = sh['om']
+            for dx, dy in G_DIRS:
+                nx, ny = gx + dx, gy + dy
+                o = ~self.solid[nx, ny]
+                if not o.any():
+                    continue
+                rfx, rfy = rx[o] + 0.5 * dx, ry[o] + 0.5 * dy
+                q = rfx * dy - rfy * dx
+                kr = G_COG_FLOW * np.minimum(rho[nx[o], ny[o]], 8.0)
+                c_in = -(ucell[nx[o], ny[o]] * dx + vcell[nx[o], ny[o]] * dy) + om * q    # how fast the gas hits the face
+                tau += float((-kr * c_in * np.abs(c_in) * q).sum())
+                D += float((2 * kr * np.abs(c_in) * q * q).sum())
+                # plain pressure on the face pushes it inwards, damped below so the wake can't spin it up by itself
+                rf = np.minimum(rho[nx[o], ny[o]], 8.0)
+                tau += float((-p[nx[o], ny[o]] * q).sum()) * G_PUSH * G_COG_PUSH
+                D += float((G_COG_DAMP * rf * q * q).sum())
+            I = self.shaft_inertia(sh)
+            if sh.get('grace', 0) > 0:
+                sh['grace'] -= 1
+                tau = 0.0
+            sh['om'] = (om + tau / (I + D)) * G_COG_FRICTION
+
+    def mesh_phase(self, a, b):
+        # turn b so its teeth fall into the gaps of a, along the line between them, then lock the pair
+        phi = math.atan2(b['y'] - a['y'], b['x'] - a['x'])
+        PA, PB = 2 * math.pi / a['teeth'], 2 * math.pi / b['teeth']
+        fa = math.fmod(phi - a['th'], PA) / PA % 1.0
+        fb = (fa + 0.5) % 1.0
+        b['th'] = (phi + math.pi - fb * PB) % (2 * math.pi)
+
+    def pitch(self, sh):
+        return sh['R'] + sh['tl'] / 2
+
+    def add_cog(self, x, y, R, tl, n):
+        for sh in self.shafts:
+            if math.hypot(sh['x'] - x, sh['y'] - y) < 1:
+                return False
+        cog = dict(x=x, y=y, R=max(3.0, R), th=0.0, om=0.0, teeth=max(4, int(n)), tl=max(1.0, tl), grace=200)
+        phased = False
+        for o in self.shafts:
+            if o.get('teeth'):
+                d = math.hypot(o['x'] - x, o['y'] - y)
+                if o['R'] + cog['R'] - 0.5 < d < o['R'] + o['tl'] + cog['R'] + cog['tl'] - 0.2:
+                    if not phased:
+                        self.mesh_phase(o, cog)
+                        phased = True
+                    self.meshes.append(dict(a=o, b=cog, k=0.0))
+        self.shafts.append(cog)
+        for m in self.meshes:
+            if m['b'] is cog or m['a'] is cog:
+                m['k'] = m['a']['th'] * self.pitch(m['a']) + m['b']['th'] * self.pitch(m['b'])
+        return True
 
     def hinge_pos(self, h):
         # (x, y, vx, vy, rx, ry), r = lever arm from the shaft centre (None on blocks)
@@ -2630,22 +2834,31 @@ class GasSim:
         return True
 
     def add_hinge(self, fx, fy):
-        # on a block: snaps to the closest corner. on a shaft: right where you clicked
+        # on a block: snaps to the middle of the closest side. on a shaft: 4 spots on the rim and 4 halfway in
         for b in self.bodies:
             if b['x'] <= fx < b['x'] + b['w'] and b['y'] <= fy < b['y'] + b['h']:
-                cx = 1 if fx - b['x'] > b['w'] / 2 else 0
-                cy = 1 if fy - b['y'] > b['h'] / 2 else 0
+                d = {'l': fx - b['x'], 'r': b['x'] + b['w'] - fx, 't': fy - b['y'], 'b': b['y'] + b['h'] - fy}
+                side = min(d, key=d.get)
+                cx, cy = {'l': (0, 0.5), 'r': (1, 0.5), 't': (0.5, 0), 'b': (0.5, 1)}[side]
                 for h in self.hinges:
                     if h['kind'] == 'body' and h['ref'] is b and h['cx'] == cx and h['cy'] == cy:
-                        return 'that corner already has a hinge'
+                        return 'that side already has a hinge'
                 self.hinges.append(dict(kind='body', ref=b, ox=0.0, oy=0.0, cx=cx, cy=cy))
                 return 'hinge on block'
         for sh in self.shafts:
             dx, dy = fx - sh['x'], fy - sh['y']
-            if math.hypot(dx, dy) <= sh['R']:
-                c, sn = math.cos(-sh['th']), math.sin(-sh['th'])
-                self.hinges.append(dict(kind='shaft', ref=sh, ox=dx * c - dy * sn, oy=dx * sn + dy * c, cx=0, cy=0))
-                return 'hinge on shaft'
+            dist = math.hypot(dx, dy)
+            if dist <= sh['R']:
+                # direction in the shaft's own frame, snapped to the nearest of 4
+                ang = math.atan2(dy, dx) - sh['th']
+                ang = round(ang / (math.pi / 2)) * (math.pi / 2)
+                rad = sh['R'] if dist > sh['R'] * 0.75 else sh['R'] * 0.5
+                ox, oy = rad * math.cos(ang), rad * math.sin(ang)
+                for h in self.hinges:
+                    if h['kind'] == 'shaft' and h['ref'] is sh and abs(h['ox'] - ox) < 1e-6 and abs(h['oy'] - oy) < 1e-6:
+                        return 'that spot already has a hinge'
+                self.hinges.append(dict(kind='shaft', ref=sh, ox=ox, oy=oy, cx=0, cy=0))
+                return 'hinge on shaft rim' if rad == sh['R'] else 'hinge on shaft, halfway in'
         return 'put hinges on a block or inside a shaft'
 
     def near_hinge(self, fx, fy, reach=3.0):
@@ -2674,17 +2887,19 @@ class GasSim:
                        if id(h['ref']) in (live_b if h['kind'] == 'body' else live_s)]
         ids = {id(h) for h in self.hinges}
         self.rods = [r for r in self.rods if id(r['a']) in ids and id(r['b']) in ids]
+        self.meshes = [m for m in self.meshes if id(m['a']) in live_s and id(m['b']) in live_s]
 
     def erase_mech(self, mask):
         keep = []
         for sh in self.shafts:
-            x0, x1 = int(sh['x'] - sh['R']) - 1, int(sh['x'] + sh['R']) + 2
-            y0, y1 = int(sh['y'] - sh['R']) - 1, int(sh['y'] + sh['R']) + 2
+            Ro = sh['R'] + sh.get('tl', 0)
+            x0, x1 = int(sh['x'] - Ro) - 1, int(sh['x'] + Ro) + 2
+            y0, y1 = int(sh['y'] - Ro) - 1, int(sh['y'] + Ro) + 2
             sub = mask[max(0, x0):max(0, x1), max(0, y0):max(0, y1)]
             hit = False
             if sub.any():
                 xs, ys = np.nonzero(sub)
-                hit = bool((((xs + max(0, x0) + 0.5 - sh['x']) ** 2 + (ys + max(0, y0) + 0.5 - sh['y']) ** 2) <= sh['R'] ** 2).any())
+                hit = bool((((xs + max(0, x0) + 0.5 - sh['x']) ** 2 + (ys + max(0, y0) + 0.5 - sh['y']) ** 2) <= Ro ** 2).any())
             if not hit:
                 keep.append(sh)
         self.shafts = keep
@@ -2693,10 +2908,19 @@ class GasSim:
                                    min(self.H2 - 1, max(0, int(self.hinge_pos(h)[1])))]
                        or (h['kind'] == 'shaft' and h['ref'] in keep and False)]
         self.prune_mech()
+        self.update_cogs()      # a deleted cog stops being a solid shape
 
     def solve_rods(self):
         # velocity-level distance constraints (impulses), with a little push-back so errors don't pile up
         for _ in range(6):
+            for m in self.meshes:
+                a, b = m['a'], m['b']
+                ra, rb = self.pitch(a), self.pitch(b)
+                Ia, Ib = self.shaft_inertia(a), self.shaft_inertia(b)
+                err = a['th'] * ra + b['th'] * rb - m['k']
+                lam = -(ra * a['om'] + rb * b['om'] + 0.1 * err) / (ra * ra / Ia + rb * rb / Ib)
+                a['om'] += lam * ra / Ia
+                b['om'] += lam * rb / Ib
             for r in self.rods:
                 A, B = self.hinge_pos(r['a']), self.hinge_pos(r['b'])
                 dx, dy = A[0] - B[0], A[1] - B[1]
@@ -2745,7 +2969,9 @@ class GasSim:
             b['vy'] = (b['vy'] + fy * G_PUSH / mass + (G_BODY_G if self.gravity else 0)) * 0.998
             b['vx'] = max(-0.9, min(0.9, b['vx']))
             b['vy'] = max(-0.9, min(0.9, b['vy']))
-        if self.rods:
+        if any(sh.get('teeth') for sh in self.shafts):
+            self.cog_torque(p)
+        if self.rods or self.meshes:
             self.solve_rods()
             for b in self.bodies:
                 b['vx'] = max(-0.9, min(0.9, b['vx']))
@@ -2768,10 +2994,12 @@ class GasSim:
                         break
                     b[fk] -= d
         for sh in self.shafts:
-            if self.starter and sh['om'] < G_STARTER_MAX:
-                sh['om'] += G_STARTER_T / self.shaft_inertia(sh)
-            sh['th'] = (sh['th'] + sh['om']) % (2 * math.pi)
+            if self.starter and not sh.get('teeth') and sh['om'] < G_STARTER_MAX:
+                sh['om'] = min(G_STARTER_MAX, sh['om'] + G_STARTER_T / self.shaft_inertia(sh))
+            sh['th'] += sh['om']        # not wrapped, meshing cogs compare total turns
             sh['om'] *= G_SHAFT_DAMP
+        if any(sh.get('teeth') for sh in self.shafts) or self.cogmask.any():
+            self.update_cogs()
 
     # walls cracking
     def check_breaks(self, p):
@@ -2941,7 +3169,7 @@ class GasSim:
             n[:, ring] = 0
         self.age += 1
         # blocks and cracking walls work on the whole grid before the gas moves
-        if self.bodies or self.shafts or self.sensors or (self.age % 4 == 0 and self.strength.any()):
+        if self.bodies or self.shafts or self.cogmask.any() or self.sensors or (self.age % 4 == 0 and self.strength.any()):
             p0 = n.sum(0) * T / 293
             if self.bodies or self.shafts:
                 self.move_bodies(p0)
@@ -2985,6 +3213,18 @@ class GasSim:
         u[:, 1:-1] += G_VISC * (uu[:, :-2] + uu[:, 2:] - 2 * uu[:, 1:-1])
         v[1:-1] += G_VISC * (vv[:-2] + vv[2:] - 2 * vv[1:-1])
         v[:, 1:-1] += G_VISC * (vv[:, :-2] + vv[:, 2:] - 2 * vv[:, 1:-1])
+        if G_ADV:
+            uu, vv = u.copy(), v.copy()
+            du = np.where(uu[1:-1] > 0, uu[1:-1] - uu[:-2], uu[2:] - uu[1:-1])
+            u[1:-1] -= G_ADV * uu[1:-1] * du
+            dv = np.where(vv[:, 1:-1] > 0, vv[:, 1:-1] - vv[:, :-2], vv[:, 2:] - vv[:, 1:-1])
+            v[:, 1:-1] -= G_ADV * vv[:, 1:-1] * dv
+            vbar = 0.25 * (vv[:-1, :-1] + vv[:-1, 1:] + vv[1:, :-1] + vv[1:, 1:])      # (W2-1, H2-2), v seen from the u faces
+            duy = np.where(vbar > 0, uu[:, 1:-1] - uu[:, :-2], uu[:, 2:] - uu[:, 1:-1])
+            u[:, 1:-1] -= G_ADV * vbar * duy
+            ubar = 0.25 * (uu[:-1, :-1] + uu[1:, :-1] + uu[:-1, 1:] + uu[1:, 1:])      # (W2-2, H2-1)
+            dvx = np.where(ubar > 0, vv[1:-1] - vv[:-2], vv[2:] - vv[1:-1])
+            v[1:-1] -= G_ADV * ubar * dvx
         u *= G_DAMP * ox
         v *= G_DAMP * oy
         chk = (self.kind == G_CHECK) if G_CHECK in self.has else None
@@ -3120,6 +3360,7 @@ class GasSim:
                 if m.any():
                     col[m] = np.array(base, np.float32) * (0.45 + 0.14 * np.clip(aux[m], 0, 4))[:, None]
         col[self.valve_open[1:-1, 1:-1]] = G_VALVE_OPEN
+        col[self.cogmask[1:-1, 1:-1]] = (70, 78, 100)      # cog body, the drawn outline goes on top
         for (x, y), sn in self.sensors.items():
             c = G_SENSOR_COLOR[sn['type']]
             col[x - 1, y - 1] = tuple(min(255, v + 90) for v in c) if sn['on'] else c
@@ -3157,6 +3398,8 @@ class GasSim:
             if self.kind[x, y] == G_IGNITER:
                 return 'igniter' + (linked.strip() and ' ' + linked.strip() or ', e to spark')
             return name.lower() + (f'  holds {st:.0f} atm/cell' if st else '  unbreakable')
+        if self.cogmask[x, y]:
+            return 'cog'
         if self.solid[x, y]:
             return 'block'
         n = self.n[:, x, y]
@@ -3178,8 +3421,10 @@ class GasSim:
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
                                 bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
                                 sensors=sens, link=self.link, aux=self.aux,
-                                shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om']] for q in self.shafts],
-                                                np.float64).reshape(-1, 5),
+                                shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0)]
+                                                 for q in self.shafts], np.float64).reshape(-1, 7),
+                                meshes=np.array([[self.shafts.index(m['a']), self.shafts.index(m['b']), m['k']]
+                                                 for m in self.meshes], np.float64).reshape(-1, 3),
                                 hinges=np.array([[int(h['kind'] == 'shaft'),
                                                   (self.shafts if h['kind'] == 'shaft' else self.bodies).index(h['ref']),
                                                   h['ox'], h['oy'], h['cx'], h['cy']] for h in self.hinges],
@@ -3215,15 +3460,24 @@ class GasSim:
                 for x, y, t, dr, lv in d['sensors'].tolist():
                     self.sensors[(x, y)] = dict(type=G_SENSOR_KINDS[t], dir=dr, level=lv, on=False)
                 self.link[:] = d['link']
-            self.shafts, self.hinges, self.rods = [], [], []
+            self.shafts, self.hinges, self.rods, self.meshes = [], [], [], []
+            self.cogmask[:] = False
             if 'shafts' in d:
-                for x, y, R, th, om in d['shafts'].tolist():
-                    self.shafts.append(dict(x=x, y=y, R=R, th=th, om=om))
+                for row in d['shafts'].tolist():
+                    x, y, R, th, om = row[:5]
+                    q = dict(x=x, y=y, R=R, th=th, om=om)
+                    if len(row) > 5 and row[5]:
+                        q['teeth'], q['tl'] = int(row[5]), row[6]
+                    self.shafts.append(q)
+                if 'meshes' in d:
+                    for ia, ib, k in d['meshes'].tolist():
+                        if int(ia) < len(self.shafts) and int(ib) < len(self.shafts):
+                            self.meshes.append(dict(a=self.shafts[int(ia)], b=self.shafts[int(ib)], k=k))
                 for kd, ri, ox, oy, cx, cy in d['hinges'].tolist():
                     lst = self.shafts if kd else self.bodies
                     if int(ri) < len(lst):
                         self.hinges.append(dict(kind='shaft' if kd else 'body', ref=lst[int(ri)],
-                                                ox=ox, oy=oy, cx=int(cx), cy=int(cy)))
+                                                ox=ox, oy=oy, cx=float(cx), cy=float(cy)))
                     else:
                         self.hinges.append(None)
                 for a_, b_, L in d['rods'].tolist():
@@ -3266,6 +3520,7 @@ class GasMode:
         self.link_target = None     # sensor / valve / igniter that the next LINK cell connects to
         self.link_id = 1
         self.rod_first = None       # first hinge of a rod being placed
+        self.cog_prev = None        # cog being sized: base chosen, now picking tooth length
         self.sel = None             # SELECT tool rectangle (cell corners)
         self.clip = None
         self.pasting = False
@@ -3377,6 +3632,8 @@ class GasMode:
             if k == pygame.K_ESCAPE:
                 if self.drag:
                     self.drag = None
+                elif self.cog_prev:
+                    self.cog_prev = None
                 elif self.pasting:
                     self.pasting = False
                 elif self.sel:
@@ -3447,7 +3704,9 @@ class GasMode:
         elif e.type == pygame.KEYUP and e.key == pygame.K_k:
             self.sim.starter = False
         elif e.type == pygame.MOUSEWHEEL:
-            if pygame.mouse.get_pos()[0] < PAL_W:
+            if self.cog_prev:
+                self.cog_prev['n'] = max(4, min(60, self.cog_prev['n'] + e.y))
+            elif pygame.mouse.get_pos()[0] < PAL_W:
                 self.mat_scroll -= e.y * 42
                 self.clamp_scroll()
             else:
@@ -3484,6 +3743,19 @@ class GasMode:
             kd = int(self.sim.kind[key])
             fx = (e.pos[0] - self.x0) / self.cs + 1
             fy = (e.pos[1] - self.y0) / self.cs + 1
+            if self.cog_prev:
+                cp_ = self.cog_prev
+                if e.button == 1:
+                    if self.sim.add_cog(cp_['x'], cp_['y'], cp_['R'], cp_['tl'], cp_['n']):
+                        self.dirty = True
+                        self.app.say(f"cog: {cp_['n']} teeth")
+                    else:
+                        self.app.say('a shaft is already there')
+                self.cog_prev = None
+                return None
+            if self.mat == 'COG' and not erase and self.tool != 'SELECT':
+                self.drag = dict(start=c, cur=c, last=c, erase=False, tool='COG')
+                return None
             if self.tool == 'SELECT' and not erase:
                 self.drag = dict(start=c, cur=c, last=c, erase=False, tool='SELECT')
                 return None
@@ -3566,11 +3838,21 @@ class GasMode:
                 return None
             self.drag = dict(start=c, cur=c, last=c, erase=erase,
                              tool='BRUSH' if erase else self.tool)
+        elif e.type == pygame.MOUSEMOTION and self.cog_prev:
+            cp_ = self.cog_prev
+            fx = (e.pos[0] - self.x0) / self.cs + 1
+            fy = (e.pos[1] - self.y0) / self.cs + 1
+            cp_['tl'] = max(1.0, min(14.0, math.hypot(fx - cp_['x'], fy - cp_['y']) - cp_['R']))
         elif e.type == pygame.MOUSEMOTION and self.drag:
             self.drag['cur'] = self.cell(e.pos)
         elif e.type == pygame.MOUSEBUTTONUP and self.drag and e.button in (1, 3):
             d, self.drag = self.drag, None
-            if d['tool'] == 'SHAFT':
+            if d['tool'] == 'COG':
+                (ax, ay), (bx, by) = d['start'], d['cur']
+                R = max(3.0, math.hypot(bx - ax, by - ay))
+                self.cog_prev = dict(x=ax + 1.5, y=ay + 1.5, R=R, tl=3.0, n=max(4, int(2 * math.pi * R / 4)))
+                self.app.say('move out for tooth length, wheel = tooth count, click to place')
+            elif d['tool'] == 'SHAFT':
                 (ax, ay), (bx, by) = d['start'], d['cur']
                 R = math.hypot(bx - ax, by - ay)
                 if self.sim.add_shaft(ax + 1.5, ay + 1.5, R):
@@ -3665,9 +3947,21 @@ class GasMode:
         sim = self.sim
         def scr(px, py):
             return (int(self.x0 + (px - 1) * cs), int(self.y0 + (py - 1) * cs))
+        def draw_teeth(sh):
+            P = 2 * math.pi / sh['teeth']
+            for i in range(sh['teeth']):
+                a0 = sh['th'] + i * P
+                a1 = a0 + P / 2
+                Ri, Ro = sh['R'] - 0.5, sh['R'] + sh['tl']
+                pts = [scr(sh['x'] + Ri * math.cos(a), sh['y'] + Ri * math.sin(a)) for a in (a0, a1)] + \
+                      [scr(sh['x'] + Ro * math.cos(a), sh['y'] + Ro * math.sin(a)) for a in (a1, a0)]
+                pygame.draw.polygon(surf, (70, 78, 100), pts)
+                pygame.draw.polygon(surf, (150, 160, 182), pts, 1)
         for sh in sim.shafts:
             c0 = scr(sh['x'], sh['y'])
             R = int(sh['R'] * cs)
+            if sh.get('teeth'):
+                draw_teeth(sh)
             pygame.draw.circle(surf, (52, 58, 76), c0, R)
             pygame.draw.circle(surf, (150, 160, 182), c0, R, 2)
             for k in range(4):
@@ -3685,8 +3979,12 @@ class GasMode:
             hp = scr(*sim.hinge_pos(h)[:2])
             pygame.draw.circle(surf, (20, 22, 28), hp, max(4, cs))
             pygame.draw.circle(surf, SEL if h is self.rod_first else (235, 235, 245), hp, max(3, cs - 1))
+        if self.cog_prev:
+            q = dict(self.cog_prev, th=0.0, teeth=self.cog_prev['n'])
+            draw_teeth(q)
+            pygame.draw.circle(surf, SEL, scr(q['x'], q['y']), int(q['R'] * cs), 1)
         d_ = self.drag
-        if d_ and d_['tool'] == 'SHAFT':
+        if d_ and d_['tool'] in ('SHAFT', 'COG'):
             (ax, ay), (bx, by) = d_['start'], d_['cur']
             pygame.draw.circle(surf, SEL, scr(ax + 1.5, ay + 1.5), int(max(3, math.hypot(bx - ax, by - ay)) * cs), 1)
         # circuit links: line to whatever they're connected to, with their id
@@ -3817,9 +4115,15 @@ def main():
         if app.mode == 'gas' and gas is None:
             gas = GasMode(app)
         in_gas = app.mode == 'gas' and not modal
+        if app.updater.note:
+            app.say(app.updater.note)
+            app.updater.note = ''
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
+            elif e.type == pygame.KEYDOWN and e.key == pygame.K_F5 and not modal:
+                app.updater = Updater(manual=True)      # check for updates again
+                app.say('checking for updates...')
             elif in_gas:
                 if gas.handle(e) == 'quit':
                     running = False
@@ -3853,11 +4157,14 @@ def main():
     app.save()
     pygame.quit()
     if restart:     # run the freshly installed version
-        if FROZEN:
-            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')   # fresh unpack for the new process
-            subprocess.Popen([sys.executable] + sys.argv[1:], env=env)
-        else:
-            subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        try:
+            if FROZEN:
+                env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')   # fresh unpack for the new process
+                subprocess.Popen([sys.executable] + sys.argv[1:], env=env)
+            else:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        except Exception as err:
+            log_update(f'restart failed: {err!r}, start the game again by hand')
 
 
 if __name__ == '__main__':
