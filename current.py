@@ -124,11 +124,13 @@ def github_token():
     t = os.environ.get('LOGICSIM_TOKEN')
     if t:
         return t.strip()
-    try:
-        with open(os.path.join(APP_DIR, 'token.txt')) as f:
-            return f.read().strip()
-    except OSError:
-        return ''
+    for d in (APP_DIR, os.path.dirname(save_path())):
+        try:
+            with open(os.path.join(d, 'token.txt')) as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return ''
 
 
 # ---------------------------------------------------------------- themes
@@ -426,7 +428,7 @@ class Updater:
                 'User-Agent': 'logicsim', 'Cache-Control': 'no-cache',
                 'Accept': 'application/vnd.github.raw' if raw else 'application/vnd.github+json'})
             tok = github_token()
-            if tok and 'api.github.com' in url:
+            if tok and ('api.github.com' in url or 'raw.githubusercontent.com' in url):
                 req.add_header('Authorization', 'Bearer ' + tok)
             try:
                 with urllib.request.urlopen(req, timeout=10, context=ssl_context()) as r:
@@ -2188,6 +2190,7 @@ G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, 
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
           'space = pause, . = step', 'up/dn = speed', 'o = open edges', 'g = gravity',
           'hold p = valves', 'hold k = starter', 'i = pin readout', 'select + ctrl+c/v',
+          'm = symmetry, rmb = erase with tool',
           'click block = cycle it', 'a = reset air', 'clr: ctrl+sh+del']
 
 
@@ -3526,6 +3529,7 @@ class GasMode:
         self.link_target = None     # sensor / valve / igniter that the next LINK cell connects to
         self.link_id = 1
         self.rod_first = None       # first hinge of a rod being placed
+        self.sym = 0                # mirror drawing: 0 off, 1 left/right, 2 up/down, 3 both
         self.cog_prev = None        # cog being sized: base chosen, now picking tooth length
         self.sel = None             # SELECT tool rectangle (cell corners)
         self.clip = None
@@ -3609,7 +3613,42 @@ class GasMode:
                     q.append((nx, ny))
         return m
 
+    def mirror(self, m):
+        if not self.sym:
+            return m
+        out = m.copy()
+        if self.sym in (1, 3):
+            out |= m[::-1, :]
+        if self.sym in (2, 3):
+            out |= m[:, ::-1]
+        if self.sym == 3:
+            out |= m[::-1, ::-1]
+        return out & ~self.sim.ring
+
+    def flood_erase(self, c):
+        # erase tool + FILL: wipes the whole connected chunk under the cursor (all linked solids, or the gas pocket)
+        sim = self.sim
+        start = (c[0] + 1, c[1] + 1)
+        solid_hit = sim.kind[start] > 0 or sim.cogmask[start]
+        m = np.zeros(sim.kind.shape, bool)
+        q = deque([start])
+        m[start] = True
+        while q:
+            x, y = q.popleft()
+            for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if 1 <= nx < sim.W2 - 1 and 1 <= ny < sim.H2 - 1 and not m[nx, ny]:
+                    here = sim.kind[nx, ny] > 0
+                    if here == solid_hit and (here or not sim.solid[nx, ny]):
+                        m[nx, ny] = True
+                        q.append((nx, ny))
+        if solid_hit:
+            sim.erase(self.mirror(m))
+        else:
+            sim.drain(self.mirror(m), 0.0)
+        self.dirty = True
+
     def apply(self, mask, amount, erase=False):
+        mask = self.mirror(mask)
         sim = self.sim
         if erase or self.tool == 'ERASE':
             sim.erase(mask)
@@ -3668,6 +3707,9 @@ class GasMode:
                     self.app.say('click to paste, esc or rmb to stop')
                 else:
                     self.app.say('nothing copied yet')
+            elif k == pygame.K_m:
+                self.sym = (self.sym + 1) % 4
+                self.app.say(['symmetry off', 'mirror left/right', 'mirror up/down', 'mirror both'][self.sym])
             elif k == pygame.K_k:
                 self.sim.starter = True
             elif k == pygame.K_PERIOD:
@@ -3842,8 +3884,12 @@ class GasMode:
                 amount = 1.0
                 self.apply(self.flood(c), amount)
                 return None
+            if erase and self.tool == 'FILL':
+                self.flood_erase(c)
+                return None
+            # erasing (right click) uses the selected tool: line erases a line, rect a filled box
             self.drag = dict(start=c, cur=c, last=c, erase=erase,
-                             tool='BRUSH' if erase else self.tool)
+                             tool=self.tool if erase and self.tool in ('LINE', 'RECT') else ('BRUSH' if erase else self.tool))
         elif e.type == pygame.MOUSEMOTION and self.cog_prev:
             cp_ = self.cog_prev
             fx = (e.pos[0] - self.x0) / self.cs + 1
@@ -3867,12 +3913,21 @@ class GasMode:
             elif d['tool'] == 'SELECT':
                 self.sel = (d['start'], d['cur'])
             elif d['tool'] == 'LINE':
-                self.apply(self.seg_mask(d['start'], d['cur'], self.size), 1.0)
+                self.apply(self.seg_mask(d['start'], d['cur'], self.size), 1.0, erase=d['erase'])
             elif d['tool'] == 'RECT':
-                if self.mat == 'BLOCK':
+                if d['erase']:
+                    self.apply(self.rect_mask(d['start'], d['cur'], False), 1.0, erase=True)
+                elif self.mat == 'BLOCK':
                     (ax, ay), (bx, by) = d['start'], d['cur']
                     if not self.sim.add_body(ax + 1, ay + 1, bx + 1, by + 1):
                         self.app.say('block needs empty space')
+                    W2, H2 = self.sim.W2, self.sim.H2
+                    if self.sym in (1, 3):
+                        self.sim.add_body(W2 - 1 - (ax + 1), ay + 1, W2 - 1 - (bx + 1), by + 1)
+                    if self.sym in (2, 3):
+                        self.sim.add_body(ax + 1, H2 - 1 - (ay + 1), bx + 1, H2 - 1 - (by + 1))
+                    if self.sym == 3:
+                        self.sim.add_body(W2 - 1 - (ax + 1), H2 - 1 - (ay + 1), W2 - 1 - (bx + 1), H2 - 1 - (by + 1))
                     self.dirty = True
                 else:
                     solid = self.mat in G_SOLID_MATS
@@ -3939,6 +3994,13 @@ class GasMode:
             r = pygame.Rect(self.x0 + min(ax, bx) * cs, self.y0 + min(ay, by) * cs,
                             (abs(bx - ax) + 1) * cs, (abs(by - ay) + 1) * cs)
             pygame.draw.rect(surf, SEL, r, 1)
+        if self.sym:
+            mx_ = self.x0 + GW * cs // 2
+            my_ = self.y0 + GH * cs // 2
+            if self.sym in (1, 3):
+                pygame.draw.line(surf, (90, 120, 160), (mx_, self.y0), (mx_, self.y0 + GH * cs), 1)
+            if self.sym in (2, 3):
+                pygame.draw.line(surf, (90, 120, 160), (self.x0, my_), (self.x0 + GW * cs, my_), 1)
         # selection, paste ghost, pinned cells
         if self.sel:
             (ax, ay), (bx, by) = self.sel
@@ -4024,7 +4086,19 @@ class GasMode:
                     r = (self.x0 + (lx - 1) * cs, self.y0 + (ly - 1) * cs, cs, cs)
                     pygame.draw.rect(surf, SEL, r, 1)
         if mp[0] >= PAL_W and self.tool != 'FILL':
-            pygame.draw.circle(surf, SEL, mp, max(2, int((self.size + 0.5) * cs)), 1)
+            rr = max(7, int((self.size + 0.5) * cs))
+            pts = [mp]
+            if self.sym:
+                cx_, cy_ = self.x0 + GW * cs // 2, self.y0 + GH * cs // 2
+                if self.sym in (1, 3): pts.append((2 * cx_ - mp[0], mp[1]))
+                if self.sym in (2, 3): pts.append((mp[0], 2 * cy_ - mp[1]))
+                if self.sym == 3: pts.append((2 * cx_ - mp[0], 2 * cy_ - mp[1]))
+            for q in pts:
+                pygame.draw.circle(surf, SEL, q, rr, 2)
+                pygame.draw.line(surf, SEL, (q[0] - rr - 5, q[1]), (q[0] - rr + 2, q[1]), 2)
+                pygame.draw.line(surf, SEL, (q[0] + rr - 2, q[1]), (q[0] + rr + 5, q[1]), 2)
+                pygame.draw.line(surf, SEL, (q[0], q[1] - rr - 5), (q[0], q[1] - rr + 2), 2)
+                pygame.draw.line(surf, SEL, (q[0], q[1] + rr - 2), (q[0], q[1] + rr + 5), 2)
         # hover readout
         c = self.cell(mp, clamp=False)
         if c and mp[0] >= PAL_W:
@@ -4089,7 +4163,7 @@ class GasMode:
         hy = H - (len(G_HELP) * 15 + 30)
         for i, t in enumerate(G_HELP):
             surf.blit(self.app.small.render(t, True, TEXT_DIM), (12, hy + i * 15))
-        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if self.sim.open else '  closed') \
+        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if not self.sym else '  sym ' + 'xyb'[self.sym - 1]) + ('' if self.sim.open else '  closed') \
             + ('' if self.sim.gravity else '  no g')
         surf.blit(self.app.small.render(st, True, SEL if self.paused else TEXT), (12, H - 22))
         msg, until = self.app.toast
