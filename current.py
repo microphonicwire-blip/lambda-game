@@ -216,12 +216,12 @@ PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', '
              'NOT', 'BUF', 'TOGGLE', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
              'SR LATCH', 'NV LATCH', 'GAS IN', 'GAS OUT', 'PIN', 'LABEL']
 
-RUN_KEYS = {pygame.K_SPACE, pygame.K_UP, pygame.K_DOWN, pygame.K_l, pygame.K_t, pygame.K_x,
+RUN_KEYS = {pygame.K_SPACE, pygame.K_UP, pygame.K_DOWN, pygame.K_l, pygame.K_t,
             pygame.K_n, pygame.K_HOME, pygame.K_TAB, pygame.K_RETURN, pygame.K_KP_ENTER}
 HELP = ['enter = compile / build', 'drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
         'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
         'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
-        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes', 'x = instant logic',
+        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes',
         'clr: ctrl+sh+del', 'tab = gas lab', 'f5 = check update']
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
@@ -887,7 +887,7 @@ class App:
         FONT = self.font
         self.light = False
         self.tubes = True
-        self.instant = False    # gates settle inside one tick (no race glitches)
+        self.instant = True     # gates always settle inside one tick (no race glitches)
         self.running = False    # False = build mode (frozen, editable), True = compiled and running
         self.cmp = None
         self.updater = None
@@ -913,6 +913,9 @@ class App:
         self.obs_ver = None     # wire routes are redone when parts move
         self.blocked = None
         self.routes = {}
+        self.occ = None         # cells used by routed wires, so new wires lay next to them
+        self.occ_key = None
+        self.occ_ver = 0
         self.route_budget = 12
         self.tint_cache = {}
         self.sim_parts = []     # every real part, chip insides included
@@ -1254,6 +1257,29 @@ class App:
             self.blocked = (hard, soft - hard)
         return self.blocked
 
+    def occupancy(self):
+        key = (self.occ_ver, len(self.wires), self.obs_ver)
+        if self.occ is not None and self.occ_key == key:
+            return self.occ
+        occ = {}
+        for w in self.wires:
+            ent = self.routes.get(w)
+            if not ent or not ent[2] or ent[0] != self.obs_ver:
+                continue
+            net = self.root.get(self.k(w[0], w[1]))
+            pts = ent[2]
+            for p, q in zip(pts, pts[1:]):
+                if p[1] == q[1]:
+                    cy = round(p[1] / RU)
+                    for cx in range(round(min(p[0], q[0]) / RU), round(max(p[0], q[0]) / RU) + 1):
+                        occ.setdefault((cx, cy, 0), set()).add((net, w))
+                elif p[0] == q[0]:
+                    cx = round(p[0] / RU)
+                    for cy in range(round(min(p[1], q[1]) / RU), round(max(p[1], q[1]) / RU) + 1):
+                        occ.setdefault((cx, cy, 1), set()).add((net, w))
+        self.occ, self.occ_key = occ, key
+        return occ
+
     def route_world(self, w):
         # orthogonal path around parts (world px), or None if there's no room
         pa, ia, pb, ib = w
@@ -1267,6 +1293,14 @@ class App:
         lo = (min(sa[0], sb[0]) - 14, min(sa[1], sb[1]) - 14)
         hi = (max(sa[0], sb[0]) + 14, max(sa[1], sb[1]) + 14)
         dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        occ = self.occupancy()
+        mynet = self.root.get(self.k(pa, ia))
+
+        def others(key):
+            # nets other than mine that sit on this cell and axis
+            v = occ.get(key)
+            return bool(v) and any(n != mynet for n, _ in v)
+
         start = (sa[0], sa[1], dirs.index(da))
         heap = [(abs(sa[0] - sb[0]) + abs(sa[1] - sb[1]), 0, start)]
         best, parent, n, end = {start: 0}, {}, 0, None
@@ -1287,7 +1321,16 @@ class App:
                 nx, ny = x + dx, y + dy
                 if nx < lo[0] or nx > hi[0] or ny < lo[1] or ny > hi[1] or (nx, ny) in blocked:
                     continue
-                ng = g + 1 + (0 if nd == d else 2) + (4 if (nx, ny) in soft else 0)
+                ax = nd >> 1
+                step = 1.0
+                if others((nx, ny, ax)):
+                    step += 5.0                 # never ride on top of another net's wire
+                elif ax == 0 and (others((nx, ny - 1, 0)) or others((nx, ny + 1, 0))) \
+                        or ax == 1 and (others((nx - 1, ny, 1)) or others((nx + 1, ny, 1))):
+                    step = 0.4                  # next to a wire going the same way: lay alongside it
+                elif others((nx, ny, 1 - ax)):
+                    step += 1.0                 # crossing
+                ng = g + step + (0 if nd == d else 2) + (4 if (nx, ny) in soft else 0)
                 ns = (nx, ny, nd)
                 if ng < best.get(ns, 1e9):
                     best[ns] = ng
@@ -1324,6 +1367,7 @@ class App:
                 self.route_budget -= 1
                 ent = (self.obs_ver, pins, self.route_world(w))
                 self.routes[w] = ent
+                self.occ_ver += 1
             elif not same_pins:
                 ent = None      # no time left this frame, plain route for now
         pts = ent[2] if ent else None
@@ -1447,7 +1491,7 @@ class App:
     def save(self):
         idx = {p.uid: i for i, p in enumerate(self.parts)}
         data = dict(
-            version=2, rate=self.rate, light=self.light, tubes=self.tubes, instant=self.instant,
+            version=2, rate=self.rate, light=self.light, tubes=self.tubes,
             view=[CAMX, CAMY, ZOOM],
             parts=[self.part_to_dict(p) for p in self.parts],
             wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires])
@@ -1490,7 +1534,6 @@ class App:
             self.rate = max(1, min(MAX_RATE, int(data.get('rate', self.rate))))
             self.light = bool(data.get('light'))
             self.tubes = bool(data.get('tubes', True))
-            self.instant = bool(data.get('instant', False))
             v = data.get('view')
             if isinstance(v, list) and len(v) == 3:
                 CAMX, CAMY = float(v[0]), float(v[1])
@@ -1972,10 +2015,6 @@ class App:
             self.dirty = True
         elif k in (pygame.K_RETURN, pygame.K_KP_ENTER) and not ctrl:
             self.toggle_run()
-        elif k == pygame.K_x and not ctrl:
-            self.instant = not self.instant
-            self.say('instant logic ' + ('on: gates settle in one tick' if self.instant else 'off: 1 tick per gate'))
-            self.dirty = True
         elif k == pygame.K_UP:
             self.rate = min(MAX_RATE, self.rate * 2)
             self.dirty = True
