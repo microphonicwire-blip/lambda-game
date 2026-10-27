@@ -200,6 +200,7 @@ DEFS = {
     'PIN_O':   dict(w=3, h=2, pins=[(0, 1, 'io')]),
     'CHIP':    dict(w=4, h=2, pins=[]),         # real size/pins come from its circuit
     'NOT': ONE_IN, 'BUF': ONE_IN,
+    'TOGGLE': ONE_IN,                          # flips its output on every rising edge of IN
     'SR LATCH': TWO_IN, 'NV LATCH': TWO_IN,    # NV keeps its state in the save file
     'AND': TWO_IN, 'NAND': TWO_IN, 'OR': TWO_IN,
     'NOR': TWO_IN, 'XOR': TWO_IN, 'XNOR': TWO_IN,
@@ -210,7 +211,7 @@ NAMES = {'DISPLAY': ['R', 'G', 'B'], 'TOUCH': ['R', 'G', 'B', 'OUT'], 'GATE': ['
                   'RED', 'GREEN', 'BLUE']}
 
 PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', 'TOUCH', '7SEG',
-             'NOT', 'BUF', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
+             'NOT', 'BUF', 'TOGGLE', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
              'SR LATCH', 'NV LATCH', 'GAS IN', 'GAS OUT', 'PIN', 'LABEL']
 
 HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
@@ -221,11 +222,12 @@ HELP = ['drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = ad
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
 # kinds with an editable description in the body (double-click the empty space)
-DESC_KINDS = set(GATES) | {'SOURCE', 'SWITCH', 'BUTTON', 'GATE', 'LAMP', 'SR LATCH', 'NV LATCH'}
+DESC_KINDS = set(GATES) | {'SOURCE', 'SWITCH', 'BUTTON', 'GATE', 'LAMP', 'SR LATCH', 'NV LATCH', 'TOGGLE'}
 DEFAULT_DESC = {'AND': 'both high', 'OR': 'any high', 'NAND': 'not both', 'NOR': 'none high',
                 'XOR': 'odd count', 'XNOR': 'even count', 'NOT': 'inverts', 'BUF': 'copies',
                 'SOURCE': 'always on', 'LAMP': 'glows', 'GATE': 'EN opens it',
-                'SR LATCH': 'S sets, R resets', 'NV LATCH': 'remembers', 'BUTTON': '1 pulse'}
+                'SR LATCH': 'S sets, R resets', 'NV LATCH': 'remembers', 'BUTTON': '1 pulse',
+                'TOGGLE': 'flips each pulse'}
 IND_KINDS = ('LAMP', 'DISPLAY', 'TOUCH', '7SEG')
 WIDGET_KINDS = ('SWITCH', 'BUTTON')     # these draw a little control in the body
 
@@ -795,6 +797,10 @@ class App:
                     new.append((p, 1))
                 else:
                     new.append((p, 0))
+            elif k == 'TOGGLE':
+                v = int(hi(p, 0))
+                new.append((p, 1 - p.out if v and not p.counter else p.out))
+                p.counter = v       # last input, to catch the rising edge
             elif k in ('SR LATCH', 'NV LATCH'):
                 # reset wins if both are high
                 new.append((p, 0 if hi(p, 1) else (1 if hi(p, 0) else p.out)))
