@@ -2909,7 +2909,7 @@ G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, 
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
           'space = pause, . = step', 'up/dn = speed', 'o = open edges', 'g = gravity',
           'hold p = valves', 'hold k = starter', 'i = pin readout', 'select + ctrl+c/v',
-          'm = symmetry, rmb = erase with tool',
+          'm = symmetry, rmb = erase with tool', 'ctrl+wheel = zoom, mmb = pan',
           'click block = cycle it', 'a = reset air', 'clr: ctrl+sh+del']
 
 
@@ -4554,6 +4554,10 @@ class GasMode:
         if not credits_ok():
             raise SystemExit
         self.app = app
+        self.zcs = None             # zoomed cell size in pixels, None = fit the window
+        self.panx = self.pany = None
+        self.pan_from = None
+        self.fit = 1
         self.sim = GasSim()
         self.tool = 'BRUSH'
         self.mat = 'WALL'
@@ -4591,9 +4595,36 @@ class GasMode:
 
     # layout
     def layout(self, W, H):
-        self.cs = max(1, min((W - PAL_W) // GW, H // GH))
-        self.x0 = PAL_W + ((W - PAL_W) - GW * self.cs) // 2
-        self.y0 = (H - GH * self.cs) // 2
+        fit = max(1, min((W - PAL_W) // GW, H // GH))
+        self.fit = fit
+        if self.zcs is not None and self.zcs <= fit:
+            self.zcs = None
+        if self.zcs is None:
+            self.cs = fit
+            self.panx = self.pany = None
+        else:
+            self.cs = self.zcs
+        gw, gh = GW * self.cs, GH * self.cs
+        vw = W - PAL_W
+        if self.panx is None:
+            self.panx = PAL_W + (vw - gw) // 2
+            self.pany = (H - gh) // 2
+        # the grid can't be dragged away from the view
+        self.panx = max(W - gw, min(PAL_W, self.panx)) if gw > vw else PAL_W + (vw - gw) // 2
+        self.pany = max(H - gh, min(0, self.pany)) if gh > H else (H - gh) // 2
+        self.x0, self.y0 = self.panx, self.pany
+
+    def zoom_at(self, pos, steps):
+        # ctrl + wheel: zoom in on the cell under the mouse
+        old = self.cs
+        new = max(self.fit, min(40, old + steps * max(1, old // 5)))
+        if new == old:
+            return
+        fx, fy = (pos[0] - self.x0) / old, (pos[1] - self.y0) / old
+        self.zcs = None if new <= self.fit else new
+        self.cs = new
+        self.panx = int(pos[0] - fx * new)
+        self.pany = int(pos[1] - fy * new)
 
     def cell(self, pos, clamp=True):
         cx = (pos[0] - self.x0) // self.cs
@@ -4802,8 +4833,19 @@ class GasMode:
             elif pygame.mouse.get_pos()[0] < PAL_W:
                 self.mat_scroll -= e.y * 42
                 self.clamp_scroll()
+            elif pygame.key.get_mods() & pygame.KMOD_CTRL:
+                self.zoom_at(pygame.mouse.get_pos(), e.y)
             else:
                 self.size = max(0, min(36, self.size + e.y))
+        elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 2:
+            if e.pos[0] >= PAL_W and self.zcs is not None:
+                self.pan_from = (e.pos, self.panx, self.pany)
+        elif e.type == pygame.MOUSEBUTTONUP and e.button == 2:
+            self.pan_from = None
+        elif e.type == pygame.MOUSEMOTION and self.pan_from:
+            (mx, my), px, py = self.pan_from
+            self.panx = px + e.pos[0] - mx
+            self.pany = py + e.pos[1] - my
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button in (1, 3):
             if e.pos[0] < PAL_W:
                 for i, t in enumerate(G_TOOLS):
@@ -5028,10 +5070,14 @@ class GasMode:
         W, H = surf.get_size()
         self.layout(W, H)
         surf.fill(BG)
-        img = pygame.surfarray.make_surface(self.sim.render())
-        if self.cs != 1:
-            img = pygame.transform.scale(img, (GW * self.cs, GH * self.cs))
-        surf.blit(img, (self.x0, self.y0))
+        arr = self.sim.render()
+        cs0 = self.cs
+        vx0, vx1 = max(0, (PAL_W - self.x0) // cs0), min(GW, -(-(W - self.x0) // cs0))
+        vy0, vy1 = max(0, -self.y0 // cs0), min(GH, -(-(H - self.y0) // cs0))
+        img = pygame.surfarray.make_surface(np.ascontiguousarray(arr[vx0:vx1, vy0:vy1]))
+        if cs0 != 1:
+            img = pygame.transform.scale(img, ((vx1 - vx0) * cs0, (vy1 - vy0) * cs0))
+        surf.blit(img, (self.x0 + vx0 * cs0, self.y0 + vy0 * cs0))
         ds = max(2, self.cs)
         for d in self.sim.debris:
             surf.fill(d[5], (self.x0 + int((d[0] - 1) * self.cs), self.y0 + int((d[1] - 1) * self.cs), ds, ds))
