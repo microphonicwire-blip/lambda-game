@@ -2869,7 +2869,7 @@ G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('I
           ('COOLER', None), ('PUMP', None), ('SOURCE', None), ('VENT', None), ('LINK', None),
           ('RELIEF VALVE', None), ('EXCHANGER', None), ('TURBINE', None), ('URANIUM', None), ('CONTROL ROD', None),
           ('SHAFT', None), ('COG', None), ('HINGE', None), ('ROD', None),
-          ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None), ('HINGE SENSOR', None), ('TIMER', None),
+          ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None), ('HINGE SENSOR', None), ('TIMER', None), ('THRUST PROBE', None),
           ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
           ('PROPANE', {'C3H8': 1}), ('METHANE', {'CH4': 1}), ('OXYGEN', {'O2': 1}),
           ('HELIUM', {'He': 1}), ('CO2', {'CO2': 1}),
@@ -2907,10 +2907,27 @@ G_UMAX = 0.65        # fastest flow on a cell face (cells / step)
 G_COLL = 5.0         # how much fast flow ignores sideways pressure (keeps jets narrow), 0 = off
 G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, pressure drops there (bernoulli)
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
-          'space = pause, . = step', 'up/dn = speed', 'o = open edges', 'g = gravity',
+          'space = pause, . = step', 'up/dn = speed', 'o = air / closed / void', 'g = gravity',
           'hold p = valves', 'hold k = starter', 'i = pin readout', 'select + ctrl+c/v',
-          'm = symmetry, rmb = erase with tool', 'ctrl+wheel = zoom, mmb = pan', 'v = smooth gas',
+          'm = symmetry, rmb = erase with tool', 'ctrl+wheel = zoom, mmb = pan', 'v = smooth gas', 't = overlay views',
           'click block = cycle it', 'a = reset air', 'clr: ctrl+sh+del']
+
+
+def ramp(v, stops):
+    # v in 0..1 -> colors, stops = [(pos, (r, g, b)), ...]
+    xs = [a for a, _ in stops]
+    out = np.empty(v.shape + (3,), np.float32)
+    for ch in range(3):
+        out[..., ch] = np.interp(v, xs, [c[ch] for _, c in stops])
+    return out
+
+
+G_RAMP_P = [(0, (20, 30, 110)), (0.2, (40, 110, 220)), (0.33, (200, 230, 245)), (0.5, (250, 220, 90)),
+            (0.7, (240, 110, 40)), (0.88, (210, 30, 60)), (1, (255, 120, 255))]
+G_RAMP_T = [(0, (10, 10, 40)), (0.2, (60, 20, 120)), (0.45, (200, 40, 50)), (0.7, (255, 150, 30)),
+            (0.9, (255, 235, 130)), (1, (255, 255, 255))]
+G_RAMP_S = [(0, (8, 10, 30)), (0.3, (30, 70, 200)), (0.6, (40, 200, 230)), (0.85, (230, 250, 120)), (1, (255, 255, 255))]
+G_VIEWS = ['normal', 'pressure', 'temperature', 'speed']
 
 
 class GasSim:
@@ -2929,7 +2946,9 @@ class GasSim:
         self.v = np.zeros((self.W2, self.H2 - 1), np.float32)
         self.ring = np.ones(shape, bool)
         self.ring[1:-1, 1:-1] = False
-        self.open = True                        # edges open to the outside air
+        self.open = True                        # edges open to the outside
+        self.void = False                       # ...and the outside is empty space (gas that gets out is gone)
+        self.probes = {}                        # (x, y) -> thrust probe on a wall cell
         self.gravity = True
         self.starter = False                    # hold k: motor spins the shafts up
         self.manual_valves = False              # P held: opens valves that aren't linked to a sensor
@@ -2979,7 +2998,7 @@ class GasSim:
         self.amb_ring = np.broadcast_to(self.amb_field, self.n.shape)[:, self.ring].copy()
 
     def reset_air(self):
-        self.n[:] = self.amb_field
+        self.n[:] = 0 if self.void else self.amb_field
         self.T[:] = 293
         self.liq[:] = 0
         self.phi[:] = 0
@@ -2990,6 +3009,7 @@ class GasSim:
         self.active = {0, 1}
 
     def clear(self):
+        self.probes = {}
         self.shafts, self.hinges, self.rods, self.meshes = [], [], [], []
         self.cogmask[:] = False
         self.sensors = {}
@@ -3259,8 +3279,59 @@ class GasSim:
             self.n[:, closing] = 0
             self.T[closing] = 293
 
+    def new_probe(self):
+        return dict(hist=deque(maxlen=240), imp=[0.0, 0.0], peak=0.0, f=(0.0, 0.0))
+
+    def add_probe(self, x, y):
+        if not (self.kind[x, y] and self.solid[x, y]) or self.kind[x, y] in (G_SENSOR, G_LINK):
+            return 'put the thrust probe on a wall of the engine'
+        if (x, y) in self.probes:
+            self.probes[(x, y)] = self.new_probe()
+            return 'probe reset'
+        if len(self.probes) >= 4:
+            return 'up to 4 probes'
+        self.probes[(x, y)] = self.new_probe()
+        return 'thrust probe placed, it adds up the gas pressure on everything this wall is attached to'
+
+    def probe_mask(self, x, y):
+        key = ('thrust', x, y, int(self.solid.sum()))
+        m = self.comp_cache.get(key)
+        if m is None:
+            m = np.zeros(self.kind.shape, bool)
+            if self.solid[x, y]:
+                m[x, y] = True
+                todo = [(x, y)]
+                while todo and m.sum() < 6000:
+                    cx, cy = todo.pop()
+                    for dx, dy in G_DIRS:
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < self.W2 and 0 <= ny < self.H2 and not m[nx, ny] and self.solid[nx, ny] \
+                                and self.kind[nx, ny] and not self.ring[nx, ny]:
+                            m[nx, ny] = True
+                            todo.append((nx, ny))
+            self.comp_cache[key] = m
+        return m
+
+    def probe_tick(self):
+        # net force of the gas pressure on the whole piece of structure the probe sits on (= thrust of an engine)
+        p = self.n.sum(0) * self.T / 293
+        gas = ~self.solid
+        for (x, y), pr in self.probes.items():
+            M = self.probe_mask(x, y)
+            fx = float(p[:-1][M[1:] & gas[:-1]].sum()) - float(p[1:][M[:-1] & gas[1:]].sum())
+            fy = float(p[:, :-1][M[:, 1:] & gas[:, :-1]].sum()) - float(p[:, 1:][M[:, :-1] & gas[:, 1:]].sum())
+            pr['f'] = (fx, fy)
+            pr['imp'][0] += fx
+            pr['imp'][1] += fy
+            mag = math.hypot(fx, fy)
+            pr['peak'] = max(pr['peak'], mag)
+            if self.age % 2 == 0:
+                pr['hist'].append((fx, fy))
+
     def erase(self, mask):
         mask = mask & ~self.ring
+        for key in [k for k in self.probes if mask[k]]:
+            del self.probes[key]
         hit = mask & (self.kind > 0)
         self.comp_cache = {}
         self.remove_sensors(hit)
@@ -4145,7 +4216,10 @@ class GasSim:
         ring = self.ring
         if self.open:
             sol[ring] = False
-            n[:, ring] = self.amb_ring
+            if self.void:
+                n[:, ring] = 0
+            else:
+                n[:, ring] = self.amb_ring
             T[ring] = 293
         else:
             sol[ring] = True
@@ -4291,6 +4365,8 @@ class GasSim:
             self.reactor(n, T)
         if self.has & set(G_THERM):
             self.exchange(n, T)
+        if self.probes:
+            self.probe_tick()
         # sparks from igniters
         if self.spark_t.any():
             sm = (self.spark_t > 0) & ~sol
@@ -4334,7 +4410,7 @@ class GasSim:
         else:
             T[sol] = 293
 
-    def render(self):
+    def render(self, view=0):
         # pressure: dark = thin, normal = gas color, high = red. hot = flame glow
         n = self.n[:, 1:-1, 1:-1]
         T = self.T[1:-1, 1:-1]
@@ -4410,6 +4486,21 @@ class GasSim:
             col[x:x + w, y:y + h] = G_BLOCK_EDGE
             if w > 2 and h > 2:
                 col[x + 1:x + w - 1, y + 1:y + h - 1] = G_BLOCK_COLOR
+        if view:
+            gm = ~self.solid[1:-1, 1:-1] & (kind == 0) & ~self.cogmask[1:-1, 1:-1]
+            if view == 1:
+                v = np.clip((np.log2(np.maximum(p, 1e-3)) + 3) / 9, 0, 1)         # 0.125 atm .. 64 atm
+                col = np.where(gm[..., None], ramp(v, G_RAMP_P), col)
+            elif view == 2:
+                v = np.clip((T - 200) / 4800, 0, 1) ** 0.7
+                col = np.where(gm[..., None], ramp(v, G_RAMP_T), col)
+            else:
+                uu, vv = self.u, self.v
+                uc = 0.5 * (uu[:-1] + uu[1:])[:, 1:-1]
+                vc = 0.5 * (vv[:, :-1] + vv[:, 1:])[1:-1]
+                v = np.clip(np.hypot(uc, vc) / G_UMAX, 0, 1) ** 0.6
+                col = np.where(gm[..., None], ramp(v, G_RAMP_S), col)
+            col[gm & (ntot < 1e-3)] = (6, 8, 16)
         return np.clip(col, 0, 255).astype(np.uint8)
 
     def info(self, cx, cy):
@@ -4461,7 +4552,8 @@ class GasSim:
             sens = np.array([[x, y, G_SENSOR_KINDS.index(v['type']), v['dir'], v['level']]
                              for (x, y), v in self.sensors.items()], np.int32).reshape(-1, 5)
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
-                                made_by=np.array(AUTHOR), bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
+                                made_by=np.array(AUTHOR), bodies=bodies, open=np.array(self.open), void=np.array(self.void),
+                                probes=np.array(list(self.probes), np.int32).reshape(-1, 2), gravity=np.array(self.gravity),
                                 sensors=sens, link=self.link, aux=self.aux, liq=self.liq, phi=self.phi, decay=self.decay,
                                 shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0)]
                                                  for q in self.shafts], np.float64).reshape(-1, 7),
@@ -4540,6 +4632,11 @@ class GasSim:
                                                role='rx' if rx_ else 'tx', on=False)
             self.comp_cache = {}
             self.open = bool(d['open'])
+            self.void = bool(d['void']) if 'void' in d else False
+            self.probes = {}
+            if 'probes' in d:
+                for px_, py_ in d['probes'].tolist():
+                    self.probes[(px_, py_)] = self.new_probe()
             if 'gravity' in d:
                 self.gravity = bool(d['gravity'])
             self.update_ambient()
@@ -4554,6 +4651,7 @@ class GasMode:
         if not credits_ok():
             raise SystemExit
         self.app = app
+        self.view = 0               # 0 normal, 1 pressure, 2 temperature, 3 speed
         self.smooth = True          # blend the gas colors between cells (looks finer, walls stay sharp)
         self.zcs = None             # zoomed cell size in pixels, None = fit the window
         self.panx = self.pany = None
@@ -4731,7 +4829,7 @@ class GasMode:
             if self.link_sensor and self.mat in ('VALVE', 'IGNITER', 'CONTROL ROD'):
                 link = self.link_sensor[0] * sim.H2 + self.link_sensor[1]
             sim.set_solid(mask, G_SOLID_MATS[self.mat], link)
-        elif self.mat in G_SENSOR_TYPES or self.mat in ('LINK',) + G_MECH:
+        elif self.mat in G_SENSOR_TYPES or self.mat in ('LINK', 'THRUST PROBE') + G_MECH:
             pass        # sensors and links are placed one click at a time
         elif self.mat == 'BLOCK':
             self.app.say('draw blocks with RECT')
@@ -4809,8 +4907,19 @@ class GasMode:
             elif k == pygame.K_DOWN:
                 self.speed = max(1, self.speed // 2)
             elif k == pygame.K_o:
-                self.sim.open = not self.sim.open
+                # open air -> closed box -> open to empty space -> ...
+                sim = self.sim
+                if sim.open and not sim.void:
+                    sim.open = False
+                elif not sim.open:
+                    sim.open, sim.void = True, True
+                else:
+                    sim.void = False
+                self.app.say('edges: open to space (gas that leaves is gone)' if sim.void else 'edges: open to air' if sim.open else 'edges: closed box')
                 self.dirty = True
+            elif k == pygame.K_t and not ctrl:
+                self.view = (self.view + 1) % len(G_VIEWS)
+                self.app.say('view: ' + G_VIEWS[self.view])
             elif k == pygame.K_v and not ctrl:
                 self.smooth = not self.smooth
                 self.app.say('smooth gas on' if self.smooth else 'smooth gas off')
@@ -4966,6 +5075,10 @@ class GasMode:
                     self.dirty = True
                     self.app.say(self.sim.info(*c))
                     return None
+                if self.mat == 'THRUST PROBE':
+                    self.app.say(self.sim.add_probe(key[0], key[1]))
+                    self.dirty = True
+                    return None
                 if self.mat in G_SENSOR_TYPES:
                     if not self.sim.add_sensor(key[0], key[1], G_SENSOR_TYPES[self.mat]):
                         self.app.say('sensors go on empty cells')
@@ -5105,7 +5218,7 @@ class GasMode:
         W, H = surf.get_size()
         self.layout(W, H)
         surf.fill(BG)
-        arr = self.sim.render()
+        arr = self.sim.render(self.view)
         cs0 = self.cs
         vx0, vx1 = max(0, (PAL_W - self.x0) // cs0), min(GW, -(-(W - self.x0) // cs0))
         vy0, vy1 = max(0, -self.y0 // cs0), min(GH, -(-(H - self.y0) // cs0))
@@ -5258,6 +5371,64 @@ class GasMode:
             pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
             pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
             surf.blit(self.app.small.render(t, True, TEXT), (r.x + 8, r.y + 2))
+        if self.view:
+            lw, lx, ly = 300, (W + PAL_W) // 2 - 150, H - 46
+            stops = (G_RAMP_P, G_RAMP_T, G_RAMP_S)[self.view - 1]
+            strip = ramp(np.linspace(0, 1, lw)[:, None] * np.ones((1, 12)), stops).astype(np.uint8)
+            surf.blit(pygame.surfarray.make_surface(strip), (lx, ly))
+            pygame.draw.rect(surf, PANEL_LINE, (lx - 1, ly - 1, lw + 2, 14), 1)
+            if self.view == 1:
+                marks = [(2.0 ** k, f'{2.0 ** k:g}') for k in (-3, 0, 3, 6)]
+                posf = lambda a: (math.log2(a) + 3) / 9
+                unit = 'atm'
+            elif self.view == 2:
+                marks = [(t_, f'{t_ - 273}') for t_ in (293, 1000, 2000, 3500, 5000)]
+                posf = lambda a: ((a - 200) / 4800) ** 0.7 if a > 200 else 0
+                unit = 'C'
+            else:
+                marks = [(G_UMAX * f_, f'{G_UMAX * f_:.2f}') for f_ in (0, 0.25, 0.5, 1)]
+                posf = lambda a: (a / G_UMAX) ** 0.6
+                unit = 'cells/step'
+            for a, lab in marks:
+                mx_ = lx + int(posf(a) * (lw - 1))
+                pygame.draw.line(surf, TEXT, (mx_, ly + 12), (mx_, ly + 16), 1)
+                t_ = self.app.tiny.render(lab, True, TEXT)
+                surf.blit(t_, (mx_ - t_.get_width() // 2, ly + 17))
+            t_ = self.app.small.render(f'{G_VIEWS[self.view]} ({unit})   t = next view', True, TEXT_DIM)
+            surf.blit(t_, ((W + PAL_W) // 2 - t_.get_width() // 2, ly - 20))
+        # thrust probes
+        if self.sim.probes:
+            by = 10
+            for i, ((px_, py_), pr) in enumerate(self.sim.probes.items()):
+                fx, fy = pr['f']
+                mag = math.hypot(fx, fy)
+                sx, sy = self.x0 + (px_ - 1) * cs + cs // 2, self.y0 + (py_ - 1) * cs + cs // 2
+                pygame.draw.circle(surf, (255, 170, 60), (sx, sy), max(3, cs // 2 + 1), 1)
+                if mag > 0.05:
+                    ln = min(110, 14 + mag * 0.6)
+                    ex, ey = sx + fx / mag * ln, sy + fy / mag * ln
+                    pygame.draw.line(surf, (255, 170, 60), (sx, sy), (ex, ey), 2)
+                    ang = math.atan2(fy, fx)
+                    for da in (2.6, -2.6):
+                        pygame.draw.line(surf, (255, 170, 60), (ex, ey), (ex + 9 * math.cos(ang + da), ey + 9 * math.sin(ang + da)), 2)
+                dirs = []
+                if abs(fy) > 0.25 * mag:
+                    dirs.append('down' if fy > 0 else 'up')
+                if abs(fx) > 0.25 * mag:
+                    dirs.append('right' if fx > 0 else 'left')
+                imp = math.hypot(*pr['imp'])
+                gx, gy, gw_, gh_ = PAL_W + 10, by, 250, 74
+                pygame.draw.rect(surf, PANEL, (gx, gy, gw_, gh_))
+                pygame.draw.rect(surf, PANEL_LINE, (gx, gy, gw_, gh_), 1)
+                surf.blit(self.app.small.render(f'T{i + 1}  thrust {mag:.1f}  {" + ".join(dirs) or "-"}', True, (255, 190, 90)), (gx + 6, gy + 4))
+                surf.blit(self.app.tiny.render(f'peak {pr["peak"]:.1f}    impulse {imp:.0f}    (click probe = reset)', True, TEXT_DIM), (gx + 6, gy + 22))
+                h = pr['hist']
+                if len(h) > 1:
+                    vals = [math.hypot(a_, b_) for a_, b_ in h]
+                    hi_ = max(max(vals), 1e-6)
+                    pts = [(gx + 6 + k * (gw_ - 12) / (len(vals) - 1), gy + gh_ - 5 - v_ / hi_ * 28) for k, v_ in enumerate(vals)]
+                    pygame.draw.lines(surf, (255, 170, 60), False, pts, 1)
+                by += gh_ + 6
         # pinned readouts
         for i, pc in enumerate(self.pins):
             px, py = self.x0 + pc[0] * cs + cs // 2, self.y0 + pc[1] * cs + cs // 2
@@ -5309,6 +5480,8 @@ class GasMode:
                 sw = G_SENSOR_COLOR[G_SENSOR_TYPES[m]]
             elif m == 'LINK':
                 sw = G_SOLIDS[G_LINK][2]
+            elif m == 'THRUST PROBE':
+                sw = (255, 170, 60)
             elif m == 'WATER':
                 sw = (60, 130, 230)
             elif m in G_MECH:
@@ -5325,7 +5498,7 @@ class GasMode:
         hy = H - (len(G_HELP) * 15 + 30)
         for i, t in enumerate(G_HELP):
             surf.blit(self.app.small.render(t, True, TEXT_DIM), (12, hy + i * 15))
-        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if not self.sym else '  sym ' + 'xyb'[self.sym - 1]) + ('' if self.sim.open else '  closed') \
+        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if not self.sym else '  sym ' + 'xyb'[self.sym - 1]) + ('  void' if self.sim.void else '' if self.sim.open else '  closed') \
             + ('' if self.sim.gravity else '  no g')
         surf.blit(self.app.small.render(st, True, SEL if self.paused else TEXT), (12, H - 22))
         ct = self.app.small.render(_CR_A, True, TEXT_DIM)
