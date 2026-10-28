@@ -36,7 +36,6 @@ MAX_RATE = 4000
 SAVE_EVERY = 0.5    # min seconds between autosaves
 MAX_LABEL = 20
 MAX_DESC = 60
-TUBE_SPEED = 60     # px/s, the little signal tubes sliding along wires
 MAX_DEPTH = 5       # chips inside chips, this many levels
 MIN_ZOOM, MAX_ZOOM = 0.25, 3.0
 CAMX = CAMY = 0.0   # world pixel under the top-left of the work area
@@ -233,7 +232,7 @@ HELP = ['enter = compile / build', 'drag out parts', 'pin-pin = wire', 'drag bg 
         'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
         'ctrl+s = chip to file',
         'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
-        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light  t tubes',
+        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light',
         'clr: ctrl+sh+del', 'tab = gas lab', 'f5 = check update']
 HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
@@ -725,11 +724,10 @@ class Compiled:
         self.app = app
         parts = self.parts = list(app.sim_parts)
         P = len(parts)
-        roots = {}
-        root = app.root
+        gid = app.gid
 
         def nid(p, i):
-            return roots.setdefault(root[(p.uid, i)], len(roots))
+            return gid[(p.uid, i)]
 
         kinds = [p.kind for p in parts]
 
@@ -754,6 +752,14 @@ class Compiled:
                     dp.append(i)
                     dn.append(nid(p, j))
         self.dp, self.dn = arr(dp), arr(dn)
+        self.N = max(1, app.ngroups)
+        ein = app.edges_in
+        es = [s_ for d_, ss in ein.items() for s_ in ss]
+        ed = [d_ for d_, ss in ein.items() for _ in ss]
+        self.es, self.ed = arr(es), arr(ed)
+        self.rt = arr([t for t, _ in app.relays])
+        self.rs = arr([r for _, r in app.relays])
+        self.rdepth = app.relay_depth
         # gates
         self.ci = arr(of(*GATES))
         self.ctype = arr([GATE_CODE[kinds[i]] for i in self.ci])
@@ -817,15 +823,10 @@ class Compiled:
         self.z_col = arr([[nid(parts[i], j) for j in (7, 8, 9)] for i in self.zi]).reshape(-1, 3)
         self.z_slit = np.zeros((len(self.zi), 7), bool)
         self.z_clit = np.zeros((len(self.zi), 3), bool)
-        self.N = max(1, len(roots))
-        self.roots = [None] * self.N
-        for r, n in roots.items():
-            self.roots[n] = r
         self.sw_on = np.zeros(len(self.si), bool)
         self.b_pulse = np.zeros(len(self.bi), bool)
         self.t_pulse = np.zeros(len(self.ti), bool)
         self.tx = np.zeros(17, np.int8)
-        self.prev = None
         self.last_out = self.out.copy()
         self.last_drive = self.drive.copy()
         self.nparts = P
@@ -833,9 +834,24 @@ class Compiled:
     def nets(self):
         val = self.out[self.dp]
         act = self.drive[self.dp]
-        n1 = np.bincount(self.dn[act & (val == 1)], minlength=self.N)
-        n0 = np.bincount(self.dn[act & (val == 0)], minlength=self.N)
-        return n1 > 0, (n0 > 0) & (n1 == 0)
+        N = self.N
+        bh = np.bincount(self.dn[act & (val == 1)], minlength=N) > 0
+        bl = np.bincount(self.dn[act & (val == 0)], minlength=N) > 0
+        hi, lo = bh, bl & ~bh
+        es, ed = self.es, self.ed
+
+        def pull(hi, lo):
+            ih = np.bincount(ed[hi[es]], minlength=N) > 0
+            il = np.bincount(ed[lo[es]], minlength=N) > 0
+            return hi | ih, lo | (il & ~ih)
+
+        for _ in range(self.rdepth):
+            hi, lo = pull(hi, lo)
+            rh = np.bincount(self.rt[hi[self.rs]], minlength=N) > 0
+            rl = np.bincount(self.rt[lo[self.rs]], minlength=N) > 0
+            hi = bh | rh
+            lo = (bl | rl) & ~hi
+        return pull(hi, lo) if es.size else (hi, lo)
 
     def settle(self):
         # instant logic: gates resolve completely inside the tick
@@ -865,17 +881,6 @@ class Compiled:
         app = self.app
         hi, lo = self.settle() if app.instant else self.nets()
         out, cnt, drive = self.out, self.cnt, self.drive
-        if app.tubes:
-            st = np.where(hi, 1, np.where(lo, 0, -1)).astype(np.int8)
-            if self.prev is not None:
-                for n in np.flatnonzero((st != self.prev) & (st >= 0)):
-                    for wi in app.root_wires.get(self.roots[n], ()):
-                        q = app.pending.setdefault(wi, [])
-                        if len(q) < 6:
-                            q.append(int(st[n]))
-            self.prev = st
-        else:
-            self.prev = None
         h8 = hi.view(np.int8)
         if self.ci.size:
             out[self.ci] = _TBL[self.ctype, h8[self.ca] * 2 + h8[self.cb]]
@@ -1018,20 +1023,18 @@ class App:
         self.paused = False
         self.rate = 500     # ticks per second
         self.acc = 0.0
-        self.anim = 0.0     # drives the signal tubes, stops while paused
+        self.anim = 0.0
         self.dirty = False
         self.last_save = 0.0
         self.path = save_path()
         self.font = pygame.font.SysFont(MONO, 16, bold=True)
         self.small = pygame.font.SysFont(MONO, 13)
         self.tiny = pygame.font.SysFont(MONO, 11, bold=True)
-        self.pillf = pygame.font.SysFont(MONO, 10, bold=True)
         self.descf = pygame.font.SysFont(MONO, 11)
         self.edit_field = 'title'
         global FONT
         FONT = self.font
         self.light = False
-        self.tubes = True
         self.instant = True     # gates always settle inside one tick (no race glitches)
         self.running = False    # False = build mode (frozen, editable), True = compiled and running
         self.cmp = None
@@ -1048,14 +1051,9 @@ class App:
         self.topo_key = None    # cached net layout, rebuilt when parts/wires change
         self.root = {}
         self.out_pins = []
-        self.flow = []
         self.grid_cache = None
-        self.pill_cache = {}
-        self.prev_state = None
-        self.root_wires = {}
-        self.wire_root = []
-        self.pulses = {}
-        self.pending = {}
+        self.gid = {}
+        self.wsrc = []
         self.obs_ver = None     # wire routes are redone when parts move
         self.blocked = None
         self.routes = {}
@@ -1090,6 +1088,16 @@ class App:
         else:
             parts.append(p)
 
+    def end_info(self, p, i):
+        # (key, role) of a wire end. A chip pin seen from outside, or the PIN part seen from
+        # inside, are the two faces of the same relay.
+        if p.kind == 'CHIP':
+            q = p.pinmap[i]
+            return (q.uid, 'o'), ('out' if q.on else 'in')
+        if p.kind == 'PIN':
+            return (p.uid, 'i'), ('in' if p.on else 'out')
+        return (p.uid, i), p.d['pins'][i][2]
+
     def build_topo(self):
         parent = {}
         sim, all_wires = [], list(self.wires)
@@ -1108,95 +1116,157 @@ class App:
                 a = parent[a]
             return a
 
-        adj = {}
-        nw = len(self.wires)
-        for wi, (pa, ia, pb, ib) in enumerate(all_wires):
-            ka, kb = self.k(pa, ia), self.k(pb, ib)
-            ra, rb = find(ka), find(kb)
+        for pa, ia, pb, ib in all_wires:
+            ra, rb = find(self.k(pa, ia)), find(self.k(pb, ib))
             if ra != rb:
                 parent[ra] = rb
-            if wi < nw:     # only the wires you can see get a flow direction
-                adj.setdefault(ka, []).append((kb, wi, True))
-                adj.setdefault(kb, []).append((ka, wi, False))
-        self.root = {k: find(k) for k in list(parent)}
-        self.out_pins, queue = [], []
+        self.root = {k: find(k) for k in list(parent)}       # plain connectivity, for routing
+
+        # directed model: outputs only ever push into inputs
+        par, role = {}, {}
+
+        def f2(a):
+            par.setdefault(a, a)
+            while par[a] != a:
+                par[a] = par[par[a]]
+                a = par[a]
+            return a
+
+        def reg(key, r):
+            role[key] = r
+            f2(key)
+
         for p in sim:
-            for i, (_, _, role) in enumerate(p.d['pins']):
-                if role == 'out':
-                    self.out_pins.append((p, i, self.root[(p.uid, i)]))
-        for p in self.parts:
-            for i, (_, _, role) in enumerate(p.d['pins']):
-                if role == 'out':
-                    queue.append(self.k(p, i))
-        # which way signals travel along each wire: away from the driving pin
-        flow = [None] * len(self.wires)
-        seen = set(queue)
-        qi = 0
-        while qi < len(queue):
-            node = queue[qi]
-            qi += 1
-            for other, wi, fwd in adj.get(node, ()):
-                if flow[wi] is None:
-                    flow[wi] = fwd
-                if other not in seen:
-                    seen.add(other)
-                    queue.append(other)
-        self.flow = flow
-        self.wire_root = [self.root[self.k(w[0], w[1])] for w in self.wires]
-        self.root_wires = {}
-        for wi, r in enumerate(self.wire_root):
-            self.root_wires.setdefault(r, []).append(wi)
-        self.prev_state = None      # no pulses for whatever changed with the layout
-        self.pulses = {}            # wire index -> [[distance, value], ...]
-        self.pending = {}           # wire index -> values waiting to leave the start
+            if p.kind == 'PIN':
+                reg((p.uid, 'i'), 'in' if p.on else 'out')
+                reg((p.uid, 'o'), 'out' if p.on else 'in')
+            else:
+                for i, (_, _, r) in enumerate(p.d['pins']):
+                    reg((p.uid, i), r)
+        edges = []
+        for pa, ia, pb, ib in all_wires:
+            (ka, ra), (kb, rb) = self.end_info(pa, ia), self.end_info(pb, ib)
+            reg(ka, ra)
+            reg(kb, rb)
+            if ra == rb:
+                x, y = f2(ka), f2(kb)
+                if x != y:
+                    par[x] = y
+            elif ra == 'out':
+                edges.append((ka, kb))
+            else:
+                edges.append((kb, ka))
+        ids = {}
+
+        def gid(key):
+            r = f2(key)
+            g = ids.get(r)
+            if g is None:
+                g = ids[r] = len(ids)
+            return g
+
+        for key in list(role):
+            gid(key)
+        self.ngroups = len(ids)
+        self.gid = {}
+        for p in sim:
+            if p.kind == 'PIN':
+                self.gid[(p.uid, 0)] = gid((p.uid, 'o'))
+            else:
+                for i in range(len(p.d['pins'])):
+                    self.gid[(p.uid, i)] = gid((p.uid, i))
+        self.out_pins = []
+        for p in sim:
+            if p.kind != 'PIN':
+                for i, (_, _, r) in enumerate(p.d['pins']):
+                    if r == 'out':
+                        self.out_pins.append((p, i, gid((p.uid, i))))
+        ein = {}
+        for ko, ki in set((gid(a), gid(b)) for a, b in edges):
+            ein.setdefault(ki, []).append(ko)
+        self.edges_in = {k: tuple(v) for k, v in ein.items()}
+        self.relays = []
+        for p in sim:
+            if p.kind == 'PIN':
+                if p.on:
+                    self.relays.append((gid((p.uid, 'o')), gid((p.uid, 'i'))))
+                else:
+                    self.relays.append((gid((p.uid, 'i')), gid((p.uid, 'o'))))
+        # how many relay hops deep the longest chain goes
+        by_tg = {}
+        for tg, src in self.relays:
+            by_tg.setdefault(tg, []).append(src)
+        memo, busy = {}, set()
+
+        def depth(src):
+            if src in memo:
+                return memo[src]
+            if src in busy:
+                return 0
+            busy.add(src)
+            d = 0
+            for og in self.edges_in.get(src, ()):
+                for s2 in by_tg.get(og, ()):
+                    d = max(d, 1 + depth(s2))
+            busy.discard(src)
+            memo[src] = d
+            return d
+
+        self.relay_depth = max([1 + depth(src) for _, src in self.relays] or [0])
+        # wires show the value of the end that drives them
+        self.wsrc = []
+        for pa, ia, pb, ib in self.wires:
+            (ka, ra), (kb, rb) = self.end_info(pa, ia), self.end_info(pb, ib)
+            self.wsrc.append(gid(kb if (ra == 'in' and rb == 'out') else ka))
         self.topo_key = self.topo_sig()
 
     def netstate(self):
         if self.topo_key != self.topo_sig():
             self.build_topo()
         drv = {}
-        for p, i, root in self.out_pins:
+        for p, i, og in self.out_pins:
             k = p.kind
             if k == 'GATE' and not p.drive:
                 continue        # open gate puts nothing on the wire
             v = 1 if k == 'SOURCE' else p.out
             if v:
-                drv[root] = {1}         # several outputs on one wire act like an OR
-            elif root not in drv:
-                drv[root] = {0}
-        return self.root.__getitem__, drv
+                drv[og] = {1}           # outputs sharing a wire act like an OR
+            elif og not in drv:
+                drv[og] = {0}
+        ein = self.edges_in
 
-    def track_changes(self, drv):
-        # a net that changes value sends one pulse down each of its wires
-        cur = {r: next(iter(s)) for r, s in drv.items() if len(s) == 1}
-        prev = self.prev_state
-        self.prev_state = cur
-        if prev is None or not self.tubes:
-            return
-        for r in set(cur) | set(prev):
-            if cur.get(r) != prev.get(r) and r in cur:
-                for wi in self.root_wires.get(r, ()):
-                    q = self.pending.setdefault(wi, [])
-                    if len(q) < 6:
-                        q.append(cur[r])
+        def pull():
+            for ig, srcs in ein.items():
+                lo = False
+                for sg in srcs:
+                    d = drv.get(sg)
+                    if d is None:
+                        continue
+                    if 1 in d:
+                        drv[ig] = {1}
+                        break
+                    lo = True
+                else:
+                    if lo:
+                        drv[ig] = {0}
 
-    def move_pulses(self, dt):
-        for wi in list(self.pending.keys() | self.pulses.keys()):
-            if wi >= len(self.wires):
-                continue
-            pa, ia, pb, ib = self.wires[wi]
-            length = poly_len(self.wire_screen(self.wires[wi])) / ZOOM        # world units, so zoom doesn't change the speed
-            ps = self.pulses.setdefault(wi, [])
-            for p in ps:
-                p[0] += TUBE_SPEED * dt
-            ps[:] = [p for p in ps if p[0] < length + 14]
-            q = self.pending.get(wi)
-            # next pulse only leaves once the last one is clear of the start
-            if q and (not ps or ps[-1][0] > 34):
-                ps.append([0.0, q.pop(0)])
-            if not ps and not q:
-                self.pulses.pop(wi, None)
-                self.pending.pop(wi, None)
+        if self.relay_depth:
+            base = dict(drv)
+            for _ in range(self.relay_depth):
+                pull()
+                cur = dict(base)
+                for tg, src in self.relays:
+                    d = drv.get(src)
+                    if d is None:
+                        continue
+                    if 1 in d:
+                        cur[tg] = {1}
+                    elif tg not in cur:
+                        cur[tg] = {0}
+                drv.clear()
+                drv.update(cur)
+        pull()
+        return self.gid.get, drv
 
     def settle(self):
         # instant logic: gates (and the send gate) resolve fully inside the tick, only
@@ -1227,7 +1297,6 @@ class App:
 
     def step(self):
         find, drv = self.settle() if self.instant else self.netstate()
-        self.track_changes(drv)
 
         def hi(p, i):
             return drv.get(find((p.uid, i))) == {1}
@@ -1325,8 +1394,6 @@ class App:
         if self.paused or not self.running:
             return
         self.anim += dt
-        if self.topo_key == self.topo_sig():
-            self.move_pulses(dt)
         for p in self.sim_parts:
             if p.glow > 0:
                 p.glow = max(0.0, p.glow - dt)
@@ -1639,7 +1706,7 @@ class App:
     def save(self):
         idx = {p.uid: i for i, p in enumerate(self.parts)}
         data = dict(
-            version=2, made_by=AUTHOR, rate=self.rate, light=self.light, tubes=self.tubes,
+            version=2, made_by=AUTHOR, rate=self.rate, light=self.light,
             view=[CAMX, CAMY, ZOOM],
             parts=[self.part_to_dict(p) for p in self.parts],
             wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires])
@@ -1681,7 +1748,6 @@ class App:
             self.topo_key = None
             self.rate = max(1, min(MAX_RATE, int(data.get('rate', self.rate))))
             self.light = bool(data.get('light'))
-            self.tubes = bool(data.get('tubes', True))
             v = data.get('view')
             if isinstance(v, list) and len(v) == 3:
                 CAMX, CAMY = float(v[0]), float(v[1])
@@ -1696,7 +1762,6 @@ class App:
 
     def reset_caches(self):
         self.grid_cache = None
-        self.pill_cache = {}
 
     # ------------------------------------------------------------ helpers
     def pal_area(self, H):
@@ -2242,9 +2307,6 @@ class App:
             set_theme(self.light)
             self.reset_caches()
             self.dirty = True
-        elif k == pygame.K_t:
-            self.tubes = not self.tubes
-            self.dirty = True
         elif k in (pygame.K_RETURN, pygame.K_KP_ENTER) and not ctrl:
             self.toggle_run()
         elif k == pygame.K_UP:
@@ -2414,19 +2476,6 @@ class App:
                 continue
             y = round((j * C - CAMY) * ZOOM)
             pygame.draw.line(surf, GRID2 if major else GRID, (PAL_W, y), (W, y))
-
-    def pill(self, text):
-        key = (text, self.light)
-        s = self.pill_cache.get(key)
-        if s is None:
-            color = ON if text == 'ON' else OFF
-            t = self.pillf.render(text, True, color)
-            s = pygame.Surface((t.get_width() + 6, 11))
-            s.fill(PANEL)
-            pygame.draw.rect(s, color, s.get_rect(), 1)
-            s.blit(t, (3, (11 - t.get_height()) // 2))
-            self.pill_cache[key] = s
-        return s
 
     def net_color(self, s):
         if not s:
@@ -2628,28 +2677,12 @@ class App:
         # wires
         for wi, (pa, ia, pb, ib) in enumerate(self.wires):
             pts = self.wire_screen(self.wires[wi])
-            s = drv.get(find(k_(pa, ia)))
+            s = drv.get(self.wsrc[wi]) if wi < len(self.wsrc) else None
             color = self.net_color(s)
             if len(s or ()) < 2:
                 color = self.tint(self.wires[wi], 'float' if not s else ('on' if 1 in s else 'off'))
             w = 1 if not s else (2 if s == {0} else 3)
             draw_wire(surf, pts, color, w)
-
-        # signal pulses: one per change, sliding away from the driver
-        if self.tubes and self.topo_key == self.topo_sig():
-            for wi, ps in self.pulses.items():
-                if wi >= len(self.wires) or self.flow[wi] is None:
-                    continue
-                pts = self.wire_screen(self.wires[wi])
-                path = pts if self.flow[wi] else pts[::-1]
-                length = poly_len(pts)
-                for dist, val in ps:
-                    dist *= ZOOM
-                    if dist > length:
-                        continue
-                    pill = self.pill('ON' if val == 1 else 'OFF')
-                    x, y = point_at(path, dist)
-                    surf.blit(pill, (int(x) - pill.get_width() // 2, int(y) - pill.get_height() // 2))
 
         if self.drag and self.drag['kind'] == 'wire':
             pa, ia = self.drag['a']
