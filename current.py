@@ -835,7 +835,7 @@ class Compiled:
         act = self.drive[self.dp]
         n1 = np.bincount(self.dn[act & (val == 1)], minlength=self.N)
         n0 = np.bincount(self.dn[act & (val == 0)], minlength=self.N)
-        return (n1 > 0) & (n0 == 0), (n0 > 0) & (n1 == 0)
+        return n1 > 0, (n0 > 0) & (n1 == 0)
 
     def settle(self):
         # instant logic: gates resolve completely inside the tick
@@ -1160,11 +1160,10 @@ class App:
             if k == 'GATE' and not p.drive:
                 continue        # open gate puts nothing on the wire
             v = 1 if k == 'SOURCE' else p.out
-            s = drv.get(root)
-            if s is None:
-                drv[root] = {v}
-            else:
-                s.add(v)
+            if v:
+                drv[root] = {1}         # several outputs on one wire act like an OR
+            elif root not in drv:
+                drv[root] = {0}
         return self.root.__getitem__, drv
 
     def track_changes(self, drv):
@@ -1186,7 +1185,7 @@ class App:
             if wi >= len(self.wires):
                 continue
             pa, ia, pb, ib = self.wires[wi]
-            length = poly_len(self.wire_screen(self.wires[wi]))
+            length = poly_len(self.wire_screen(self.wires[wi])) / ZOOM        # world units, so zoom doesn't change the speed
             ps = self.pulses.setdefault(wi, [])
             for p in ps:
                 p[0] += TUBE_SPEED * dt
@@ -2645,6 +2644,7 @@ class App:
                 path = pts if self.flow[wi] else pts[::-1]
                 length = poly_len(pts)
                 for dist, val in ps:
+                    dist *= ZOOM
                     if dist > length:
                         continue
                     pill = self.pill('ON' if val == 1 else 'OFF')
