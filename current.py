@@ -5026,6 +5026,8 @@ class GasMode:
         return None
 
     def update(self, dt):
+        if self.sel and self.tool != 'SELECT' and not self.pasting:
+            self.sel = None         # the selection box goes away once you pick another tool
         d = self.drag
         if d and d['tool'] in ('BRUSH', 'ERASE'):
             # brush paints every frame it's held, so holding gas pumps pressure up
