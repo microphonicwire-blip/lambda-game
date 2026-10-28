@@ -1,22 +1,9 @@
-# entry point for the packaged exe. runs the downloaded current.py if there is one,
-# otherwise the copy bundled inside the exe
 import os
 import runpy
 import sys
 import traceback
 
-# common stdlib + pygame so updated game code can use them without rebuilding the exe
-import base64, collections, colorsys, copy, dataclasses, datetime, enum, functools  # noqa
-import hashlib, heapq, itertools, json, math, pathlib, queue, random, re, shutil  # noqa
-import socket, ssl, string, struct, subprocess, tempfile, textwrap, threading, time  # noqa
-import typing, urllib.parse, urllib.request, zlib  # noqa
-import pygame  # noqa
-import numpy  # noqa  (gas lab)
-import pygame.surfarray  # noqa
-try:
-    import certifi  # noqa  (https certs for the updater)
-except ImportError:
-    pass
+import guard
 
 
 def data_dir():
@@ -30,36 +17,50 @@ def data_dir():
     return os.path.join(base, 'logicsim')
 
 
+def log_crash(text):
+    try:
+        os.makedirs(data_dir(), exist_ok=True)
+        with open(os.path.join(data_dir(), 'crash.log'), 'w') as f:
+            f.write(text)
+    except OSError:
+        pass
+
+
+def drop(*paths):
+    for p in paths:
+        try:
+            os.replace(p, p + '.bad')
+        except OSError:
+            pass
+    try:
+        os.remove(os.path.join(data_dir(), 'version.txt'))
+    except OSError:
+        pass
+
+
 def run():
+    # downloaded game if it is the signed one, otherwise the copy compiled into the exe
     code = os.path.join(data_dir(), 'code')
     ext = os.path.join(code, 'current.py')
     if os.path.exists(ext):
-        sys.path.insert(0, code)
-        try:
-            runpy.run_path(ext, run_name='__main__')
-            return
-        except Exception:
-            # the downloaded version crashed or can't run in this exe: log it, fall back to the bundled one
+        if guard.install_ok(code):
+            sys.path.insert(0, code)
             try:
-                with open(os.path.join(data_dir(), 'crash.log'), 'w') as f:
-                    f.write(traceback.format_exc())
-                os.replace(ext, ext + '.bad')
-                os.remove(os.path.join(data_dir(), 'version.txt'))
-            except OSError:
-                pass
-            sys.path.remove(code)
+                runpy.run_path(ext, run_name='__main__')
+                return
+            except Exception:
+                log_crash(traceback.format_exc())
+                drop(ext, os.path.join(code, 'check.txt'))
+                sys.path.remove(code)
+        else:
+            drop(ext, os.path.join(code, 'check.txt'))
     import current
     current.main()
 
 
-if __name__ == '__main__':
+def main():
     try:
         run()
     except Exception:
-        try:
-            os.makedirs(data_dir(), exist_ok=True)
-            with open(os.path.join(data_dir(), 'crash.log'), 'w') as f:
-                f.write(traceback.format_exc())
-        except OSError:
-            pass
+        log_crash(traceback.format_exc())
         raise

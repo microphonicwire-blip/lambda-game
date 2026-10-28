@@ -2,6 +2,7 @@
 # logic gate sandbox
 import colorsys
 import hashlib
+import io
 import random
 import heapq
 import math
@@ -17,6 +18,10 @@ import urllib.request
 import zlib
 from collections import deque
 import pygame
+try:
+    import guard       # signature + credit checks, compiled into the exe
+except ImportError:
+    guard = None
 try:
     import numpy as np          # only the gas lab needs it
     import pygame.surfarray     # noqa
@@ -71,7 +76,12 @@ REPO_MAIN = "current.py"
 # other repo files that get synced too (text ones are compared ignoring CRLF)
 TEXT_EXT = ('.py', '.txt', '.json')
 SYNC_EXT = TEXT_EXT + ('.png', '.jpg', '.wav', '.ogg', '.ttf')
-SKIP = ('launcher.py',)     # only used to build the exe
+SKIP = ('launcher.py', 'guard.py', 'entry.py')     # only used to build the exe
+UPDATE_IMG = 'update.png'       # shown on the update notice
+CHECK_FILE = 'check.txt'        # signature of current.py
+AUTHOR = 'Max, Keaton Technologies'
+_CR_A = 'logic sandbox by Max, Keaton Technologies'
+_CR_B = 'Max, Keaton Technologies'
 
 
 def local_path(path):
@@ -412,20 +422,83 @@ def log_update(msg):
         pass
 
 
+def credits_ok():
+    # the credit lives in a few places, and the compiled guard knows what it should say
+    if guard is None:
+        return True
+    try:
+        return guard.seal('a', AUTHOR) and guard.seal('b', _CR_B) and _CR_A.endswith(AUTHOR)
+    except Exception:
+        return False
+
+
+def locked_screen(surf):
+    surf.fill((12, 12, 18))
+    f = pygame.font.SysFont('consolas,dejavusansmono,monospace', 22)
+    for i, t in enumerate(['this copy has been changed', 'it is not an official logic sandbox build',
+                           'get the real one from Max, Keaton Technologies']):
+        r = f.render(t, True, (230, 90, 90) if i == 0 else (200, 205, 220))
+        surf.blit(r, r.get_rect(center=(surf.get_width() // 2, surf.get_height() // 2 - 30 + i * 34)))
+    pygame.display.flip()
+
+
+def news_path(ext):
+    return os.path.join(os.path.dirname(save_path()), 'whatsnew.' + ext)
+
+
 class Updater:
-    # checks github on boot (and on F5), installs the repo's files if they differ
+    # checks github on boot (and on F5) and installs whatever changed right away, then the next start says what was new
     def __init__(self, start=True, manual=False):
-        self.state = 'off'      # off idle checking prompt installing failed restart
+        self.state = 'off'      # off idle checking installing failed restart
         self.message = ''
+        self.body = ''          # rest of the commit message
+        self.image = None       # update.png bytes
+        self.surf = None
+        self.scaled = None
         self.sha = ''
         self.todo = []
         self.raw = {}           # files already downloaded by the fallback check
         self.note = ''          # one-line status for the toast
         self.manual = manual
+        self.news = False       # show "what was updated" after a restart
+        if os.path.exists(news_path('json')):
+            try:
+                with open(news_path('json'), encoding='utf-8') as f:
+                    d = json.load(f)
+                self.message, self.body = d.get('message', ''), d.get('body', '')
+                try:
+                    with open(news_path('png'), 'rb') as f:
+                        self.image = f.read()
+                except OSError:
+                    pass
+                self.news = True
+            except Exception:
+                self.close_news()
         if GITHUB_REPO:
             self.state = 'checking'
             if start:
                 threading.Thread(target=self._check, daemon=True).start()
+
+    def modal(self):
+        return self.news or self.state in ('installing', 'failed')
+
+    def close_news(self):
+        self.news = False
+        self.surf = self.scaled = self.image = None
+        for e in ('json', 'png'):
+            try:
+                os.remove(news_path(e))
+            except OSError:
+                pass
+
+    def picture(self):
+        # update.png as a surface (made on the main thread)
+        if self.surf is None and self.image:
+            try:
+                self.surf = pygame.image.load(io.BytesIO(self.image)).convert_alpha()
+            except Exception:
+                self.image = None
+        return self.surf
 
     def _get(self, url, raw=False, tries=2):
         err = None
@@ -471,7 +544,6 @@ class Updater:
         api = f'https://api.github.com/repos/{GITHUB_REPO}'
         head = json.loads(self._get(f'{api}/commits/{GITHUB_BRANCH}'))
         sha = head['sha']
-        msg = head['commit']['message'].strip().split('\n')[0]
         try:
             with open(version_path()) as f:
                 cur = f.read().strip()
@@ -483,11 +555,12 @@ class Updater:
         tree = json.loads(self._get(f"{api}/git/trees/{head['commit']['tree']['sha']}?recursive=1"))
         todo = []
         has_main = any(t['path'] == REPO_MAIN for t in tree['tree'])
+        paths = {t['path'] for t in tree['tree']}
         for t in tree['tree']:
             path = t['path']
             ext = os.path.splitext(path)[1].lower()
             if t['type'] != 'blob' or ext not in SYNC_EXT or not safe_repo_path(path) \
-                    or os.path.basename(path) in SKIP:
+                    or os.path.basename(path) in SKIP or path.startswith('tools/'):
                 continue
             if has_main and path != REPO_MAIN and local_path(path) == MAIN_LOCAL:
                 continue        # same file as current.py, current.py wins
@@ -500,43 +573,84 @@ class Updater:
             self._write_version(sha)     # already matches, nothing to say
             self.state = 'idle'
             return
-        self.sha, self.message, self.todo = sha, msg, todo
-        self.state = 'prompt'
+        # the commit message that goes with the game file (not the bot commit that signs it)
+        full = head['commit']['message']
+        try:
+            last = json.loads(self._get(f'{api}/commits?path={REPO_MAIN}&sha={GITHUB_BRANCH}&per_page=1'))
+            full = last[0]['commit']['message']
+        except Exception:
+            pass
+        full = full.strip().replace('\r\n', '\n')
+        msg, _, body = full.partition('\n')
+        self.sha, self.message, self.body, self.todo = sha, msg.strip(), body.strip(), todo
+        if CHECK_FILE in paths and CHECK_FILE not in todo:
+            self.todo.append(CHECK_FILE)
+        self._fetch_image(UPDATE_IMG in paths)
+        self._install()
 
     def _check_raw(self):
         # api down or rate limited (60 checks an hour): just compare the main file straight from github
-        url = f'https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{REPO_MAIN}?t={int(time.time())}'
-        data = self._get(url, raw=True)
+        base = f'https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/'
+        data = self._get(base + f'{REPO_MAIN}?t={int(time.time())}', raw=True)
         local = read_local(REPO_MAIN)
         if local is not None and local.replace(b'\r\n', b'\n') == data.replace(b'\r\n', b'\n'):
             self.state = 'idle'
             return
-        self.sha, self.message, self.todo = '', 'new version of the game', [REPO_MAIN]
+        self.sha, self.message, self.body, self.todo = '', 'new version of the game', '', [REPO_MAIN, CHECK_FILE]
         self.raw = {REPO_MAIN: data}
-        self.state = 'prompt'
+        self._fetch_image(True)
+        self._install()
 
-    def install(self):
-        self.state = 'installing'
-        threading.Thread(target=self._install, daemon=True).start()
+    def _fetch_image(self, exists):
+        if not exists:
+            return
+        try:
+            self.image = self._fetch(UPDATE_IMG)
+        except Exception as err:
+            log_update(f'no update image: {err!r}')
+            self.image = None
 
     def _fetch(self, path):
         if path in self.raw:
             return self.raw[path]
         q = urllib.parse.quote(path)
         try:
+            if not self.sha:
+                raise OSError('no commit yet')
             return self._get(f'https://api.github.com/repos/{GITHUB_REPO}/contents/{q}?ref={self.sha}', raw=True)
         except Exception as err:
             log_update(f'api download of {path} failed: {err!r}, trying raw')
             return self._get(f'https://raw.githubusercontent.com/{GITHUB_REPO}/{self.sha or GITHUB_BRANCH}/{q}', raw=True)
 
     def _install(self):
+        self.state = 'installing'
         try:
             files = []
             for path in self.todo:
-                data = self._fetch(path)
+                try:
+                    data = self._fetch(path)
+                except Exception:
+                    if path == CHECK_FILE:
+                        continue        # no signature in the repo yet, handled below
+                    raise
                 if path.endswith('.py'):
                     compile(data, path, 'exec')      # don't install something that can't even parse
                 files.append((path, data))
+            main = dict(files).get(REPO_MAIN)
+            if guard is not None and main is not None:
+                # only games signed with the owner's key are installed
+                chk = dict(files).get(CHECK_FILE)
+                if chk is None:
+                    try:
+                        chk = self._fetch(CHECK_FILE)
+                        files.append((CHECK_FILE, chk))
+                    except Exception:
+                        chk = None
+                if chk is None or not guard.check_ok(main, chk.decode('utf-8', 'replace')):
+                    log_update('update not signed (yet), skipped')
+                    self.note = 'update is not signed yet, will try again next launch'
+                    self.state = 'idle'
+                    return
             for path, data in files:
                 dst = local_path(path)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -549,6 +663,18 @@ class Updater:
             else:
                 try:
                     os.remove(version_path())   # unknown commit, let the next api check sort it out
+                except OSError:
+                    pass
+            if main is not None:
+                try:
+                    os.makedirs(os.path.dirname(news_path('json')), exist_ok=True)
+                    with open(news_path('json'), 'w', encoding='utf-8') as f:
+                        json.dump(dict(message=self.message, body=self.body), f)
+                    if self.image:
+                        with open(news_path('png'), 'wb') as f:
+                            f.write(self.image)
+                    elif os.path.exists(news_path('png')):
+                        os.remove(news_path('png'))
                 except OSError:
                     pass
             self.state = 'restart'
@@ -910,6 +1036,7 @@ class App:
         self.running = False    # False = build mode (frozen, editable), True = compiled and running
         self.cmp = None
         self.updater = None
+        self.modal_img = None
         self.editing = None     # part being renamed
         self.edit_on = False
         self.edit_text = ''
@@ -1513,7 +1640,7 @@ class App:
     def save(self):
         idx = {p.uid: i for i, p in enumerate(self.parts)}
         data = dict(
-            version=2, rate=self.rate, light=self.light, tubes=self.tubes,
+            version=2, made_by=AUTHOR, rate=self.rate, light=self.light, tubes=self.tubes,
             view=[CAMX, CAMY, ZOOM],
             parts=[self.part_to_dict(p) for p in self.parts],
             wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires])
@@ -1609,6 +1736,7 @@ class App:
         safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in name).strip('_') or 'chip'
         d = json.loads(json.dumps(p.defn))
         d['name'] = name
+        d['made_by'] = AUTHOR
         try:
             os.makedirs(self.chips_dir(), exist_ok=True)
             tmp = os.path.join(self.chips_dir(), safe + '.tmp')
@@ -1967,22 +2095,46 @@ class App:
                     self.edit_text = cand
 
     # ------------------------------------------------------------ input
+    def update_text(self, width):
+        # (text, is_title) lines of the update notice: commit title then the description under it
+        u = self.updater
+        out = [(l, True) for l in wrap(self.font, u.message or 'new version of the game', width)[:3]]
+        for para in (u.body or '').split('\n'):
+            para = para.strip()
+            if para:
+                out += [(l, False) for l in wrap(self.font, para, width)]
+        return out[:10]
+
     def modal_rects(self, W, H):
-        box = pygame.Rect(0, 0, 520, 190)
+        u = self.updater
+        w, h, img = 560, 190, None
+        if u and u.news and u.state != 'installing':
+            lines = self.update_text(w - 40)
+            pic = u.picture()
+            ih = 0
+            if pic:
+                k = min((w - 40) / pic.get_width(), 230 / pic.get_height())
+                ih = max(1, int(pic.get_height() * k))
+                img = pygame.Rect(0, 0, max(1, int(pic.get_width() * k)), ih)
+            h = min(100 + len(lines) * 20 + (ih + 14 if ih else 0) + 40, H - 20)
+        box = pygame.Rect(0, 0, w, h)
         box.center = (W // 2, H // 2)
         btn = pygame.Rect(0, 0, 90, 32)
         btn.midbottom = (box.centerx, box.bottom - 16)
+        if img:
+            img.midtop = (box.centerx, box.y + 52)
+        self.modal_img = img
         return box, btn
 
     def handle(self, e):
         u = self.updater
-        if u and u.state in ('prompt', 'installing', 'failed'):
+        if u and u.modal():
             if u.state != 'installing':
                 _, btn = self.modal_rects(*pygame.display.get_surface().get_size())
                 ok = (e.type == pygame.KEYDOWN and e.key in (pygame.K_RETURN, pygame.K_KP_ENTER)) \
                     or (e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and btn.collidepoint(e.pos))
                 if ok:
-                    u.install() if u.state == 'prompt' else u.dismiss()
+                    u.close_news() if u.state != 'failed' else u.dismiss()
             return
         if self.running:
             # run mode: nothing can be edited, only clicked
@@ -2552,6 +2704,8 @@ class App:
         for i, t in enumerate(HELP):
             surf.blit(self.small.render(t, True, TEXT_DIM), (12, hy + 8 + i * 15))
         surf.blit(self.small.render(f"{self.rate} ticks/s", True, TEXT), (12, H - 22))
+        ct = self.small.render(_CR_A, True, TEXT_DIM)
+        surf.blit(ct, (surf.get_width() - ct.get_width() - 10, H - 18))
         W_ = surf.get_width()
         mt = self.font.render('RUN (compiled)' if self.running and self.cmp else 'RUN' if self.running else 'BUILD, enter = run',
                               True, ON if self.running else SEL)
@@ -2591,20 +2745,29 @@ class App:
             surf.blit(t, t.get_rect(center=tr.center))
 
         u = self.updater
-        if u and u.state in ('prompt', 'installing', 'failed'):
+        if u and u.modal():
             dim = pygame.Surface((W, H), pygame.SRCALPHA)
             dim.fill((*DIM, 170))
             surf.blit(dim, (0, 0))
             box, btn = self.modal_rects(W, H)
             pygame.draw.rect(surf, PANEL, box)
             pygame.draw.rect(surf, PART_LINE, box, 2)
-            self.label(surf, 'UPDATE', TEXT, (box.centerx, box.y + 26))
-            if u.state == 'prompt':
-                self.label(surf, 'new update:', TEXT_DIM, (box.centerx, box.y + 62))
-                for i, line in enumerate(wrap(self.font, u.message, box.w - 40)[:3]):
-                    self.label(surf, line, ON, (box.centerx, box.y + 88 + i * 20))
-            elif u.state == 'installing':
-                self.label(surf, 'installing...', TEXT, (box.centerx, box.centery))
+            self.label(surf, 'UPDATING' if u.state == 'installing' else 'UPDATED' if u.news else 'UPDATE', TEXT, (box.centerx, box.y + 26))
+            if u.state == 'installing':
+                self.label(surf, 'getting the new version...', TEXT, (box.centerx, box.centery))
+            elif u.news:
+                y = box.y + 56
+                if self.modal_img:
+                    if u.scaled is None or u.scaled.get_size() != self.modal_img.size:
+                        u.scaled = pygame.transform.smoothscale(u.picture(), self.modal_img.size)
+                    surf.blit(u.scaled, self.modal_img)
+                    pygame.draw.rect(surf, PART_LINE, self.modal_img.inflate(2, 2), 1)
+                    y = self.modal_img.bottom + 22
+                else:
+                    self.label(surf, 'what changed:', TEXT_DIM, (box.centerx, y + 6))
+                    y += 32
+                for i, (line, title) in enumerate(self.update_text(box.w - 40)):
+                    self.label(surf, line, ON if title else TEXT_DIM, (box.centerx, y + i * 20))
             else:
                 self.label(surf, 'update failed, keeping this version', TEXT, (box.centerx, box.y + 70))
                 for i, line in enumerate(wrap(self.font, u.message, box.w - 40)[:2]):
@@ -4298,7 +4461,7 @@ class GasSim:
             sens = np.array([[x, y, G_SENSOR_KINDS.index(v['type']), v['dir'], v['level']]
                              for (x, y), v in self.sensors.items()], np.int32).reshape(-1, 5)
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
-                                bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
+                                made_by=np.array(AUTHOR), bodies=bodies, open=np.array(self.open), gravity=np.array(self.gravity),
                                 sensors=sens, link=self.link, aux=self.aux, liq=self.liq, phi=self.phi, decay=self.decay,
                                 shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0)]
                                                  for q in self.shafts], np.float64).reshape(-1, 7),
@@ -4388,6 +4551,8 @@ class GasSim:
 class GasMode:
     # the gas lab screen: same window, tab flips between this and the circuits
     def __init__(self, app):
+        if not credits_ok():
+            raise SystemExit
         self.app = app
         self.sim = GasSim()
         self.tool = 'BRUSH'
@@ -5078,6 +5243,8 @@ class GasMode:
         st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if not self.sym else '  sym ' + 'xyb'[self.sym - 1]) + ('' if self.sim.open else '  closed') \
             + ('' if self.sim.gravity else '  no g')
         surf.blit(self.app.small.render(st, True, SEL if self.paused else TEXT), (12, H - 22))
+        ct = self.app.small.render(_CR_A, True, TEXT_DIM)
+        surf.blit(ct, (W - ct.get_width() - 10, H - 18))
         msg, until = self.app.toast
         if msg and time.time() < until:
             t = self.app.font.render(msg, True, TEXT)
@@ -5090,21 +5257,32 @@ class GasMode:
 
 def main():
     pygame.init()
-    pygame.display.set_caption("logic sandbox")
+    pygame.display.set_caption('logic sandbox  |  ' + AUTHOR)
     pygame.display.set_mode((1280, 800), pygame.RESIZABLE)
     clock = pygame.time.Clock()
     app = App()
     app.load()
     app.scan_chips()
     app.updater = Updater()
+    if not credits_ok():
+        locked_screen(pygame.display.get_surface())
+        pygame.time.wait(6000)
+        pygame.quit()
+        return
     running = True
     restart = False
+    frame = 0
     gas = None
     if np is not None and os.path.exists(os.path.join(os.path.dirname(save_path()), 'gas.npz')):
         gas = GasMode(app)      # loaded now so its circuit links keep working from the circuit screen
     while running:
         dt = clock.tick(60) / 1000
-        modal = app.updater.state in ('prompt', 'installing', 'failed')
+        frame += 1
+        if frame % 300 == 0 and not credits_ok():
+            locked_screen(pygame.display.get_surface())
+            pygame.time.wait(6000)
+            break
+        modal = app.updater.modal()
         if app.mode == 'gas' and gas is None:
             gas = GasMode(app)
         in_gas = app.mode == 'gas' and not modal
