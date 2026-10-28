@@ -2909,7 +2909,7 @@ G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, 
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
           'space = pause, . = step', 'up/dn = speed', 'o = open edges', 'g = gravity',
           'hold p = valves', 'hold k = starter', 'i = pin readout', 'select + ctrl+c/v',
-          'm = symmetry, rmb = erase with tool', 'ctrl+wheel = zoom, mmb = pan',
+          'm = symmetry, rmb = erase with tool', 'ctrl+wheel = zoom, mmb = pan', 'v = smooth gas',
           'click block = cycle it', 'a = reset air', 'clr: ctrl+sh+del']
 
 
@@ -4554,6 +4554,7 @@ class GasMode:
         if not credits_ok():
             raise SystemExit
         self.app = app
+        self.smooth = True          # blend the gas colors between cells (looks finer, walls stay sharp)
         self.zcs = None             # zoomed cell size in pixels, None = fit the window
         self.panx = self.pany = None
         self.pan_from = None
@@ -4810,6 +4811,9 @@ class GasMode:
             elif k == pygame.K_o:
                 self.sim.open = not self.sim.open
                 self.dirty = True
+            elif k == pygame.K_v and not ctrl:
+                self.smooth = not self.smooth
+                self.app.say('smooth gas on' if self.smooth else 'smooth gas off')
             elif k == pygame.K_p:
                 self.sim.set_valves(True)
             elif k == pygame.K_g:
@@ -5065,6 +5069,35 @@ class GasMode:
         if self.dirty and time.time() - self.last_save >= 10:
             self.save()
 
+    def smooth_img(self, arr, vx0, vx1, vy0, vy1):
+        # gas colors are blended between cells (only with other gas cells, so nothing bleeds through a wall),
+        # parts like walls, valves and blocks keep their sharp cell edges
+        sim, cs = self.sim, self.cs
+        w, h = vx1 - vx0, vy1 - vy0
+        obj = (sim.kind[1 + vx0:1 + vx1, 1 + vy0:1 + vy1] > 0) | sim.solid[1 + vx0:1 + vx1, 1 + vy0:1 + vy1]
+        gas = ~obj
+        # parts get the average color of the gas next to them first, so the blend near them stays gas-colored
+        f = arr.astype(np.float32)
+        g = gas.astype(np.float32)
+        acc = np.zeros_like(f)
+        cnt = np.zeros(g.shape, np.float32)
+        for sl_d, sl_s in (((slice(1, None), slice(None)), (slice(None, -1), slice(None))),
+                           ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+                           ((slice(None), slice(1, None)), (slice(None), slice(None, -1))),
+                           ((slice(None), slice(None, -1)), (slice(None), slice(1, None)))):
+            acc[sl_d] += f[sl_s] * g[sl_s][..., None]
+            cnt[sl_d] += g[sl_s]
+        fill = acc / np.maximum(cnt, 1)[..., None]
+        base = np.where(gas[..., None], f, fill).astype(np.uint8)
+        img = pygame.transform.smoothscale(pygame.surfarray.make_surface(base), (w * cs, h * cs))
+        if obj.any():
+            key = (255, 0, 255)
+            solid_arr = np.where(obj[..., None], arr, np.array(key, np.uint8))
+            top = pygame.transform.scale(pygame.surfarray.make_surface(solid_arr), (w * cs, h * cs))
+            top.set_colorkey(key)
+            img.blit(top, (0, 0))
+        return img
+
     # drawing
     def draw(self, surf):
         W, H = surf.get_size()
@@ -5074,9 +5107,13 @@ class GasMode:
         cs0 = self.cs
         vx0, vx1 = max(0, (PAL_W - self.x0) // cs0), min(GW, -(-(W - self.x0) // cs0))
         vy0, vy1 = max(0, -self.y0 // cs0), min(GH, -(-(H - self.y0) // cs0))
-        img = pygame.surfarray.make_surface(np.ascontiguousarray(arr[vx0:vx1, vy0:vy1]))
-        if cs0 != 1:
-            img = pygame.transform.scale(img, ((vx1 - vx0) * cs0, (vy1 - vy0) * cs0))
+        arr = np.ascontiguousarray(arr[vx0:vx1, vy0:vy1])
+        if self.smooth and cs0 >= 3:
+            img = self.smooth_img(arr, vx0, vx1, vy0, vy1)
+        else:
+            img = pygame.surfarray.make_surface(arr)
+            if cs0 != 1:
+                img = pygame.transform.scale(img, ((vx1 - vx0) * cs0, (vy1 - vy0) * cs0))
         surf.blit(img, (self.x0 + vx0 * cs0, self.y0 + vy0 * cs0))
         ds = max(2, self.cs)
         for d in self.sim.debris:
