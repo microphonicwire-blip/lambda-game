@@ -2814,18 +2814,18 @@ class App:
 # ---------------------------------------------------------------- gas lab
 GW, GH = 224, 152           # gas grid size in cells
 G_SPECIES = ['N2', 'O2', 'H2', 'C3H8', 'CH4', 'CO2', 'H2O', 'He',
-             'Ar', 'Ne', 'NH3', 'CO', 'C4H10', 'C2H2', 'C2H5OH', 'Cl2', 'SF6']
+             'Ar', 'Ne', 'NH3', 'CO', 'C4H10', 'C2H2', 'C2H5OH', 'Cl2', 'SF6', 'C12H26']
 G_IDX = {s: i for i, s in enumerate(G_SPECIES)}
-G_MASS = [28, 32, 2, 44, 16, 44, 18, 4, 40, 20, 17, 28, 58, 26, 46, 71, 146]                 # g/mol
-G_CV = [2.5, 2.5, 2.5, 8.0, 3.3, 3.5, 3.0, 1.5, 1.5, 1.5, 3.4, 2.5, 10.5, 4.0, 8.0, 3.1, 10.0]         # heat capacity, in units of R
+G_MASS = [28, 32, 2, 44, 16, 44, 18, 4, 40, 20, 17, 28, 58, 26, 46, 71, 146, 170]                 # g/mol
+G_CV = [2.5, 2.5, 2.5, 8.0, 3.3, 3.5, 3.0, 1.5, 1.5, 1.5, 3.4, 2.5, 10.5, 4.0, 8.0, 3.1, 10.0, 14.0]         # heat capacity, in units of R
 G_COLOR = [(46, 66, 108), (60, 100, 160), (130, 70, 190), (170, 145, 40), (60, 140, 85),
            (110, 110, 110), (90, 150, 180), (180, 100, 150),
            (120, 90, 200), (230, 90, 110), (200, 215, 110), (150, 120, 90), (205, 130, 60),
-           (240, 190, 90), (190, 120, 170), (150, 200, 60), (90, 205, 190)]
+           (240, 190, 90), (190, 120, 170), (150, 200, 60), (90, 205, 190), (200, 150, 40)]
 G_NICE = {'N2': 'N2', 'O2': 'O2', 'H2': 'H2', 'C3H8': 'propane', 'CH4': 'methane',
           'CO2': 'CO2', 'H2O': 'steam', 'He': 'He', 'Ar': 'argon', 'Ne': 'neon', 'NH3': 'ammonia',
           'CO': 'CO', 'C4H10': 'butane', 'C2H2': 'acetylene', 'C2H5OH': 'ethanol', 'Cl2': 'chlorine',
-          'SF6': 'SF6'}
+          'SF6': 'SF6', 'C12H26': 'diesel'}
 # fuel: (O2 needed per fuel, products, heat released / R per mol, activation temp K)
 G_FUELS = {'H2': (0.5, {'H2O': 1}, 29100, 7000),
            'C3H8': (5, {'CO2': 3, 'H2O': 4}, 245800, 8500),
@@ -2834,7 +2834,8 @@ G_FUELS = {'H2': (0.5, {'H2O': 1}, 29100, 7000),
            'C4H10': (6.5, {'CO2': 4, 'H2O': 5}, 346000, 8500),
            'C2H2': (2.5, {'CO2': 2, 'H2O': 1}, 156000, 7000),
            'C2H5OH': (3, {'CO2': 2, 'H2O': 3}, 153600, 9000),
-           'NH3': (0.75, {'N2': 0.5, 'H2O': 1.5}, 38000, 11000)}
+           'NH3': (0.75, {'N2': 0.5, 'H2O': 1.5}, 38000, 11000),
+           'C12H26': (18.5, {'CO2': 12, 'H2O': 13}, 854000, 4500)}      # diesel: low activation, lights from compression heat alone
 G_AIR = {'N2': 0.79, 'O2': 0.21}
 # solid kinds: (name, strength in atm per cell of thickness (0 = never breaks), color)
 G_SOLIDS = [None, ('WALL', 60, (150, 160, 178)), ('STEEL', 0, (100, 108, 122)),
@@ -2909,9 +2910,9 @@ G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('I
           ('NITROGEN', {'N2': 1}), ('STEAM', {'H2O': 1}), ('ARGON', {'Ar': 1}), ('NEON', {'Ne': 1}),
           ('AMMONIA', {'NH3': 1}), ('CO', {'CO': 1}), ('BUTANE', {'C4H10': 1}),
           ('ACETYLENE', {'C2H2': 1}), ('ETHANOL', {'C2H5OH': 1}), ('CHLORINE', {'Cl2': 1}),
-          ('SF6', {'SF6': 1}), ('WATER', None),
+          ('SF6', {'SF6': 1}), ('DIESEL', {'C12H26': 1}), ('WATER', None),
           ('H2+O2 2:1', {'H2': 2 / 3, 'O2': 1 / 3}), ('CH4+O2 1:2', {'CH4': 1 / 3, 'O2': 2 / 3}),
-          ('C3H8+O2 1:5', {'C3H8': 1 / 6, 'O2': 5 / 6}), ('CO+O2 2:1', {'CO': 2 / 3, 'O2': 1 / 3}),
+          ('C3H8+O2 1:5', {'C3H8': 1 / 6, 'O2': 5 / 6}), ('CO+O2 2:1', {'CO': 2 / 3, 'O2': 1 / 3}), ('DIESEL+AIR', {'C12H26': 0.011, 'N2': 0.78, 'O2': 0.209}),
           ('VACUUM', None)]
 G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER,
                 'VALVE': G_VALVE, 'FILTER': G_FILTER, 'CHECK VALVE': G_CHECK, 'HEATER': G_HEATER,
@@ -2927,6 +2928,7 @@ G_DIFF = 0.02       # gases mixing
 G_HEAT = 0.05       # heat conduction
 G_BURN = 0.35       # burn speed once lit
 G_EFF = 0.6         # share of the reaction heat that stays (real flames lose some)
+G_COMP = {'C12H26': 0.3}       # diesel lights from compression: squeezed gas counts as hotter, T * density^0.3
 G_BURN_A = {f: 0.25 / math.exp(-v[3] / 1500) for f, v in G_FUELS.items()}   # 0.25/step at 1500K
 G_BUOY = 4e-4       # how fast light / hot gas rises and heavy gas sinks
 G_PDV = 0.35         # compression heating / expansion cooling
@@ -4406,14 +4408,17 @@ class GasSim:
             T[sm] = np.maximum(T[sm], 1900)
             self.spark_t[self.spark_t > 0] -= 1
         # burning: reaction speed climbs steeply with temperature (arrhenius)
-        if (T > 650).any():
+        if (T > 650).any() or n[G_IDX['C12H26']].max() > 1e-5:
             o2 = G_IDX['O2']
             for f, (nu, prods, dh, ta) in G_FUELS.items():
                 fi = G_IDX[f]
-                m = (T > 650) & (n[fi] > 1e-5) & (n[o2] > 1e-5)
+                Te = T
+                if f in G_COMP:
+                    Te = T * np.clip(n.sum(0), 1, 60) ** G_COMP[f]
+                m = (Te > 650) & (n[fi] > 1e-5) & (n[o2] > 1e-5)
                 if not m.any():
                     continue
-                k = np.minimum(G_BURN, G_BURN_A[f] * np.exp(-ta / np.maximum(T, 1)))
+                k = np.minimum(G_BURN, G_BURN_A[f] * np.exp(-ta / np.maximum(Te, 1)))
                 b = np.where(m, k * np.minimum(n[fi], n[o2] / nu), 0)
                 e = (self.cvv @ n.reshape(S, -1)).reshape(T.shape) * T + b * dh * G_EFF
                 n[fi] -= b
