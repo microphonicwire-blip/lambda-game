@@ -12,10 +12,10 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            sep: ';'
+            win: '--windowed'
             file: logicsim.exe
           - os: ubuntu-latest
-            sep: ':'
+            win: ''
             file: logicsim-linux
     runs-on: ${{ matrix.os }}
     steps:
@@ -23,18 +23,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pygame pyinstaller numpy certifi
-      - name: build
+      - run: pip install pygame pyinstaller numpy certifi nuitka
+      - name: compile the game, launcher and guard to native code
         shell: bash
-        run: pyinstaller --onefile --windowed --name logicsim --add-data "current.py${{ matrix.sep }}." launcher.py
-      - name: rename linux binary
-        if: runner.os == 'Linux'
-        run: mv dist/logicsim dist/logicsim-linux
+        run: |
+          mkdir -p work/out
+          python tools/strip.py current.py work/current.py
+          cp guard.py launcher.py work/
+          cd work
+          for m in current guard launcher; do
+            python -m nuitka --module $m.py --output-dir=out --remove-output --no-pyi-file --assume-yes-for-downloads
+          done
+          ls out
+      - name: build the exe
+        shell: bash
+        run: |
+          mkdir pk
+          cp entry.py pk/
+          cd pk
+          pyinstaller --onefile ${{ matrix.win }} --name logicsim --paths ../work/out --hidden-import current --hidden-import guard entry.py
+          if [ "$RUNNER_OS" = "Linux" ]; then mv dist/logicsim dist/logicsim-linux; fi
+          ls dist
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.file }}
-          path: dist/${{ matrix.file }}
+          path: pk/dist/${{ matrix.file }}
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: dist/${{ matrix.file }}
+          files: pk/dist/${{ matrix.file }}
