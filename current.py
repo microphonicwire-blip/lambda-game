@@ -2840,17 +2840,18 @@ G_AIR = {'N2': 0.79, 'O2': 0.21}
 # solid kinds: (name, strength in atm per cell of thickness (0 = never breaks), color)
 G_SOLIDS = [None, ('WALL', 60, (150, 160, 178)), ('STEEL', 0, (100, 108, 122)),
             ('GLASS', 4, (150, 210, 225)), ('IGNITER', 60, (235, 125, 30)),
-            ('VALVE', 60, (200, 60, 60)), ('SENSOR', 60, (150, 90, 200)),
-            ('FILTER', 60, (120, 200, 190)), ('CHECK VALVE', 60, (205, 175, 60)),
+            ('VALVE', 0, (200, 60, 60)), ('SENSOR', 60, (150, 90, 200)),
+            ('FILTER', 0, (120, 200, 190)), ('CHECK VALVE', 0, (205, 175, 60)),
             ('HEATER', 60, (240, 90, 40)), ('COOLER', 60, (80, 170, 240)),
-            ('PUMP', 60, (90, 200, 90)), ('SOURCE', 60, (230, 230, 110)),
+            ('PUMP', 0, (90, 200, 90)), ('SOURCE', 60, (230, 230, 110)),
             ('VENT', 60, (70, 70, 80)), ('LINK', 60, (235, 235, 245)),
-            ('RELIEF VALVE', 60, (215, 110, 170)), ('EXCHANGER', 60, (150, 152, 168)),
+            ('RELIEF VALVE', 0, (215, 110, 170)), ('EXCHANGER', 60, (150, 152, 168)),
             ('TURBINE', 60, (215, 205, 90)), ('URANIUM', 60, (110, 190, 70)),
             ('CONTROL ROD', 60, (70, 72, 92))]
 G_WALL, G_STEEL, G_GLASS, G_IGNITER, G_VALVE, G_SENSOR = 1, 2, 3, 4, 5, 6
 G_FILTER, G_CHECK, G_HEATER, G_COOLER, G_PUMP, G_SOURCE, G_VENT, G_LINK = 7, 8, 9, 10, 11, 12, 13, 14
 G_RELIEF, G_EXCH, G_TURB = 15, 16, 17
+G_TOUGH = (G_VALVE, G_FILTER, G_CHECK, G_PUMP, G_RELIEF)      # these never break
 G_URAN, G_CTRL = 18, 19
 G_THERM = (G_EXCH, G_URAN, G_CTRL)      # solid parts that keep their own temperature and trade heat with the gas
 G_THERM_C = np.zeros(256, np.float32)
@@ -2871,7 +2872,7 @@ G_TURB_COUPLE = 0.3     # how hard the rotor drags the gas along (and the gas dr
 G_HEAT_LEVELS = [400, 600, 900, 1400, 2200]     # K
 G_COOL_LEVELS = [270, 230, 180, 120, 77]        # K
 G_RATE = 0.12       # source emit rate per step
-G_PUMP_V = 0.15     # pump face speed
+G_PUMP_V = 0.45     # pump face speed
 # signals shared with the circuit side (GAS IN / GAS OUT parts): link id -> 0/1
 GAS_TX = {}         # gas lab -> circuits
 GAS_RX = {}         # circuits -> gas lab
@@ -2922,7 +2923,7 @@ G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G
 G_DEFAULT_AUX = {G_FILTER: G_IDX['H2'], G_CHECK: 0, G_HEATER: 2, G_COOLER: 2, G_PUMP: 0, G_SOURCE: G_IDX['H2'],
                  G_RELIEF: 2, G_TURB: 0, G_CTRL: 4}
 G_TOOLS = ['BRUSH', 'LINE', 'RECT', 'FILL', 'ERASE', 'SELECT']
-G_K = 0.08          # how hard pressure pushes
+G_K = 0.24          # how hard pressure pushes
 G_DAMP = 0.998      # flow friction
 G_DIFF = 0.02       # gases mixing
 G_HEAT = 0.05       # heat conduction
@@ -2938,7 +2939,8 @@ G_BODY_G = 0.0015   # block gravity
 G_COOL = 0.0004     # hot gas slowly radiating heat away
 G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
 G_VISC = 0.02
-G_UMAX = 0.65        # fastest flow on a cell face (cells / step)
+G_SUB = 1           # flow sub-steps per step: gas moves, jets and shocks run this much faster
+G_UMAX = 0.95        # fastest flow on a cell face (cells / step)
 G_COLL = 5.0         # how much fast flow ignores sideways pressure (keeps jets narrow), 0 = off
 G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, pressure drops there (bernoulli)
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
@@ -4282,116 +4284,117 @@ class GasSim:
             self.active = set(np.nonzero(live)[0].tolist()) | ({0, 1} if self.open else set())
         idx = np.array(sorted(self.active) or [0])
         full = n
-        n = full[idx]
-        cvv, Mv = self.cvv[idx], self.Mv[idx]
-        S = n.shape[0]
-        flat = n.reshape(S, -1)
-        C = (cvv @ flat).reshape(T.shape)
-        p = flat.sum(0).reshape(T.shape) * T / 293
-        rho = (Mv @ flat).reshape(T.shape) / 29 + 0.02
-        ox = ~sol[:-1] & ~sol[1:]
-        oy = ~sol[:, :-1] & ~sol[:, 1:]
-        u, v = self.u, self.v
-        # pressure pushes the flow (capped so it can't overshoot into a checkerboard)
-        ku = np.minimum(G_K / (0.5 * (rho[:-1] + rho[1:])), 0.25 / (np.maximum(p[:-1], p[1:]) + 1e-3))
-        kv = np.minimum(G_K / (0.5 * (rho[:, :-1] + rho[:, 1:])), 0.25 / (np.maximum(p[:, :-1], p[:, 1:]) + 1e-3))
-        if G_COLL:
-            # fast flow barely feels pressure sideways, so jets keep their shape instead of ballooning at the exit
-            ub = np.zeros_like(v)
-            ub[1:-1] = 0.25 * (u[:-1, :-1] + u[1:, :-1] + u[:-1, 1:] + u[1:, 1:])
-            vb = np.zeros_like(u)
-            vb[:, 1:-1] = 0.25 * (v[:-1, :-1] + v[:-1, 1:] + v[1:, :-1] + v[1:, 1:])
-            ku = ku / (1 + G_COLL * vb * vb / 0.08)
-            kv = kv / (1 + G_COLL * ub * ub / 0.08)
-        u += ku * (p[:-1] - p[1:])
-        v += kv * (p[:, :-1] - p[:, 1:])
-        if self.gravity:
-            # buoyancy: gas lighter than air would be at that pressure floats, heavier sinks
-            rf = 0.5 * (rho[:, :-1] + rho[:, 1:])
-            pf = 0.5 * (p[:, :-1] + p[:, 1:])
-            v += G_BUOY * np.clip((rf - 0.02 - pf) / rf, -3, 3) * (pf > 0.05)
-        # viscosity keeps jets smooth
-        uu, vv = u.copy(), v.copy()
-        u[1:-1] += G_VISC * (uu[:-2] + uu[2:] - 2 * uu[1:-1])
-        u[:, 1:-1] += G_VISC * (uu[:, :-2] + uu[:, 2:] - 2 * uu[:, 1:-1])
-        v[1:-1] += G_VISC * (vv[:-2] + vv[2:] - 2 * vv[1:-1])
-        v[:, 1:-1] += G_VISC * (vv[:, :-2] + vv[:, 2:] - 2 * vv[:, 1:-1])
-        if G_ADV:
+        for _sub in range(G_SUB):
+            n = full[idx]
+            cvv, Mv = self.cvv[idx], self.Mv[idx]
+            S = n.shape[0]
+            flat = n.reshape(S, -1)
+            C = (cvv @ flat).reshape(T.shape)
+            p = flat.sum(0).reshape(T.shape) * T / 293
+            rho = (Mv @ flat).reshape(T.shape) / 29 + 0.02
+            ox = ~sol[:-1] & ~sol[1:]
+            oy = ~sol[:, :-1] & ~sol[:, 1:]
+            u, v = self.u, self.v
+            # pressure pushes the flow (capped so it can't overshoot into a checkerboard)
+            ku = np.minimum(G_K / (0.5 * (rho[:-1] + rho[1:])), 0.25 / (np.maximum(p[:-1], p[1:]) + 1e-3))
+            kv = np.minimum(G_K / (0.5 * (rho[:, :-1] + rho[:, 1:])), 0.25 / (np.maximum(p[:, :-1], p[:, 1:]) + 1e-3))
+            if G_COLL:
+                # fast flow barely feels pressure sideways, so jets keep their shape instead of ballooning at the exit
+                ub = np.zeros_like(v)
+                ub[1:-1] = 0.25 * (u[:-1, :-1] + u[1:, :-1] + u[:-1, 1:] + u[1:, 1:])
+                vb = np.zeros_like(u)
+                vb[:, 1:-1] = 0.25 * (v[:-1, :-1] + v[:-1, 1:] + v[1:, :-1] + v[1:, 1:])
+                ku = ku / (1 + G_COLL * vb * vb / 0.08)
+                kv = kv / (1 + G_COLL * ub * ub / 0.08)
+            u += ku * (p[:-1] - p[1:])
+            v += kv * (p[:, :-1] - p[:, 1:])
+            if self.gravity:
+                # buoyancy: gas lighter than air would be at that pressure floats, heavier sinks
+                rf = 0.5 * (rho[:, :-1] + rho[:, 1:])
+                pf = 0.5 * (p[:, :-1] + p[:, 1:])
+                v += G_BUOY * np.clip((rf - 0.02 - pf) / rf, -3, 3) * (pf > 0.05)
+            # viscosity keeps jets smooth
             uu, vv = u.copy(), v.copy()
-            du = np.where(uu[1:-1] > 0, uu[1:-1] - uu[:-2], uu[2:] - uu[1:-1])
-            u[1:-1] -= G_ADV * uu[1:-1] * du
-            dv = np.where(vv[:, 1:-1] > 0, vv[:, 1:-1] - vv[:, :-2], vv[:, 2:] - vv[:, 1:-1])
-            v[:, 1:-1] -= G_ADV * vv[:, 1:-1] * dv
-            vbar = 0.25 * (vv[:-1, :-1] + vv[:-1, 1:] + vv[1:, :-1] + vv[1:, 1:])      # (W2-1, H2-2), v seen from the u faces
-            duy = np.where(vbar > 0, uu[:, 1:-1] - uu[:, :-2], uu[:, 2:] - uu[:, 1:-1])
-            u[:, 1:-1] -= G_ADV * vbar * duy
-            ubar = 0.25 * (uu[:-1, :-1] + uu[1:, :-1] + uu[:-1, 1:] + uu[1:, 1:])      # (W2-2, H2-1)
-            dvx = np.where(ubar > 0, vv[1:-1] - vv[:-2], vv[2:] - vv[1:-1])
-            v[1:-1] -= G_ADV * ubar * dvx
-        u *= G_DAMP * ox
-        v *= G_DAMP * oy
-        chk = (self.kind == G_CHECK) if G_CHECK in self.has else None
-        if G_PUMP in self.has or chk is not None:
-            self.flow_devices(u, v)
-        if G_TURB in self.has:
-            self.turbines(u, v, p)
-        np.clip(u, -G_UMAX, G_UMAX, out=u)
-        np.clip(v, -G_UMAX, G_UMAX, out=v)
-        # never move more than 70% of a cell out in one step
-        up, un = np.maximum(u, 0), np.minimum(u, 0)
-        vp, vn = np.maximum(v, 0), np.minimum(v, 0)
-        out = np.zeros_like(T)
-        out[:-1] += up
-        out[1:] -= un
-        out[:, :-1] += vp
-        out[:, 1:] -= vn
-        s = np.minimum(1.0, 0.7 / (out + 1e-9))
-        # flux = (what leaves the left cell) - (what leaves the right cell), upwind + mixing
-        if chk is not None:
-            dx = G_DIFF * (ox & ~(chk[:-1] | chk[1:]))      # no backwards leaking through one-way valves
-            dy = G_DIFF * (oy & ~(chk[:, :-1] | chk[:, 1:]))
-        else:
-            dx = G_DIFF * ox
-            dy = G_DIFF * oy
-        al = up * s[:-1] + dx
-        ar = un * s[1:] - dx
-        bl = vp * s[:, :-1] + dy
-        br = vn * s[:, 1:] - dy
-        exm = self.thermal() if self.has & set(G_THERM) else None
-        exT = T[exm].copy() if exm is not None else None
-        E = C * T
-        # squeezing gas heats it, letting it expand cools it (p dV work)
-        ue = up * s[:-1] + un * s[1:]
-        ve = vp * s[:, :-1] + vn * s[:, 1:]
-        div = np.zeros_like(T)
-        div[:-1] += ue
-        div[1:] -= ue
-        div[:, :-1] += ve
-        div[:, 1:] -= ve
-        E -= G_PDV * flat.sum(0).reshape(T.shape) * T * div
-        np.maximum(E, 0, out=E)
-        fx = n[:, :-1] * al + n[:, 1:] * ar
-        fy = n[:, :, :-1] * bl + n[:, :, 1:] * br
-        hx = G_HEAT * np.minimum(C[:-1], C[1:]) * ox
-        hy = G_HEAT * np.minimum(C[:, :-1], C[:, 1:]) * oy
-        ex = E[:-1] * al + E[1:] * ar + hx * (T[:-1] - T[1:])
-        ey = E[:, :-1] * bl + E[:, 1:] * br + hy * (T[:, :-1] - T[:, 1:])
-        n[:, :-1] -= fx
-        n[:, 1:] += fx
-        n[:, :, :-1] -= fy
-        n[:, :, 1:] += fy
-        if self.liq.any():
-            self.mist(up, un, vp, vn, s)
-        E[:-1] -= ex
-        E[1:] += ex
-        E[:, :-1] -= ey
-        E[:, 1:] += ey
-        np.maximum(n, 0, out=n)
-        C = (cvv @ n.reshape(S, -1)).reshape(T.shape)
-        T[:] = np.where(C > 1e-5, E / np.maximum(C, 1e-5), 293)
-        if exm is not None:
-            T[exm] = exT
-        full[idx] = n
+            u[1:-1] += G_VISC * (uu[:-2] + uu[2:] - 2 * uu[1:-1])
+            u[:, 1:-1] += G_VISC * (uu[:, :-2] + uu[:, 2:] - 2 * uu[:, 1:-1])
+            v[1:-1] += G_VISC * (vv[:-2] + vv[2:] - 2 * vv[1:-1])
+            v[:, 1:-1] += G_VISC * (vv[:, :-2] + vv[:, 2:] - 2 * vv[:, 1:-1])
+            if G_ADV:
+                uu, vv = u.copy(), v.copy()
+                du = np.where(uu[1:-1] > 0, uu[1:-1] - uu[:-2], uu[2:] - uu[1:-1])
+                u[1:-1] -= G_ADV * uu[1:-1] * du
+                dv = np.where(vv[:, 1:-1] > 0, vv[:, 1:-1] - vv[:, :-2], vv[:, 2:] - vv[:, 1:-1])
+                v[:, 1:-1] -= G_ADV * vv[:, 1:-1] * dv
+                vbar = 0.25 * (vv[:-1, :-1] + vv[:-1, 1:] + vv[1:, :-1] + vv[1:, 1:])      # (W2-1, H2-2), v seen from the u faces
+                duy = np.where(vbar > 0, uu[:, 1:-1] - uu[:, :-2], uu[:, 2:] - uu[:, 1:-1])
+                u[:, 1:-1] -= G_ADV * vbar * duy
+                ubar = 0.25 * (uu[:-1, :-1] + uu[1:, :-1] + uu[:-1, 1:] + uu[1:, 1:])      # (W2-2, H2-1)
+                dvx = np.where(ubar > 0, vv[1:-1] - vv[:-2], vv[2:] - vv[1:-1])
+                v[1:-1] -= G_ADV * ubar * dvx
+            u *= G_DAMP * ox
+            v *= G_DAMP * oy
+            chk = (self.kind == G_CHECK) if G_CHECK in self.has else None
+            if G_PUMP in self.has or chk is not None:
+                self.flow_devices(u, v)
+            if G_TURB in self.has and _sub == 0:
+                self.turbines(u, v, p)
+            np.clip(u, -G_UMAX, G_UMAX, out=u)
+            np.clip(v, -G_UMAX, G_UMAX, out=v)
+            # never move more than 70% of a cell out in one step
+            up, un = np.maximum(u, 0), np.minimum(u, 0)
+            vp, vn = np.maximum(v, 0), np.minimum(v, 0)
+            out = np.zeros_like(T)
+            out[:-1] += up
+            out[1:] -= un
+            out[:, :-1] += vp
+            out[:, 1:] -= vn
+            s = np.minimum(1.0, 0.95 / (out + 1e-9))
+            # flux = (what leaves the left cell) - (what leaves the right cell), upwind + mixing
+            if chk is not None:
+                dx = G_DIFF * (ox & ~(chk[:-1] | chk[1:]))      # no backwards leaking through one-way valves
+                dy = G_DIFF * (oy & ~(chk[:, :-1] | chk[:, 1:]))
+            else:
+                dx = G_DIFF * ox
+                dy = G_DIFF * oy
+            al = up * s[:-1] + dx
+            ar = un * s[1:] - dx
+            bl = vp * s[:, :-1] + dy
+            br = vn * s[:, 1:] - dy
+            exm = self.thermal() if self.has & set(G_THERM) else None
+            exT = T[exm].copy() if exm is not None else None
+            E = C * T
+            # squeezing gas heats it, letting it expand cools it (p dV work)
+            ue = up * s[:-1] + un * s[1:]
+            ve = vp * s[:, :-1] + vn * s[:, 1:]
+            div = np.zeros_like(T)
+            div[:-1] += ue
+            div[1:] -= ue
+            div[:, :-1] += ve
+            div[:, 1:] -= ve
+            E -= G_PDV * flat.sum(0).reshape(T.shape) * T * div
+            np.maximum(E, 0, out=E)
+            fx = n[:, :-1] * al + n[:, 1:] * ar
+            fy = n[:, :, :-1] * bl + n[:, :, 1:] * br
+            hx = G_HEAT * np.minimum(C[:-1], C[1:]) * ox
+            hy = G_HEAT * np.minimum(C[:, :-1], C[:, 1:]) * oy
+            ex = E[:-1] * al + E[1:] * ar + hx * (T[:-1] - T[1:])
+            ey = E[:, :-1] * bl + E[:, 1:] * br + hy * (T[:, :-1] - T[:, 1:])
+            n[:, :-1] -= fx
+            n[:, 1:] += fx
+            n[:, :, :-1] -= fy
+            n[:, :, 1:] += fy
+            if self.liq.any():
+                self.mist(up, un, vp, vn, s)
+            E[:-1] -= ex
+            E[1:] += ex
+            E[:, :-1] -= ey
+            E[:, 1:] += ey
+            np.maximum(n, 0, out=n)
+            C = (cvv @ n.reshape(S, -1)).reshape(T.shape)
+            T[:] = np.where(C > 1e-5, E / np.maximum(C, 1e-5), 293)
+            if exm is not None:
+                T[exm] = exT
+            full[idx] = n
         n = full
         S = n.shape[0]
         if self.has & {G_FILTER, G_HEATER, G_COOLER, G_SOURCE, G_VENT}:
@@ -4618,6 +4621,7 @@ class GasSim:
             if 'kind' in d:
                 self.kind[:] = d['kind']
                 self.strength[:] = d['strength']
+                self.strength[np.isin(self.kind, G_TOUGH)] = 0
             else:       # first gas lab version: plain walls + igniters
                 self.kind[:] = np.where(d['solid'], G_WALL, 0)
                 self.kind[d['ign']] = G_IGNITER
@@ -4699,7 +4703,7 @@ class GasMode:
         self.tool = 'BRUSH'
         self.mat = 'WALL'
         self.size = 2
-        self.speed = 4          # sim steps per frame
+        self.speed = 8          # sim steps per frame
         self.paused = False
         self.drag = None
         self.dirty = False
@@ -4941,7 +4945,7 @@ class GasMode:
             elif k == pygame.K_SPACE:
                 self.paused = not self.paused
             elif k == pygame.K_UP:
-                self.speed = min(16, self.speed * 2)
+                self.speed = min(32, self.speed * 2)
             elif k == pygame.K_DOWN:
                 self.speed = max(1, self.speed // 2)
             elif k == pygame.K_o:
@@ -5190,7 +5194,7 @@ class GasMode:
             for _ in range(self.speed):
                 self.sim.step()
                 done += 1
-                if time.perf_counter() - t0 > 0.014:
+                if time.perf_counter() - t0 > 0.022:
                     break       # slow pc: keep the frame rate, run the sim slower
             self.sim.move_debris(done, dt)
             while self.sim.news:
