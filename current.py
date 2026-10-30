@@ -4180,7 +4180,15 @@ G_STARTER_T = 3.0       # starter motor torque
 G_STARTER_MAX = 0.04    # ...stops pushing above this spin (rad / step)
 G_SHAFT_DENS = 0.25     # shaft mass per cell of area (inertia = half m r^2)
 G_SHAFT_DAMP = 0.9995   # bearing friction
-G_MECH = ('SHAFT', 'COG', 'HINGE', 'ROD')
+G_MECH = ('SHAFT', 'COG', 'HINGE', 'ROD', 'CHAIN', 'WHEEL')
+G_SLAB = 32             # the world scrolls in slabs this wide (the sim window is 7 slabs)
+G_WHEEL_T = 1.5         # tire thickness on top of the shaft radius
+G_RB_KINDS = (1, 2, 3)  # wall, steel, glass: plain solids that can spin freely
+G_RB_E = 0.12           # bounce of spinning bodies
+G_RB_MU = 0.6           # friction of spinning bodies
+G_GRIP = 1.6            # tire grip, friction limit = grip x weight
+G_SHAFT_MASS = 0.1      # shaft weight per cell of area when it rides on a physics object
+G_FRAME_DAMP = 0.999
 G_COG_DENS = 0.05       # cogs weigh much less than shafts, so gas can actually turn them
 G_COG_FRICTION = 0.995  # extra bearing friction on cogs
 G_COG_PUSH = 1.0        # pressure on the teeth
@@ -4197,7 +4205,7 @@ G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('I
           ('VALVE', None), ('FILTER', None), ('CHECK VALVE', None), ('HEATER', None),
           ('COOLER', None), ('PUMP', None), ('SOURCE', None), ('VENT', None), ('LINK', None),
           ('RELIEF VALVE', None), ('EXCHANGER', None), ('TURBINE', None), ('URANIUM', None), ('CONTROL ROD', None),
-          ('SHAFT', None), ('COG', None), ('HINGE', None), ('ROD', None),
+          ('SHAFT', None), ('COG', None), ('HINGE', None), ('ROD', None), ('CHAIN', None), ('WHEEL', None),
           ('BLK SENSOR', None), ('TEMP SENSOR', None), ('PRES SENSOR', None), ('HINGE SENSOR', None), ('TIMER', None), ('THRUST PROBE', None),
           ('AIR', G_AIR), ('HYDROGEN', {'H2': 1}),
           ('PROPANE', {'C3H8': 1}), ('METHANE', {'CH4': 1}), ('OXYGEN', {'O2': 1}),
@@ -4237,11 +4245,21 @@ G_SUB = 1           # flow sub-steps per step: gas moves, jets and shocks run th
 G_UMAX = 0.95        # fastest flow on a cell face (cells / step)
 G_COLL = 5.0         # how much fast flow ignores sideways pressure (keeps jets narrow), 0 = off
 G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, pressure drops there (bernoulli)
+G_CATS = [('WALLS', ['WALL', 'STEEL', 'GLASS', 'BLOCK']),
+          ('FLOW', ['VALVE', 'FILTER', 'CHECK VALVE', 'PUMP', 'VENT', 'RELIEF VALVE', 'TURBINE']),
+          ('HEAT & POWER', ['IGNITER', 'HEATER', 'COOLER', 'EXCHANGER', 'SOURCE', 'URANIUM', 'CONTROL ROD']),
+          ('MECHANICS', ['SHAFT', 'COG', 'HINGE', 'ROD', 'CHAIN', 'WHEEL']),
+          ('SENSORS', ['BLK SENSOR', 'TEMP SENSOR', 'PRES SENSOR', 'HINGE SENSOR', 'TIMER', 'LINK', 'THRUST PROBE']),
+          ('GASES', ['AIR', 'HYDROGEN', 'PROPANE', 'METHANE', 'OXYGEN', 'HELIUM', 'CO2', 'NITROGEN', 'STEAM', 'ARGON', 'NEON',
+                     'AMMONIA', 'CO', 'BUTANE', 'ACETYLENE', 'ETHANOL', 'CHLORINE', 'SF6', 'DIESEL', 'WATER']),
+          ('MIXES', ['H2+O2 2:1', 'CH4+O2 1:2', 'C3H8+O2 1:5', 'CO+O2 2:1', 'DIESEL+AIR', 'VACUUM'])]
 G_HELP = ['tab = circuits', 'lmb = tool, rmb = erase', 'wheel = size / scroll', 'e = ignite',
           'space = pause, . = step', 'up/dn = speed', 'o = air / closed / void', 'g = gravity',
           'hold p = valves', 'hold k = starter', 'i = pin readout', 'select + ctrl+c/v',
           'm = symmetry, rmb = erase with tool', 'ctrl+wheel = zoom, mmb = pan', 'v = smooth gas', 't = overlay views',
-          'click block = cycle it', 'a = reset air', 'clr: ctrl+sh+del']
+          'click block = cycle it', 'a = reset air', 'clr: ctrl+sh+del',
+          'select + r = physics (moves, spins)', 'shift+r = no spin, box only', 'del = delete selection', 'ctrl+f = search parts',
+          'left/right = scroll the world', 'wheel tool on a shaft, chain tool joins two']
 
 
 def ramp(v, stops):
@@ -4299,6 +4317,11 @@ class GasSim:
         self.hinges = []                        # dict(kind, ref, ox, oy, cx, cy)
         self.rods = []                          # dict(a, b, L) between two hinges
         self.meshes = []                        # dict(a, b, k): two cogs whose teeth touch turn together
+        self.chains = []                        # dict(a, b, k): two shafts joined by a chain (same direction, radius = ratio)
+        self.wx = 0                             # world column of the left edge of the window (the world scrolls past it)
+        self.slabs = {}                         # world slab index -> what was built there while it is out of the window
+        self.rbs = []                           # free spinning bodies (plain solids), see make_rbody
+        self.frames = []                        # physics objects: dict(x0, y0, w, h, fx, fy, vx, vy), a box of the world that moves as one
         self.cogmask = np.zeros(shape, bool)    # cells covered by cog bases and teeth right now
         self.comp_cache = {}
         self.has = set()
@@ -4342,6 +4365,8 @@ class GasSim:
     def clear(self):
         self.probes = {}
         self.shafts, self.hinges, self.rods, self.meshes = [], [], [], []
+        self.chains, self.frames, self.rbs = [], [], []
+        self.slabs = {}
         self.cogmask[:] = False
         self.sensors = {}
         self.glinks = {}
@@ -4676,6 +4701,8 @@ class GasSim:
         self.T[hit] = 293      # the hole starts empty and gas rushes in
         self.bodies = [b for b in self.bodies
                        if not mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]
+        if self.rbs:
+            self.rbs = [rb for rb in self.rbs if not mask[rb['cx'], rb['cy']].any()]
         if self.shafts or self.hinges:
             self.erase_mech(mask & ~self.ring)
         self.rebuild()
@@ -4753,13 +4780,13 @@ class GasSim:
         return True
 
     # ---- copy / paste of a region (cells, gas, blocks, sensors, links, shafts, hinges, rods)
-    def copy_region(self, x0, y0, x1, y1):
+    def copy_region(self, x0, y0, x1, y1, gas=True):
         x0, x1 = sorted((max(1, x0), min(self.W2 - 2, x1)))
         y0, y1 = sorted((max(1, y0), min(self.H2 - 2, y1)))
         sl = (slice(x0, x1 + 1), slice(y0, y1 + 1))
         inside = lambda x, y: x0 <= x <= x1 and y0 <= y <= y1
         clip = dict(w=x1 - x0 + 1, h=y1 - y0 + 1, x0=x0, y0=y0,
-                    n=self.n[(slice(None),) + sl].copy(), T=self.T[sl].copy(), kind=self.kind[sl].copy(),
+                    n=self.n[(slice(None),) + sl].copy() if gas else None, T=self.T[sl].copy() if gas else None, kind=self.kind[sl].copy(),
                     strength=self.strength[sl].copy(), aux=self.aux[sl].copy(), link=self.link[sl].copy())
         clip['sensors'] = {k: dict(v) for k, v in self.sensors.items() if inside(*k)}
         clip['glinks'] = {k: dict(v) for k, v in self.glinks.items() if inside(*k)}
@@ -4771,6 +4798,7 @@ class GasSim:
         clip['hinges'] = hs
         clip['rods'] = [r for r in self.rods if any(r['a'] is h for h in hs) and any(r['b'] is h for h in hs)]
         clip['meshes'] = [m for m in self.meshes if any(m['a'] is q for q in shafts) and any(m['b'] is q for q in shafts)]
+        clip['chains'] = [m for m in self.chains if any(m['a'] is q for q in shafts) and any(m['b'] is q for q in shafts)]
         return clip
 
     def paste(self, clip, ox, oy):
@@ -4785,8 +4813,9 @@ class GasSim:
         self.erase(mask)
         for b in [b for b in self.bodies if mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]:
             self.bodies.remove(b)
-        self.n[(slice(None),) + sl] = clip['n']
-        self.T[sl] = clip['T']
+        if clip['n'] is not None:
+            self.n[(slice(None),) + sl] = clip['n']
+            self.T[sl] = clip['T']
         self.kind[sl] = clip['kind']
         self.strength[sl] = clip['strength']
         self.aux[sl] = clip['aux']
@@ -4841,10 +4870,13 @@ class GasSim:
             self.rods.append(dict(a=newh[id(r['a'])], b=newh[id(r['b'])], L=r['L']))
         for m in clip['meshes']:
             self.meshes.append(dict(a=news[id(m['a'])], b=news[id(m['b'])], k=m['k']))
+        for m in clip.get('chains', []):
+            self.chains.append(dict(a=news[id(m['a'])], b=news[id(m['b'])], k=m['k']))
         self.comp_cache = {}
         self.rebuild()
         self.update_valves()
-        self.active |= set(np.nonzero(clip['n'].reshape(clip['n'].shape[0], -1).max(1) > 1e-7)[0].tolist())
+        if clip['n'] is not None:
+            self.active |= set(np.nonzero(clip['n'].reshape(clip['n'].shape[0], -1).max(1) > 1e-7)[0].tolist())
         return True
 
     # ---- crankshafts: shafts spin, hinges sit on blocks / shafts, rods hold two hinges a fixed distance apart
@@ -4880,6 +4912,8 @@ class GasSim:
         for sh in cogs:
             x0, y0, m = self.cog_cells(sh)
             cm[x0:x0 + m.shape[0], y0:y0 + m.shape[1]] |= m
+        for rb in self.rbs:
+            cm[rb['cx'], rb['cy']] = True
         if (cm == self.cogmask).all():
             return
         new = cm & ~self.cogmask & ~self.solid
@@ -4961,6 +4995,628 @@ class GasSim:
 
     def pitch(self, sh):
         return sh['R'] + sh['tl'] / 2
+
+    def cpitch(self, sh):
+        return sh['R'] + sh.get('tl', 0) / 2
+
+    def add_chain(self, a, b):
+        if a is b:
+            return 'pick two different shafts'
+        for m in self.chains:
+            if (m['a'] is a and m['b'] is b) or (m['a'] is b and m['b'] is a):
+                self.chains.remove(m)
+                return 'chain removed'
+        self.chains.append(dict(a=a, b=b, k=a['th'] * self.cpitch(a) - b['th'] * self.cpitch(b)))
+        ra, rb = self.cpitch(a), self.cpitch(b)
+        return f'chain on, ratio {ra / rb:.2f} : 1'
+
+    def near_shaft(self, fx, fy):
+        best, bd = None, 1e9
+        for sh in self.shafts:
+            d = math.hypot(sh['x'] - fx, sh['y'] - fy)
+            if d <= sh['R'] + sh.get('tl', 0) and d < bd:
+                best, bd = sh, d
+        return best
+
+    def toggle_wheel(self, fx, fy):
+        sh = self.near_shaft(fx, fy)
+        if sh is None:
+            return 'wheels only go on shafts'
+        if sh.get('teeth'):
+            return 'cogs cannot be wheels, use a plain shaft'
+        sh['wheel'] = not sh.get('wheel')
+        return 'wheel on' if sh['wheel'] else 'wheel off'
+
+    # ---- the world is wider than the window: it scrolls past in slabs, and what was built is kept in storage
+    def pack_slab(self, lo, hi):
+        k = (self.wx + lo - 1) // G_SLAB
+        import copy
+        clip = copy.deepcopy(self.copy_region(lo, 1, hi, self.H2 - 2, gas=False))      # a snapshot, not the live parts
+        if (clip['kind'] > 0).any() or clip['bodies'] or clip['shafts'] or clip['sensors']:
+            self.slabs[k] = clip
+        else:
+            self.slabs.pop(k, None)
+
+    def scroll_world(self, d):
+        # d = +1: the window moves right along the world, -1: left. returns an error text or None
+        amt = G_SLAB * d
+        W2, H2 = self.W2, self.H2
+        gw = W2 - 2
+        lo = 1 if d > 0 else gw - G_SLAB + 1
+        hi = lo + G_SLAB - 1
+        for f in self.frames:
+            if not (f['x0'] + f['w'] - 1 < lo or f['x0'] > hi):
+                return 'a physics object is in the way, move it first'
+        for rb in self.rbs:
+            if ((rb['cx'] >= lo) & (rb['cx'] <= hi)).any():
+                return 'a spinning body is in the way, move it first'
+        self.pack_slab(lo, hi)
+        for arr in (self.T, self.kind, self.strength, self.valve_open, self.relief_open, self.liq, self.phi,
+                    self.decay, self.scram, self.aux, self.link, self.spark_t, self.cogmask, self.u, self.v):
+            arr[:] = np.roll(arr, -amt, axis=0)
+        self.n[:] = np.roll(self.n, -amt, axis=1)
+        e0 = gw - G_SLAB + 1 if d > 0 else 1         # the slab that comes in
+        cols = slice(e0, e0 + G_SLAB)
+        for c_ in (slice(0, 1), slice(W2 - 1, W2), cols):
+            self.kind[c_] = 0
+            self.strength[c_] = 0
+            self.aux[c_] = 0
+            self.link[c_] = -1
+            self.valve_open[c_] = False
+            self.relief_open[c_] = False
+            self.scram[c_] = False
+            self.cogmask[c_] = False
+            for arr in (self.liq, self.phi, self.decay, self.spark_t, self.u, self.v):
+                arr[c_] = 0
+            self.T[c_] = 293
+            self.n[:, c_] = 0 if self.void else self.amb_field
+        self.wx += amt
+        # everything that lives in the window moves with it
+        for b in self.bodies:
+            b['x'] -= amt
+        for q in self.shafts:
+            q['x'] -= amt
+        for f in self.frames:
+            f['x0'] -= amt
+        for rb in self.rbs:
+            rb['x'] -= amt
+            rb['cx'] = rb['cx'] - amt
+        for dbr in self.debris:
+            dbr[0] -= amt
+        self.sensors = {(k[0] - amt, k[1]): v for k, v in self.sensors.items()}
+        self.probes = {(k[0] - amt, k[1]): v for k, v in self.probes.items()}
+        gl = {}
+        for k, v in self.glinks.items():
+            t = v['tgt']
+            if t:
+                v['tgt'] = (t[0] - amt, t[1])
+            gl[(k[0] - amt, k[1])] = v
+        self.glinks = gl
+        self.link[self.link >= 0] -= amt * H2
+        gone = len([b for b in self.bodies if b['x'] < 1 or b['x'] + b['w'] > W2 - 1]) \
+            + len([q for q in self.shafts if not (1 <= q['x'] < W2 - 1)])
+        self.bodies = [b for b in self.bodies if not (b['x'] < 1 or b['x'] + b['w'] > W2 - 1)]
+        self.shafts = [q for q in self.shafts if 1 <= q['x'] < W2 - 1]
+        self.sensors = {k: v for k, v in self.sensors.items() if 1 <= k[0] < W2 - 1}
+        self.probes = {k: v for k, v in self.probes.items() if 1 <= k[0] < W2 - 1}
+        self.glinks = {k: v for k, v in self.glinks.items() if 1 <= k[0] < W2 - 1 and (v['tgt'] is None or 1 <= v['tgt'][0] < W2 - 1)}
+        valid = [x * H2 + y for (x, y) in self.sensors]
+        self.link[(self.link >= 0) & ~np.isin(self.link, valid)] = -1
+        self.prune_mech()
+        k = (self.wx + e0 - 1) // G_SLAB
+        clip = self.slabs.get(k)
+        self.comp_cache = {}
+        self.cogmask[:] = False
+        self.rebuild()
+        if clip is not None:
+            self.paste(clip, e0, 1)
+        self.update_cogs()
+        self.rebuild()
+        self.u[:] = np.clip(self.u, -G_UMAX, G_UMAX)
+        return None
+
+    def follow_frame(self):
+        # a driving physics object pulls the window along with it
+        for f in self.frames:
+            if not any(q.get('wheel') for q in self.frame_shafts(f)):
+                continue
+            cx = f['x0'] + f['w'] / 2.0
+            if cx > self.W2 - 44:
+                return 1 if self.scroll_world(1) is None else 0
+            if cx < 44:
+                return -1 if self.scroll_world(-1) is None else 0
+        return 0
+
+    def save_world(self, path):
+        import pickle
+        try:
+            if self.slabs:
+                tmp = path + '.tmp'
+                with open(tmp, 'wb') as f_:
+                    pickle.dump(self.slabs, f_, protocol=4)
+                os.replace(tmp, path)
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def load_world(self, path):
+        import pickle
+        self.slabs = {}
+        try:
+            if os.path.exists(path):
+                with open(path, 'rb') as f_:
+                    d_ = pickle.load(f_)
+                if isinstance(d_, dict):
+                    self.slabs = d_
+        except Exception:
+            self.slabs = {}
+
+    # ---- spinning bodies: a pile of plain solid cells that turns into a free rigid body (it can rotate)
+    def make_rbody(self, x0, y0, x1, y1):
+        # None = this selection can't be a free body (it has parts / mechanisms in it)
+        x0, x1 = sorted((max(1, x0), min(self.W2 - 2, x1)))
+        y0, y1 = sorted((max(1, y0), min(self.H2 - 2, y1)))
+        sl = (slice(x0, x1 + 1), slice(y0, y1 + 1))
+        ins = lambda x, y: x0 <= x <= x1 and y0 <= y <= y1
+        if any(x0 <= q['x'] <= x1 + 1 and y0 <= q['y'] <= y1 + 1 for q in self.shafts):
+            return None
+        if any(ins(*k) for k in list(self.sensors) + list(self.glinks) + list(self.probes)):
+            return None
+        kinds = self.kind[sl]
+        if ((kinds > 0) & ~np.isin(kinds, G_RB_KINDS)).any():
+            return None
+        bods = []
+        for b in self.bodies:
+            inx = not (b['x'] + b['w'] - 1 < x0 or b['x'] > x1 or b['y'] + b['h'] - 1 < y0 or b['y'] > y1)
+            if inx:
+                if not (ins(b['x'], b['y']) and ins(b['x'] + b['w'] - 1, b['y'] + b['h'] - 1)):
+                    return None
+                bods.append(b)
+        cells = []                      # (x, y, kind, strength)
+        xs, ys = np.nonzero(kinds > 0)
+        for a_, b_ in zip(xs.tolist(), ys.tolist()):
+            cells.append((x0 + a_, y0 + b_, int(kinds[a_, b_]), float(self.strength[x0 + a_, y0 + b_])))
+        for b in bods:
+            for cx in range(b['x'], b['x'] + b['w']):
+                for cy in range(b['y'], b['y'] + b['h']):
+                    cells.append((cx, cy, 255, 0.0))
+        if not cells:
+            return None
+        for x_, y_, k_, st_ in cells:
+            if k_ != 255:
+                self.kind[x_, y_] = 0
+                self.strength[x_, y_] = 0
+        for b in bods:
+            self.bodies.remove(b)
+        self.prune_mech()
+        gx0 = min(c[0] for c in cells)
+        gy0 = min(c[1] for c in cells)
+        gw = max(c[0] for c in cells) - gx0 + 1
+        gh = max(c[1] for c in cells) - gy0 + 1
+        grid = np.full((gw, gh), -1, np.int32)
+        for i, c in enumerate(cells):
+            grid[c[0] - gx0, c[1] - gy0] = i
+        N = len(cells)
+        gi = np.array([c[0] - gx0 for c in cells], np.float64) + 0.5
+        gj = np.array([c[1] - gy0 for c in cells], np.float64) + 0.5
+        cmx, cmy = float(gi.mean()), float(gj.mean())
+        rr = (gi - cmx) ** 2 + (gj - cmy) ** 2
+        rb = dict(gw=gw, gh=gh, grid=grid, kind=np.array([c[2] for c in cells], np.uint8),
+                  strength=np.array([c[3] for c in cells], np.float32),
+                  cmx=cmx, cmy=cmy, x=gx0 + cmx, y=gy0 + cmy, th=0.0, vx=0.0, vy=0.0, om=0.0,
+                  m=float(N), I=float(rr.sum() + N / 6.0), r=float(math.sqrt(rr.max()) + 1.0))
+        rb['col'] = np.array([G_BLOCK_COLOR if c[2] == 255 else G_SOLIDS[c[2]][2] for c in cells], np.uint8)
+        self.rb_pose(rb)
+        self.rbs.append(rb)
+        self.rebuild()
+        return rb
+
+    def rb_raster(self, rb, x, y, th):
+        r = rb['r'] + 1.5
+        ix0, ix1 = max(0, int(math.floor(x - r))), min(self.W2 - 1, int(math.ceil(x + r)))
+        iy0, iy1 = max(0, int(math.floor(y - r))), min(self.H2 - 1, int(math.ceil(y + r)))
+        if ix1 < ix0 or iy1 < iy0:
+            e = np.zeros(0, np.int64)
+            return e, e, e
+        X = (np.arange(ix0, ix1 + 1)[:, None] + 0.5 - x)
+        Y = (np.arange(iy0, iy1 + 1)[None, :] + 0.5 - y)
+        c, s_ = math.cos(th), math.sin(th)
+        gi = np.floor(c * X + s_ * Y + rb['cmx']).astype(np.int64)
+        gj = np.floor(-s_ * X + c * Y + rb['cmy']).astype(np.int64)
+        ok = (gi >= 0) & (gi < rb['gw']) & (gj >= 0) & (gj < rb['gh'])
+        idx = np.full(gi.shape, -1, np.int64)
+        idx[ok] = rb['grid'][gi[ok], gj[ok]]
+        m = idx >= 0
+        xs, ys = np.nonzero(m)
+        return xs + ix0, ys + iy0, idx[m]
+
+    def rb_pose(self, rb):
+        rb['cx'], rb['cy'], rb['ci'] = self.rb_raster(rb, rb['x'], rb['y'], rb['th'])
+
+    def rb_foreign(self, rb):
+        fm = self.solid | self.ring
+        fm[rb['cx'], rb['cy']] = False
+        for f in self.frames:
+            fm[f['x0']:f['x0'] + f['w'], f['y0']:f['y0'] + f['h']] = True
+        return fm
+
+    def move_rbodies(self, p):
+        for rb in list(self.rbs):
+            cx, cy = rb['cx'], rb['cy']
+            if len(cx) == 0:
+                self.rbs.remove(rb)
+                continue
+            Fx = Fy = tau = 0.0
+            for dx, dy in G_DIRS:
+                nx, ny = cx + dx, cy + dy
+                g = ~self.solid[nx, ny]
+                pp = p[nx, ny] * g
+                fx_, fy_ = -dx * pp, -dy * pp
+                Fx += float(fx_.sum())
+                Fy += float(fy_.sum())
+                rx = cx + 0.5 + 0.5 * dx - rb['x']
+                ry = cy + 0.5 + 0.5 * dy - rb['y']
+                tau += float((rx * fy_ - ry * fx_).sum())
+            m, I = rb['m'], rb['I']
+            rb['vx'] = (rb['vx'] + Fx * G_PUSH / m) * 0.999
+            rb['vy'] = (rb['vy'] + Fy * G_PUSH / m + (G_BODY_G if self.gravity else 0)) * 0.999
+            rb['om'] = (rb['om'] + tau * G_PUSH / I) * 0.998
+            vmax = 0.45
+            rb['vx'] = max(-vmax, min(vmax, rb['vx']))
+            rb['vy'] = max(-vmax, min(vmax, rb['vy']))
+            wmax = vmax / rb['r']
+            rb['om'] = max(-wmax, min(wmax, rb['om']))
+            self.rb_move(rb)
+        self.update_cogs()
+
+    def rb_move(self, rb):
+        fm = self.rb_foreign(rb)
+        x, y, th = rb['x'] + rb['vx'], rb['y'] + rb['vy'], rb['th'] + rb['om']
+        old = (rb['x'], rb['y'], rb['th'])
+        m, I = rb['m'], rb['I']
+        ok = False
+        for _ in range(4):
+            wx, wy, _i = self.rb_raster(rb, x, y, th)
+            hit = fm[wx, wy]
+            if not hit.any():
+                ok = True
+                break
+            hx, hy = wx[hit], wy[hit]
+            Nx = Ny = 0.0
+            for ddx in range(-2, 3):
+                for ddy in range(-2, 3):
+                    if ddx or ddy:
+                        v = fm[np.clip(hx + ddx, 0, self.W2 - 1), np.clip(hy + ddy, 0, self.H2 - 1)]
+                        Nx -= ddx * float(v.sum())
+                        Ny -= ddy * float(v.sum())
+            L = math.hypot(Nx, Ny)
+            if L < 1e-6:
+                Nx, Ny = x - float(hx.mean()) - 0.5, y - float(hy.mean()) - 0.5
+                L = math.hypot(Nx, Ny) or 1.0
+            Nx, Ny = Nx / L, Ny / L
+            for _k in range(10):
+                x += Nx * 0.2
+                y += Ny * 0.2
+                wx, wy, _i = self.rb_raster(rb, x, y, th)
+                if not fm[wx, wy].any():
+                    break
+            rx, ry = float(hx.mean()) + 0.5 - x, float(hy.mean()) + 0.5 - y
+            vcx, vcy = rb['vx'] - rb['om'] * ry, rb['vy'] + rb['om'] * rx
+            vn = vcx * Nx + vcy * Ny
+            if vn < 0:
+                rn = rx * Ny - ry * Nx
+                e = 0.0 if -vn < 0.03 else G_RB_E
+                j = -(1 + e) * vn / (1.0 / m + rn * rn / I)
+                rb['vx'] += j * Nx / m
+                rb['vy'] += j * Ny / m
+                rb['om'] += rn * j / I
+                tx, ty = -Ny, Nx
+                vt = vcx * tx + vcy * ty
+                rt = rx * ty - ry * tx
+                jt = -vt / (1.0 / m + rt * rt / I)
+                jt = max(-G_RB_MU * j, min(G_RB_MU * j, jt))
+                rb['vx'] += jt * tx / m
+                rb['vy'] += jt * ty / m
+                rb['om'] += rt * jt / I
+        if not ok:
+            x, y, th = old
+            rb['vx'] *= 0.5
+            rb['vy'] *= 0.5
+            rb['om'] *= 0.5
+        rb['x'], rb['y'], rb['th'] = x, y, th
+        self.rb_pose(rb)
+
+    def rb_rows(self, k, rb):
+        ii, jj = np.nonzero(rb['grid'] >= 0)
+        idx = rb['grid'][ii, jj]
+        return [[k, int(a), int(b), int(rb['kind'][i]), int(rb['strength'][i])] for a, b, i in zip(ii.tolist(), jj.tolist(), idx.tolist())]
+
+    def load_rbs(self, meta, cells):
+        for k, row in enumerate(meta.tolist()):
+            x, y, th, vx, vy, om, cmx, cmy, gw, gh = row
+            gw, gh = int(gw), int(gh)
+            mine = cells[cells[:, 0] == k]
+            grid = np.full((gw, gh), -1, np.int32)
+            kinds, stre, cols = [], [], []
+            for i, (_k, gi, gj, kd, st) in enumerate(mine.tolist()):
+                grid[gi, gj] = i
+                kinds.append(kd)
+                stre.append(st)
+                cols.append(G_BLOCK_COLOR if kd == 255 else G_SOLIDS[kd][2])
+            N = max(1, len(kinds))
+            ii, jj = np.nonzero(grid >= 0)
+            rr = (ii + 0.5 - cmx) ** 2 + (jj + 0.5 - cmy) ** 2
+            rb = dict(gw=gw, gh=gh, grid=grid, kind=np.array(kinds, np.uint8), strength=np.array(stre, np.float32),
+                      col=np.array(cols, np.uint8), cmx=cmx, cmy=cmy, x=x, y=y, th=th, vx=vx, vy=vy, om=om,
+                      m=float(N), I=float(rr.sum() + N / 6.0), r=float(math.sqrt(rr.max() if len(rr) else 1.0) + 1.0))
+            self.rb_pose(rb)
+            self.rbs.append(rb)
+
+    def freeze_rbody(self, rb):
+        # turn it back into ordinary static cells where it is now
+        for x, y, i in zip(rb['cx'].tolist(), rb['cy'].tolist(), rb['ci'].tolist()):
+            k = int(rb['kind'][i])
+            self.kind[x, y] = G_WALL if k == 255 else k
+            self.strength[x, y] = rb['strength'][i]
+        self.rbs.remove(rb)
+        self.cogmask[:] = False
+        self.update_cogs()
+        self.rebuild()
+
+    def release_rbodies(self, x0, y0, x1, y1):
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        gone = [rb for rb in self.rbs
+                if ((rb['cx'] >= x0) & (rb['cx'] <= x1) & (rb['cy'] >= y0) & (rb['cy'] <= y1)).any()]
+        for rb in gone:
+            self.freeze_rbody(rb)
+        return len(gone)
+
+    # ---- physics objects: a box of the world (walls, gas inside, blocks, shafts, rods) that moves as one piece
+    def frame_at(self, x, y, pad=0.01):
+        for f in self.frames:
+            if f['x0'] - pad <= x <= f['x0'] + f['w'] + pad and f['y0'] - pad <= y <= f['y0'] + f['h'] + pad:
+                return f
+        return None
+
+    def foff(self, x, y):
+        # how far (in cells) the physics object at this spot is shifted from its whole-cell position
+        f = self.frame_at(x, y)
+        return (f['fx'], f['fy']) if f else (0.0, 0.0)
+
+    def hoff(self, h):
+        r = h['ref']
+        if h['kind'] == 'body':
+            return self.foff(r['x'] + r['w'] / 2.0, r['y'] + r['h'] / 2.0)
+        return self.foff(r['x'], r['y'])
+
+    def make_frame(self, x0, y0, x1, y1):
+        x0, x1 = sorted((max(1, x0), min(self.W2 - 2, x1)))
+        y0, y1 = sorted((max(1, y0), min(self.H2 - 2, y1)))
+        w, h = x1 - x0 + 1, y1 - y0 + 1
+        for f in self.frames:
+            if not (x1 < f['x0'] or x0 >= f['x0'] + f['w'] or y1 < f['y0'] or y0 >= f['y0'] + f['h']):
+                return 'that overlaps another physics object'
+        if any(((rb['cx'] >= x0) & (rb['cx'] <= x1) & (rb['cy'] >= y0) & (rb['cy'] <= y1)).any() for rb in self.rbs):
+            return 'that overlaps a spinning body'
+        sl = (slice(x0, x1 + 1), slice(y0, y1 + 1))
+        has_sh = any(x0 <= q['x'] <= x1 + 1 and y0 <= q['y'] <= y1 + 1 for q in self.shafts)
+        if not (self.solid[sl].any() or has_sh):
+            return 'nothing solid in the selection'
+        for b in self.bodies:
+            inx = not (b['x'] + b['w'] - 1 < x0 or b['x'] > x1 or b['y'] + b['h'] - 1 < y0 or b['y'] > y1)
+            full = x0 <= b['x'] and b['x'] + b['w'] - 1 <= x1 and y0 <= b['y'] and b['y'] + b['h'] - 1 <= y1
+            if inx and not full:
+                return 'the selection cuts a block in half'
+        # shrink the box to what is actually in it, so empty air below the wheels doesn't hold the car off the ground
+        occ = self.solid[sl] | (self.kind[sl] > 0)
+        xs, ys = np.nonzero(occ)
+        lo_x, hi_x, lo_y, hi_y = (xs.min(), xs.max(), ys.min(), ys.max()) if len(xs) else (w, -1, h, -1)
+        for q in self.shafts:
+            if x0 <= q['x'] <= x1 + 1 and y0 <= q['y'] <= y1 + 1:
+                lo_x, hi_x = min(lo_x, int(q['x']) - x0), max(hi_x, int(q['x']) - x0)
+                lo_y, hi_y = min(lo_y, int(q['y']) - y0), max(hi_y, int(q['y']) - y0)
+        x0, x1, y0, y1 = x0 + lo_x, x0 + hi_x, y0 + lo_y, y0 + hi_y
+        w, h = x1 - x0 + 1, y1 - y0 + 1
+        self.frames.append(dict(x0=int(x0), y0=int(y0), w=int(w), h=int(h), fx=0.0, fy=0.0, vx=0.0, vy=0.0))
+        return None
+
+    def release_frames(self, x0, y0, x1, y1):
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        gone = [f for f in self.frames
+                if not (x1 < f['x0'] or x0 >= f['x0'] + f['w'] or y1 < f['y0'] or y0 >= f['y0'] + f['h'])]
+        for f in gone:
+            self.frames.remove(f)
+        return len(gone)
+
+    def in_frame(self, f, x, y):
+        return f['x0'] <= x < f['x0'] + f['w'] and f['y0'] <= y < f['y0'] + f['h']
+
+    def frame_shafts(self, f):
+        return [sh for sh in self.shafts if self.in_frame(f, sh['x'], sh['y'])]
+
+    def frame_mass(self, f):
+        sl = (slice(f['x0'], f['x0'] + f['w']), slice(f['y0'], f['y0'] + f['h']))
+        m = float(np.count_nonzero(self.solid[sl])) * G_BODY_DENSITY
+        for sh in self.frame_shafts(f):
+            m += G_SHAFT_MASS * math.pi * sh['R'] ** 2
+        return max(m, 4.0)
+
+    def frame_cogs(self, f):
+        cm = np.zeros(self.kind.shape, bool)
+        for sh in self.frame_shafts(f):
+            if sh.get('teeth'):
+                x0, y0, m = self.cog_cells(sh)
+                cm[x0:x0 + m.shape[0], y0:y0 + m.shape[1]] |= m
+        return cm
+
+    def rim_points(self, sh, n=16, lower=False):
+        Rw = sh['R'] + G_WHEEL_T
+        out = []
+        for k in range(n):
+            a = 2 * math.pi * k / n
+            if lower and math.sin(a) < 0.3:
+                continue
+            out.append((sh['x'] + Rw * math.cos(a), sh['y'] + Rw * math.sin(a)))
+        return out
+
+    def foreign_cell(self, f, cx, cy, own):
+        # is this cell something the physics object can't pass through?
+        if not (0 <= cx < self.W2 and 0 <= cy < self.H2):
+            return True
+        if self.in_frame(f, cx, cy):
+            return False
+        if self.ring[cx, cy] or self.kind[cx, cy] > 0:
+            return True
+        if (self.solid[cx, cy] or self.cogmask[cx, cy]) and not own[cx, cy]:
+            return True
+        return any(o is not f and self.in_frame(o, cx, cy) for o in self.frames)
+
+    def frame_blocked(self, f, dx, dy, own=None):
+        x0, y0, w, h = f['x0'], f['y0'], f['w'], f['h']
+        for o in self.frames:
+            if o is not f and not (x0 + dx + w <= o['x0'] or x0 + dx >= o['x0'] + o['w']
+                                   or y0 + dy + h <= o['y0'] or y0 + dy >= o['y0'] + o['h']):
+                return True
+        if dx:
+            sx = x0 + w if dx > 0 else x0 - 1
+            sl = (slice(sx, sx + 1), slice(y0, y0 + h))
+        else:
+            sy = y0 + h if dy > 0 else y0 - 1
+            sl = (slice(x0, x0 + w), slice(sy, sy + 1))
+        if own is None:
+            own = self.frame_cogs(f)
+        edge = self.solid[sl] | (self.kind[sl] > 0) | self.ring[sl]
+        if edge.any() and (edge & ~own[sl]).any():
+            return True
+        for sh in self.frame_shafts(f):
+            if sh.get('wheel'):
+                for px, py in self.rim_points(sh):
+                    if self.foreign_cell(f, int(math.floor(px)) + dx, int(math.floor(py)) + dy, own):
+                        return True
+        return False
+
+    def wheel_grounded(self, f, sh, own):
+        for px, py in self.rim_points(sh, 16, True):
+            if self.foreign_cell(f, int(math.floor(px)), int(math.floor(py)) + 1, own):
+                return True
+        return False
+
+    def roll_region(self, f, dx, dy):
+        # shift the whole box one cell: everything in it moves, the air in the way flows round to the other side
+        x0, y0, w, h = f['x0'], f['y0'], f['w'], f['h']
+        x1, y1 = x0 + w - 1, y0 + h - 1
+        if dx:
+            ex0, ex1, ey0, ey1 = (x0, x1 + 1, y0, y1) if dx > 0 else (x0 - 1, x1, y0, y1)
+            ax, sh_ = 0, dx
+        else:
+            ex0, ex1, ey0, ey1 = (x0, x1, y0, y1 + 1) if dy > 0 else (x0, x1, y0 - 1, y1)
+            ax, sh_ = 1, dy
+        sl = (slice(ex0, ex1 + 1), slice(ey0, ey1 + 1))
+        for arr in (self.T, self.kind, self.strength, self.valve_open, self.relief_open, self.liq, self.phi,
+                    self.decay, self.scram, self.aux, self.link, self.spark_t, self.cogmask):
+            arr[sl] = np.roll(arr[sl], sh_, axis=ax)
+        ns = (slice(None),) + sl
+        self.n[ns] = np.roll(self.n[ns], sh_, axis=ax + 1)
+        su = (slice(ex0, ex1), slice(ey0, ey1 + 1))
+        sv = (slice(ex0, ex1 + 1), slice(ey0, ey1))
+        self.u[su] = np.roll(self.u[su], sh_, axis=ax)
+        self.v[sv] = np.roll(self.v[sv], sh_, axis=ax)
+        # everything that lives in the box follows it
+        for b in self.bodies:
+            if self.in_frame(f, b['x'], b['y']) and self.in_frame(f, b['x'] + b['w'] - 1, b['y'] + b['h'] - 1):
+                b['x'] += dx
+                b['y'] += dy
+        for q in self.shafts:
+            if self.in_frame(f, q['x'], q['y']):
+                q['x'] += dx
+                q['y'] += dy
+        moved = {}
+        for key in [k for k in self.sensors if self.in_frame(f, *k)]:
+            moved[key] = (key[0] + dx, key[1] + dy)
+        if moved:
+            old = dict(self.sensors)
+            for k in moved:
+                del self.sensors[k]
+            for k, nk in moved.items():
+                self.sensors[nk] = old[k]
+            src = self.link.copy()
+            for k, nk in moved.items():
+                self.link[src == k[0] * self.H2 + k[1]] = nk[0] * self.H2 + nk[1]
+        if self.glinks:
+            gl = {}
+            for k, v in self.glinks.items():
+                nk = (k[0] + dx, k[1] + dy) if self.in_frame(f, *k) else k
+                t = v['tgt']
+                if t and self.in_frame(f, *t):
+                    v['tgt'] = (t[0] + dx, t[1] + dy)
+                gl[nk] = v
+            self.glinks = gl
+        if self.probes:
+            self.probes = {((k[0] + dx, k[1] + dy) if self.in_frame(f, *k) else k): v for k, v in self.probes.items()}
+        f['x0'] += dx
+        f['y0'] += dy
+        self.near_wall = None
+        self.comp_cache = {}
+        self.rebuild()
+
+    def move_frames(self, p):
+        for f in self.frames:
+            x0, y0, w, h = f['x0'], f['y0'], f['w'], f['h']
+            sl = (slice(x0 - 1, x0 + w + 1), slice(y0 - 1, y0 + h + 1))
+            sol = self.solid[sl]
+            pe = p[sl]
+            gas = ~sol
+            inner = sol[1:-1, 1:-1]
+            fxp = float((inner * (pe[:-2, 1:-1] * gas[:-2, 1:-1] - pe[2:, 1:-1] * gas[2:, 1:-1])).sum())
+            fyp = float((inner * (pe[1:-1, :-2] * gas[1:-1, :-2] - pe[1:-1, 2:] * gas[1:-1, 2:])).sum())
+            m = self.frame_mass(f)
+            f['vx'] = (f['vx'] + fxp * G_PUSH / m) * G_FRAME_DAMP
+            f['vy'] = (f['vy'] + fyp * G_PUSH / m + (G_BODY_G if self.gravity else 0)) * G_FRAME_DAMP
+            own = self.frame_cogs(f)
+            wheels = [sh for sh in self.frame_shafts(f) if sh.get('wheel')]
+            grounded = False
+            if wheels:
+                gr = [sh for sh in wheels if self.wheel_grounded(f, sh, own)]
+                grounded = bool(gr)
+                for sh in gr:
+                    Rw = sh['R'] + G_WHEEL_T
+                    I = self.shaft_inertia(sh)
+                    slip = f['vx'] - sh['om'] * Rw
+                    j = -slip / (1.0 / m + Rw * Rw / I)
+                    jm = G_GRIP * m * G_BODY_G / len(gr)
+                    j = max(-jm, min(jm, j))
+                    f['vx'] += j / m
+                    sh['om'] -= Rw * j / I
+            f['vx'] = max(-0.9, min(0.9, f['vx']))
+            f['vy'] = max(-0.9, min(0.9, f['vy']))
+            for axis in (0, 1):
+                vk, fk = ('vx', 'fx') if axis == 0 else ('vy', 'fy')
+                v = f[vk]
+                if v == 0:
+                    continue
+                d = 1 if v > 0 else -1
+                ddx, ddy = (d, 0) if axis == 0 else (0, d)
+
+                def bonk():
+                    f[vk] = 0.0 if abs(f[vk]) < 0.02 else f[vk] * -0.2
+                    if f[fk] * d > 0:
+                        f[fk] = 0.0
+                    if axis == 1 and d > 0 and not grounded:
+                        f['vx'] *= 0.92         # sliding on the floor
+                if self.frame_blocked(f, ddx, ddy, own):
+                    bonk()
+                    continue
+                f[fk] += v
+                while abs(f[fk]) >= 1:
+                    if self.frame_blocked(f, ddx, ddy, own):
+                        bonk()
+                        break
+                    self.roll_region(f, ddx, ddy)
+                    f[fk] -= d
+                    own = self.frame_cogs(f)
 
     def add_cog(self, x, y, R, tl, n):
         for sh in self.shafts:
@@ -5063,6 +5719,7 @@ class GasSim:
         ids = {id(h) for h in self.hinges}
         self.rods = [r for r in self.rods if id(r['a']) in ids and id(r['b']) in ids]
         self.meshes = [m for m in self.meshes if id(m['a']) in live_s and id(m['b']) in live_s]
+        self.chains = [m for m in self.chains if id(m['a']) in live_s and id(m['b']) in live_s]
 
     def erase_mech(self, mask):
         keep = []
@@ -5088,6 +5745,14 @@ class GasSim:
     def solve_rods(self):
         # velocity-level distance constraints (impulses), with a little push-back so errors don't pile up
         for _ in range(6):
+            for m in self.chains:
+                a, b = m['a'], m['b']
+                ra, rb = self.cpitch(a), self.cpitch(b)
+                Ia, Ib = self.shaft_inertia(a), self.shaft_inertia(b)
+                err = a['th'] * ra - b['th'] * rb - m['k']
+                lam = -(ra * a['om'] - rb * b['om'] + 0.1 * err) / (ra * ra / Ia + rb * rb / Ib)
+                a['om'] += lam * ra / Ia
+                b['om'] -= lam * rb / Ib
             for m in self.meshes:
                 a, b = m['a'], m['b']
                 ra, rb = self.pitch(a), self.pitch(b)
@@ -5146,7 +5811,7 @@ class GasSim:
             b['vy'] = max(-0.9, min(0.9, b['vy']))
         if any(sh.get('teeth') for sh in self.shafts):
             self.cog_torque(p)
-        if self.rods or self.meshes:
+        if self.rods or self.meshes or self.chains:
             self.solve_rods()
             for b in self.bodies:
                 b['vx'] = max(-0.9, min(0.9, b['vx']))
@@ -5557,11 +6222,15 @@ class GasSim:
             n[:, ring] = 0
         self.age += 1
         # blocks and cracking walls work on the whole grid before the gas moves
-        if self.bodies or self.shafts or self.cogmask.any() or self.sensors or G_RELIEF in self.has \
+        if self.bodies or self.shafts or self.frames or self.rbs or self.cogmask.any() or self.sensors or G_RELIEF in self.has \
                 or (self.age % 4 == 0 and self.strength.any()):
             p0 = n.sum(0) * T / 293
             if self.bodies or self.shafts:
                 self.move_bodies(p0)
+            if self.frames:
+                self.move_frames(p0)
+            if self.rbs or self.cogmask.any():
+                self.move_rbodies(p0)
             if self.sensors:
                 self.sense(p0)
             if self.age % 4 == 0:
@@ -5813,6 +6482,8 @@ class GasSim:
                 hot = np.clip((self.T[1:-1, 1:-1][m] - 600) / 1500, 0, 1)[:, None]
                 col[m] = col[m] * (1 - hot) + np.array([255, 120, 40], np.float32) * hot
         col[self.cogmask[1:-1, 1:-1]] = (70, 78, 100)      # cog body, the drawn outline goes on top
+        for rb in self.rbs:
+            col[rb['cx'] - 1, rb['cy'] - 1] = rb['col'][rb['ci']]
         for (x, y), sn in self.sensors.items():
             c = G_SENSOR_COLOR[sn['type']]
             col[x - 1, y - 1] = tuple(min(255, v + 90) for v in c) if sn['on'] else c
@@ -5890,8 +6561,19 @@ class GasSim:
                                 made_by=np.array(AUTHOR), bodies=bodies, open=np.array(self.open), void=np.array(self.void),
                                 probes=np.array(list(self.probes), np.int32).reshape(-1, 2), gravity=np.array(self.gravity),
                                 sensors=sens, link=self.link, aux=self.aux, liq=self.liq, phi=self.phi, decay=self.decay,
-                                shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0)]
-                                                 for q in self.shafts], np.float64).reshape(-1, 7),
+                                shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0),
+                                                  int(bool(q.get('wheel')))]
+                                                 for q in self.shafts], np.float64).reshape(-1, 8),
+                                chains=np.array([[self.shafts.index(m['a']), self.shafts.index(m['b']), m['k']]
+                                                 for m in self.chains if m['a'] in self.shafts and m['b'] in self.shafts],
+                                                np.float64).reshape(-1, 3),
+                                wx=np.array(self.wx),
+                                frames=np.array([[f['x0'], f['y0'], f['w'], f['h'], f['fx'], f['fy'], f['vx'], f['vy']]
+                                                 for f in self.frames], np.float64).reshape(-1, 8),
+                                rb_meta=np.array([[rb['x'], rb['y'], rb['th'], rb['vx'], rb['vy'], rb['om'], rb['cmx'], rb['cmy'], rb['gw'], rb['gh']]
+                                                  for rb in self.rbs], np.float64).reshape(-1, 10),
+                                rb_cells=np.array([row for k, rb in enumerate(self.rbs) for row in self.rb_rows(k, rb)],
+                                                  np.int32).reshape(-1, 5),
                                 meshes=np.array([[self.shafts.index(m['a']), self.shafts.index(m['b']), m['k']]
                                                  for m in self.meshes], np.float64).reshape(-1, 3),
                                 hinges=np.array([[int(h['kind'] == 'shaft'),
@@ -5931,14 +6613,27 @@ class GasSim:
                     self.sensors[(x, y)] = dict(type=G_SENSOR_KINDS[t], dir=dr, level=lv, on=False)
                 self.link[:] = d['link']
             self.shafts, self.hinges, self.rods, self.meshes = [], [], [], []
+            self.chains, self.frames, self.rbs = [], [], []
+            self.wx = int(d['wx']) if 'wx' in d else 0
             self.cogmask[:] = False
+            if 'rb_meta' in d:
+                self.load_rbs(d['rb_meta'], d['rb_cells'])
             if 'shafts' in d:
                 for row in d['shafts'].tolist():
                     x, y, R, th, om = row[:5]
                     q = dict(x=x, y=y, R=R, th=th, om=om)
                     if len(row) > 5 and row[5]:
                         q['teeth'], q['tl'] = int(row[5]), row[6]
+                    if len(row) > 7 and row[7]:
+                        q['wheel'] = True
                     self.shafts.append(q)
+                if 'chains' in d:
+                    for ia, ib, k in d['chains'].tolist():
+                        if int(ia) < len(self.shafts) and int(ib) < len(self.shafts):
+                            self.chains.append(dict(a=self.shafts[int(ia)], b=self.shafts[int(ib)], k=k))
+                if 'frames' in d:
+                    for x0_, y0_, w_, h_, fx_, fy_, vx_, vy_ in d['frames'].tolist():
+                        self.frames.append(dict(x0=int(x0_), y0=int(y0_), w=int(w_), h=int(h_), fx=fx_, fy=fy_, vx=vx_, vy=vy_))
                 if 'meshes' in d:
                     for ia, ib, k in d['meshes'].tolist():
                         if int(ia) < len(self.shafts) and int(ib) < len(self.shafts):
@@ -6003,11 +6698,20 @@ class GasMode:
         self.dirty = False
         self.last_save = time.time()
         self.path = os.path.join(os.path.dirname(save_path()), 'gas.npz')
-        self.cs, self.x0, self.y0 = 5, PAL_W, 0
+        self.world_path = os.path.join(os.path.dirname(save_path()), 'gas_world.bin')
+        self.cs, self.x0, self.y0 = 5, 0, TOPH
+        self.view_rect = pygame.Rect(0, TOPH, 800, 600)
+        self.right_rect = pygame.Rect(800, TOPH, RPW, 600)
+        self.search, self.search_focus, self.pal_scroll, self.help_open = '', False, 0, False
+        self.cat_open = {}
+        self.icons = {}
         self.link_sensor = None     # sensor that new valves / igniters get hooked to
         self.link_target = None     # sensor / valve / igniter that the next LINK cell connects to
         self.link_id = 1
         self.rod_first = None       # first hinge of a rod being placed
+        self.chain_first = None     # first shaft of a chain being placed
+        self.rb_spr = {}            # pictures of spinning bodies
+        self.slide, self.slide_dir, self.slide_img = 0.0, 0, None      # camera glide after the world scrolls
         self.sym = 0                # mirror drawing: 0 off, 1 left/right, 2 up/down, 3 both
         self.cog_prev = None        # cog being sized: base chosen, now picking tooth length
         self.sel = None             # SELECT tool rectangle (cell corners)
@@ -6022,6 +6726,7 @@ class GasMode:
         try:
             if os.path.exists(self.path):
                 self.sim.load(self.path)
+                self.sim.load_world(self.world_path)
         except Exception:
             try:
                 os.replace(self.path, self.path + '.bad')
@@ -6030,7 +6735,10 @@ class GasMode:
 
     # layout
     def layout(self, W, H):
-        fit = max(1, min((W - PAL_W) // GW, H // GH))
+        rp = min(RPW, max(170, W // 3))
+        self.view_rect = vr = pygame.Rect(0, TOPH, W - rp, H - TOPH)
+        self.right_rect = pygame.Rect(W - rp, TOPH, rp, H - TOPH)
+        fit = max(1, min(vr.w // GW, vr.h // GH))
         self.fit = fit
         if self.zcs is not None and self.zcs <= fit:
             self.zcs = None
@@ -6040,13 +6748,12 @@ class GasMode:
         else:
             self.cs = self.zcs
         gw, gh = GW * self.cs, GH * self.cs
-        vw = W - PAL_W
         if self.panx is None:
-            self.panx = PAL_W + (vw - gw) // 2
-            self.pany = (H - gh) // 2
+            self.panx = vr.x + (vr.w - gw) // 2
+            self.pany = vr.y + (vr.h - gh) // 2
         # the grid can't be dragged away from the view
-        self.panx = max(W - gw, min(PAL_W, self.panx)) if gw > vw else PAL_W + (vw - gw) // 2
-        self.pany = max(H - gh, min(0, self.pany)) if gh > H else (H - gh) // 2
+        self.panx = max(vr.right - gw, min(vr.x, self.panx)) if gw > vr.w else vr.x + (vr.w - gw) // 2
+        self.pany = max(vr.bottom - gh, min(vr.y, self.pany)) if gh > vr.h else vr.y + (vr.h - gh) // 2
         self.x0, self.y0 = self.panx, self.pany
 
     def zoom_at(self, pos, steps):
@@ -6068,18 +6775,517 @@ class GasMode:
             return (max(0, min(GW - 1, cx)), max(0, min(GH - 1, cy)))
         return (cx, cy) if 0 <= cx < GW and 0 <= cy < GH else None
 
-    def tool_rect(self, i):
-        return pygame.Rect(12, 40 + i * 24, PAL_W - 24, 20)
+    # ------------------------------------------------------------ chrome: top bar, tools + materials panel, selection bar
+    def in_view(self, pos):
+        return self.view_rect.collidepoint(pos) and not self.right_rect.collidepoint(pos)
 
-    def mat_top(self):
-        return 40 + len(G_TOOLS) * 24 + 26
+    def mat_nice(self, m):
+        if any(ch.isdigit() for ch in m) or m in ('CO', 'CO2', 'SF6', 'LINK'):
+            return m
+        return m.title()
 
-    def mat_rect(self, i):
-        return pygame.Rect(12, self.mat_top() + i * 21 - self.mat_scroll, PAL_W - 24, 19)
+    def mat_cats(self):
+        q = self.search.strip().lower()
+        out = []
+        for name, ms in G_CATS:
+            if q:
+                ms = [m for m in ms if q in m.lower() or q in self.mat_nice(m).lower()]
+                if not ms:
+                    continue
+            out.append((name, ms))
+        return out
 
-    def clamp_scroll(self):
-        room = self.list_bottom - self.mat_top()
-        self.mat_scroll = max(0, min(self.mat_scroll, len(G_MATS) * 21 - room))
+    def pal_rows(self, rp):
+        q = self.search.strip()
+        pad, gap = 10, 8
+        tw = (rp.w - 2 * pad - gap) // 2
+        th = 62
+        rows, y = [], 0
+        for name, ms in self.mat_cats():
+            op = True if q else self.cat_open.get(name, True)
+            rows.append(dict(t='hdr', cat=name, n=len(ms), open=op, rect=pygame.Rect(pad, y, rp.w - 2 * pad, 28)))
+            y += 30
+            if op:
+                for i, m in enumerate(ms):
+                    rows.append(dict(t='tile', mat=m, rect=pygame.Rect(pad + (i % 2) * (tw + gap), y + (i // 2) * (th + gap), tw, th)))
+                y += -(-len(ms) // 2) * (th + gap)
+            y += 4
+        return rows, y
+
+    def g_geom(self):
+        rp = self.right_rect
+        pad = 10
+        tw = (rp.w - 2 * pad - 12) // 3
+        tools = [(pygame.Rect(rp.x + pad + (i % 3) * (tw + 6), rp.y + 40 + (i // 3) * 36, tw, 30), t) for i, t in enumerate(G_TOOLS)]
+        sy = rp.y + 40 + 2 * 36 + 4
+        size = (pygame.Rect(rp.right - pad - 28 * 2 - 40, sy, 28, 26), pygame.Rect(rp.right - pad - 28 - 40, sy, 40, 26),
+                pygame.Rect(rp.right - pad - 28, sy, 28, 26))
+        search = pygame.Rect(rp.x + pad, sy + 34, rp.w - 2 * pad, 28)
+        area = pygame.Rect(rp.x, search.bottom + 8, rp.w, rp.bottom - search.bottom - 8 - 24)
+        return tools, size, search, area
+
+    def pal_clamp(self):
+        rows, total = self.pal_rows(self.right_rect)
+        _, _, _, area = self.g_geom()
+        self.pal_scroll = max(0, min(max(0, total - area.h), self.pal_scroll))
+        return rows, total
+
+    def g_top(self, W):
+        y, h = 7, 30
+        compact = W < 1180
+        x0 = 10 if W < 940 else 176
+        b = [(pygame.Rect(x0, y, 84, h), 'tab_circuit', 'Circuits', 'seg'),
+             (pygame.Rect(x0 + 84, y, 84, h), 'noop', 'Gas lab', 'seg_on')]
+        x = x0 + 190
+        b.append((pygame.Rect(x, y, 34, h), 'pause', '', 'pause'))
+        x += 40
+        b.append((pygame.Rect(x, y, 34, h), 'step', '', 'step'))
+        x += 46
+        b.append((pygame.Rect(x, y, 28, h), 'speed-', '', 'minus'))
+        b.append((pygame.Rect(x + 28, y, 50, h), 'noop', f'x{self.speed}', 'label'))
+        b.append((pygame.Rect(x + 78, y, 28, h), 'speed+', '', 'plus'))
+        x += 118
+        sim = self.sim
+        edge = 'void' if sim.void else 'air' if sim.open else 'closed'
+        items = [('gravity', 'Gravity' if not compact else 'Grav', 78 if not compact else 56),
+                 ('edges', f'Edges: {edge}' if not compact else edge.title(), 118 if not compact else 64),
+                 ('smooth', 'Smooth', 70),
+                 ('view', f'View: {G_VIEWS[self.view]}' if not compact else G_VIEWS[self.view].title(), 132 if not compact else 92)]
+        lim = W - 60
+        for act, lab, w in items:
+            if x + w > lim:
+                break
+            b.append((pygame.Rect(x, y, w, h), act, lab, 'toggle'))
+            x += w + 6
+        b.append((pygame.Rect(W - 14 - 34, y, 34, h), 'help', '', 'help'))
+        return b
+
+    def g_action(self, act):
+        sim = self.sim
+        if act == 'tab_circuit':
+            self.save()
+            self.app.mode = 'circuit'
+        elif act == 'pause':
+            self.paused = not self.paused
+        elif act == 'step':
+            if not self.paused:
+                self.paused = True
+            sim.step()
+            sim.move_debris(1, 1 / 60)
+        elif act == 'speed-':
+            self.speed = max(1, self.speed // 2)
+        elif act == 'speed+':
+            self.speed = min(32, self.speed * 2)
+        elif act == 'gravity':
+            sim.gravity = not sim.gravity
+            sim.update_ambient()
+            self.dirty = True
+        elif act == 'edges':
+            if sim.open and not sim.void:
+                sim.open = False
+            elif not sim.open:
+                sim.open, sim.void = True, True
+            else:
+                sim.void = False
+            self.dirty = True
+        elif act == 'smooth':
+            self.smooth = not self.smooth
+        elif act == 'view':
+            self.view = (self.view + 1) % len(G_VIEWS)
+        elif act == 'help':
+            self.help_open = not self.help_open
+        elif act == 'phys':
+            self.toggle_physics()
+        elif act == 'copy':
+            (ax, ay), (bx, by) = self.sel
+            self.clip = sim.copy_region(ax + 1, ay + 1, bx + 1, by + 1)
+            self.app.say(f"copied {self.clip['w']} x {self.clip['h']}, ctrl+v to paste")
+        elif act == 'delete':
+            self.delete_selection()
+
+    def start_slide(self, d):
+        try:
+            self.slide_img = pygame.display.get_surface().subsurface(self.view_rect).copy()
+            self.slide, self.slide_dir = 1.0, d
+        except (pygame.error, ValueError):
+            self.slide_img = None
+
+    def world_scroll(self, d):
+        err = self.sim.scroll_world(d)
+        if err:
+            self.app.say(err)
+            return False
+        self.start_slide(d)
+        amt = G_SLAB * d
+        self.sel = None
+        self.drag = None
+        self.pasting = False
+        self.pins = [(x - amt, y) for (x, y) in self.pins if 0 <= x - amt < GW]
+        self.hist = {}
+        self.dirty = True
+        return True
+
+    def edge_buttons(self):
+        vr = self.view_rect
+        return [(pygame.Rect(vr.x + 6, vr.centery - 30, 26, 60), -1), (pygame.Rect(vr.right - 32, vr.centery - 30, 26, 60), 1)]
+
+    def delete_selection(self):
+        if not self.sel:
+            return
+        mask = self.rect_mask(self.sel[0], self.sel[1], False)
+        self.sim.erase(mask)
+        self.dirty = True
+
+    def select_mat(self, m):
+        self.mat = m
+        if self.tool in ('SELECT', 'ERASE'):
+            self.tool = 'BRUSH'
+        if m not in ('VALVE', 'IGNITER', 'CONTROL ROD'):
+            self.link_sensor = None
+        if m != 'LINK':
+            self.link_target = None
+        if m != 'ROD':
+            self.rod_first = None
+        if m != 'CHAIN':
+            self.chain_first = None
+
+    def sel_buttons(self):
+        if not self.sel or self.pasting:
+            return []
+        (ax, ay), (bx, by) = self.sel
+        cs = self.cs
+        r = pygame.Rect(self.x0 + min(ax, bx) * cs, self.y0 + min(ay, by) * cs, (abs(bx - ax) + 1) * cs, (abs(by - ay) + 1) * cs)
+        items = [('phys', 'Physics  R', 100), ('copy', 'Copy', 56), ('delete', 'Delete', 62)]
+        tw = sum(w for _, _, w in items) + 6 * (len(items) - 1)
+        vr = self.view_rect
+        x = max(vr.x + 4, min(vr.right - tw - 4, r.centerx - tw // 2))
+        y = r.y - 38
+        if y < vr.y + 4:
+            y = min(vr.bottom - 36, r.bottom + 8)
+        out = []
+        for act, lab, w in items:
+            out.append((pygame.Rect(x, y, w, 28), act, lab))
+            x += w + 6
+        return out
+
+    def chrome_event(self, e):
+        W, H = pygame.display.get_surface().get_size()
+        mp = getattr(e, 'pos', None) or pygame.mouse.get_pos()
+        if e.type == pygame.KEYDOWN and self.search_focus:
+            k = e.key
+            if k in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.search_focus = False
+            elif k == pygame.K_BACKSPACE:
+                self.search = self.search[:-1]
+            elif e.unicode and e.unicode.isprintable() and len(self.search) < 24:
+                self.search += e.unicode
+            self.pal_scroll = 0
+            return True
+        if e.type == pygame.KEYDOWN and e.key == pygame.K_f and (e.mod & pygame.KMOD_CTRL):
+            self.search_focus = True
+            return True
+        if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE and self.help_open:
+            self.help_open = False
+            return True
+        if self.help_open and e.type == pygame.MOUSEBUTTONDOWN:
+            self.help_open = False
+            return True
+        if e.type == pygame.MOUSEWHEEL and self.right_rect.collidepoint(pygame.mouse.get_pos()):
+            self.pal_scroll -= e.y * 48
+            self.pal_clamp()
+            return True
+        if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            for r, act, lab, kind in self.g_top(W):
+                if r.collidepoint(e.pos) and act != 'noop':
+                    self.g_action(act)
+                    return True
+            if e.pos[1] < TOPH:
+                return True
+            for r, d_ in self.edge_buttons():
+                if r.collidepoint(e.pos) and self.view_rect.collidepoint(e.pos):
+                    self.world_scroll(d_)
+                    return True
+            for r, act, lab in self.sel_buttons():
+                if r.collidepoint(e.pos):
+                    self.g_action(act)
+                    return True
+            if self.right_rect.collidepoint(e.pos):
+                tools, size, search, area = self.g_geom()
+                self.search_focus = False
+                for r, t in tools:
+                    if r.collidepoint(e.pos):
+                        self.tool = t
+                        return True
+                if size[0].collidepoint(e.pos):
+                    self.size = max(0, self.size - 1)
+                elif size[2].collidepoint(e.pos):
+                    self.size = min(36, self.size + 1)
+                elif search.collidepoint(e.pos):
+                    self.search_focus = True
+                elif area.collidepoint(e.pos):
+                    rows, _ = self.pal_clamp()
+                    for row in rows:
+                        r = row['rect'].move(area.x, area.y - self.pal_scroll)
+                        if r.collidepoint(e.pos):
+                            if row['t'] == 'hdr':
+                                self.cat_open[row['cat']] = not row['open']
+                            else:
+                                self.select_mat(row['mat'])
+                            break
+                return True
+        if e.type == pygame.MOUSEBUTTONDOWN and e.button == 3 and self.right_rect.collidepoint(e.pos):
+            return True
+        if e.type == pygame.MOUSEBUTTONDOWN and self.right_rect.collidepoint(e.pos):
+            return True
+        return False
+
+    def mat_color(self, m):
+        comp = dict(G_MATS).get(m)
+        if m in G_SENSOR_TYPES:
+            return G_SENSOR_COLOR[G_SENSOR_TYPES[m]]
+        if m == 'LINK':
+            return G_SOLIDS[G_LINK][2]
+        if m == 'THRUST PROBE':
+            return (255, 170, 60)
+        if m == 'WATER':
+            return (60, 130, 230)
+        if m in G_MECH:
+            return (200, 204, 214)
+        if comp:
+            sw = tuple(int(sum(G_COLOR[G_IDX[s_]][ch] * f for s_, f in comp.items()) * 1.4) for ch in range(3))
+            return tuple(min(255, x) for x in sw)
+        if m in G_SOLID_MATS:
+            return G_SOLIDS[G_SOLID_MATS[m]][2]
+        return G_BLOCK_COLOR if m == 'BLOCK' else (90, 96, 120)
+
+    def mat_icon(self, m, w, h):
+        key = (m, w, h, id(PANEL))
+        ic = self.icons.get(key)
+        if ic is not None:
+            return ic
+        ic = pygame.Surface((w, h), pygame.SRCALPHA)
+        col = self.mat_color(m)
+        dark = tuple(int(v * 0.55) for v in col)
+        cx, cy = w // 2, h // 2
+        if m in G_SOLID_MATS or m == 'BLOCK':
+            r = pygame.Rect(0, 0, 34, 26)
+            r.center = (cx, cy)
+            pygame.draw.rect(ic, col, r, border_radius=5)
+            pygame.draw.rect(ic, dark, r, 2, border_radius=5)
+            if m in ('VALVE', 'RELIEF VALVE'):
+                pygame.draw.polygon(ic, dark, [(cx - 8, cy - 7), (cx, cy), (cx - 8, cy + 7)])
+                pygame.draw.polygon(ic, dark, [(cx + 8, cy - 7), (cx, cy), (cx + 8, cy + 7)])
+            elif m in ('PUMP', 'CHECK VALVE'):
+                pygame.draw.polygon(ic, dark, [(cx - 7, cy - 7), (cx + 8, cy), (cx - 7, cy + 7)])
+            elif m == 'FILTER':
+                for dx in (-8, 0, 8):
+                    pygame.draw.line(ic, dark, (cx + dx, cy - 8), (cx + dx, cy + 8), 2)
+            elif m in ('HEATER', 'COOLER'):
+                for dx in (-8, 0, 8):
+                    pygame.draw.lines(ic, dark, False, [(cx + dx, cy - 8), (cx + dx + 3, cy - 3), (cx + dx - 3, cy + 3), (cx + dx, cy + 8)], 2)
+            elif m == 'IGNITER':
+                pygame.draw.polygon(ic, dark, [(cx + 2, cy - 9), (cx - 6, cy + 2), (cx, cy + 2), (cx - 3, cy + 9), (cx + 7, cy - 2), (cx + 1, cy - 2)])
+            elif m == 'TURBINE':
+                for a_ in range(3):
+                    an = a_ * 2.09
+                    pygame.draw.line(ic, dark, (cx, cy), (cx + 10 * math.cos(an), cy + 10 * math.sin(an)), 3)
+            elif m == 'URANIUM':
+                pygame.draw.circle(ic, dark, (cx, cy), 7, 2)
+                pygame.draw.circle(ic, dark, (cx, cy), 2)
+            elif m == 'SOURCE':
+                pygame.draw.circle(ic, dark, (cx, cy), 7, 2)
+                pygame.draw.line(ic, dark, (cx, cy - 4), (cx, cy + 4), 2)
+                pygame.draw.line(ic, dark, (cx - 4, cy), (cx + 4, cy), 2)
+        elif m in G_MECH:
+            if m in ('SHAFT', 'WHEEL', 'COG'):
+                if m == 'WHEEL':
+                    pygame.draw.circle(ic, (24, 24, 30), (cx, cy), 15)
+                    pygame.draw.circle(ic, (90, 90, 104), (cx, cy), 15, 2)
+                if m == 'COG':
+                    for k in range(8):
+                        an = k * math.pi / 4
+                        pygame.draw.circle(ic, col, (cx + 12 * math.cos(an), cy + 12 * math.sin(an)), 3)
+                pygame.draw.circle(ic, (52, 58, 76), (cx, cy), 10)
+                pygame.draw.circle(ic, col, (cx, cy), 10, 2)
+                for k in range(4):
+                    an = k * math.pi / 2
+                    pygame.draw.line(ic, (90, 98, 120), (cx, cy), (cx + 9 * math.cos(an), cy + 9 * math.sin(an)), 1)
+                pygame.draw.circle(ic, col, (cx, cy), 2)
+            elif m == 'HINGE':
+                pygame.draw.circle(ic, (20, 22, 28), (cx, cy), 8)
+                pygame.draw.circle(ic, (235, 235, 245), (cx, cy), 5)
+            elif m == 'ROD':
+                pygame.draw.line(ic, (30, 32, 40), (cx - 16, cy + 6), (cx + 16, cy - 6), 7)
+                pygame.draw.line(ic, col, (cx - 16, cy + 6), (cx + 16, cy - 6), 3)
+                for px, py in ((cx - 16, cy + 6), (cx + 16, cy - 6)):
+                    pygame.draw.circle(ic, (235, 235, 245), (px, py), 4)
+            elif m == 'CHAIN':
+                pygame.draw.circle(ic, (52, 58, 76), (cx - 12, cy), 7)
+                pygame.draw.circle(ic, (52, 58, 76), (cx + 12, cy), 5)
+                for sg in (-1, 1):
+                    pygame.draw.line(ic, (24, 26, 32), (cx - 12, cy + sg * 7), (cx + 12, cy + sg * 5), 4)
+                    for t in range(5):
+                        pygame.draw.circle(ic, (210, 214, 224), (cx - 10 + t * 5, cy + sg * (7 - t * 0.5)), 1)
+        elif m in G_SENSOR_TYPES or m in ('LINK', 'THRUST PROBE'):
+            pygame.draw.circle(ic, col, (cx, cy), 12)
+            pygame.draw.circle(ic, dark, (cx, cy), 12, 2)
+            pygame.draw.circle(ic, dark, (cx, cy), 4)
+            if m == 'THRUST PROBE':
+                pygame.draw.line(ic, dark, (cx, cy), (cx + 14, cy - 8), 2)
+        elif m == 'VACUUM':
+            for k in range(12):
+                an = k * math.pi / 6
+                pygame.draw.circle(ic, TEXT_DIM, (cx + 12 * math.cos(an), cy + 12 * math.sin(an)), 1)
+        elif m == 'WATER':
+            for k in range(3):
+                pts = [(cx - 16 + i * 4, cy - 8 + k * 8 + (3 if i % 2 else 0)) for i in range(9)]
+                pygame.draw.lines(ic, col, False, pts, 3)
+        else:
+            comp = dict(G_MATS).get(m) or {}
+            cols = [G_COLOR[G_IDX[s_]] for s_ in comp] or [col]
+            for i, (ox, oy, rr) in enumerate(((-9, 3, 10), (8, 4, 9), (0, -6, 10))):
+                c_ = tuple(min(255, int(v * 1.5 + 20)) for v in cols[i % len(cols)])
+                pygame.draw.circle(ic, (*c_, 200), (cx + ox, cy + oy), rr)
+        self.icons[key] = ic
+        return ic
+
+    def draw_chrome(self, surf):
+        W, H = surf.get_size()
+        mp = pygame.mouse.get_pos()
+        app = self.app
+        rp = self.right_rect
+        # right panel
+        pygame.draw.rect(surf, PANEL, rp)
+        pygame.draw.line(surf, PANEL_LINE, (rp.x, rp.y), (rp.x, rp.bottom))
+        surf.blit(app.ui_h.render('Tools', True, TEXT), (rp.x + 14, rp.y + 8))
+        tools, size, search, area = self.g_geom()
+        for r, t in tools:
+            on = t == self.tool
+            hov = r.collidepoint(mp)
+            pygame.draw.rect(surf, ACTIVE if on else (CARD_HI if hov else CARD), r, border_radius=8)
+            pygame.draw.rect(surf, ON if on else (PART_LINE if hov else PANEL_LINE), r, 1, border_radius=8)
+            s_ = app.ui.render(t.title(), True, ON if on else TEXT)
+            surf.blit(s_, s_.get_rect(center=r.center))
+        s_ = app.ui_s.render('brush size', True, TEXT_DIM)
+        surf.blit(s_, (rp.x + 14, size[1].centery - s_.get_height() // 2))
+        for r, ic in ((size[0], 'minus'), (size[2], 'plus')):
+            pygame.draw.rect(surf, CARD_HI if r.collidepoint(mp) else CARD, r, border_radius=7)
+            pygame.draw.rect(surf, PANEL_LINE, r, 1, border_radius=7)
+            app.draw_icon(surf, ic, r, TEXT)
+        s_ = app.ui.render(str(self.size), True, TEXT)
+        surf.blit(s_, s_.get_rect(center=size[1].center))
+        pygame.draw.rect(surf, BG, search, border_radius=8)
+        pygame.draw.rect(surf, ON if self.search_focus else PANEL_LINE, search, 1, border_radius=8)
+        if self.search or self.search_focus:
+            s_ = app.ui.render(self.search + ('|' if self.search_focus and (pygame.time.get_ticks() // 450) % 2 == 0 else ''), True, TEXT)
+        else:
+            s_ = app.ui.render('search materials', True, TEXT_DIM)
+        surf.blit(s_, (search.x + 10, search.centery - s_.get_height() // 2))
+        rows, total = self.pal_clamp()
+        old = surf.get_clip()
+        surf.set_clip(area.clip(old))
+        for row in rows:
+            r = row['rect'].move(area.x, area.y - self.pal_scroll)
+            if r.bottom < area.y or r.top > area.bottom:
+                continue
+            if row['t'] == 'hdr':
+                arrow = [(r.x + 6, r.centery - 3), (r.x + 14, r.centery - 3), (r.x + 10, r.centery + 3)] if row['open'] \
+                    else [(r.x + 7, r.centery - 5), (r.x + 7, r.centery + 5), (r.x + 13, r.centery)]
+                pygame.draw.polygon(surf, TEXT_DIM, arrow)
+                s_ = app.ui_s.render(row['cat'], True, TEXT_DIM)
+                surf.blit(s_, (r.x + 22, r.centery - s_.get_height() // 2))
+                n_ = app.ui_s.render(str(row['n']), True, TEXT_DIM)
+                surf.blit(n_, (r.right - n_.get_width() - 4, r.centery - n_.get_height() // 2))
+                continue
+            m = row['mat']
+            on = m == self.mat
+            hov = r.collidepoint(mp) and area.collidepoint(mp)
+            pygame.draw.rect(surf, ACTIVE if on else (CARD_HI if hov else CARD), r, border_radius=10)
+            pygame.draw.rect(surf, ON if on else (PART_LINE if hov else PANEL_LINE), r, 1, border_radius=10)
+            ic = self.mat_icon(m, r.w - 8, 36)
+            surf.blit(ic, (r.x + 4, r.y + 4))
+            nm = self.mat_nice(m)
+            while len(nm) > 3 and app.ui_s.size(nm)[0] > r.w - 10:
+                nm = nm[:-2] + '…'
+            s_ = app.ui_s.render(nm, True, ON if on else TEXT)
+            surf.blit(s_, s_.get_rect(midtop=(r.centerx, r.y + 42)))
+        surf.set_clip(old)
+        if total > area.h:
+            th = max(24, int(area.h * area.h / total))
+            ty = area.y + int((area.h - th) * self.pal_scroll / max(1, total - area.h))
+            pygame.draw.rect(surf, PANEL_LINE, (rp.right - 5, ty, 3, th), border_radius=2)
+        ct = app.ui_s.render(_CR_A, True, TEXT_DIM)
+        while ct.get_width() > rp.w - 16 and len(_CR_A) > 4:
+            ct = pygame.transform.smoothscale(ct, (rp.w - 16, ct.get_height()))
+        surf.blit(ct, (rp.x + 8, rp.bottom - 20))
+        # top bar
+        top = pygame.Rect(0, 0, W, TOPH)
+        pygame.draw.rect(surf, PANEL, top)
+        pygame.draw.line(surf, PANEL_LINE, (0, top.bottom - 1), (top.right, top.bottom - 1))
+        if W >= 940:
+            t = app.ui_h.render('logic sandbox', True, TEXT)
+            surf.blit(t, (16, top.centery - t.get_height() // 2))
+        sim = self.sim
+        for r, act, label, kind in self.g_top(W):
+            icon = {'pause': 'pause', 'step': 'step', 'minus': 'minus', 'plus': 'plus', 'help': 'help'}.get(kind)
+            active = (kind == 'pause' and self.paused) or (act == 'gravity' and sim.gravity) or (act == 'smooth' and self.smooth) \
+                or (act == 'view' and self.view) or (kind == 'help' and self.help_open) or (act == 'edges' and not sim.open)
+            app.draw_btn(surf, r, label, 'toggle' if kind == 'toggle' else kind, mp, active, icon)
+        st = ('paused' if self.paused else f'{self.sps:.0f} steps/s') + ('' if not self.sym else ' · mirror ' + 'xyb'[self.sym - 1])
+        s_ = app.ui_s.render(st, True, SEL if self.paused else TEXT_DIM)
+        surf.blit(s_, (W - 14 - 34 - 12 - s_.get_width(), top.centery - s_.get_height() // 2))
+        # world edges
+        for r, d_ in self.edge_buttons():
+            hov = r.collidepoint(mp)
+            pygame.draw.rect(surf, CARD_HI if hov else PANEL, r, border_radius=10)
+            pygame.draw.rect(surf, PART_LINE if hov else PANEL_LINE, r, 1, border_radius=10)
+            cx, cy = r.center
+            sg = 1 if d_ > 0 else -1
+            pygame.draw.lines(surf, TEXT if hov else TEXT_DIM, False, [(cx - 4 * sg, cy - 8), (cx + 4 * sg, cy), (cx - 4 * sg, cy + 8)], 3)
+        lo_x = self.sim.wx
+        s_ = app.ui_s.render(f'world x {lo_x:,} to {lo_x + GW:,}   (arrow keys scroll)', True, TEXT_DIM)
+        surf.blit(s_, (self.view_rect.x + 10, self.view_rect.bottom - 22))
+        # selection actions
+        for r, act, lab in self.sel_buttons():
+            hov = r.collidepoint(mp)
+            hot = act == 'phys'
+            pygame.draw.rect(surf, ON if hot else (CARD_HI if hov else PANEL), r, border_radius=8)
+            pygame.draw.rect(surf, ON if hot else PART_LINE, r, 1, border_radius=8)
+            s_ = app.ui.render(lab, True, (8, 16, 30) if hot else TEXT)
+            surf.blit(s_, s_.get_rect(center=r.center))
+        # toast
+        msg, until = app.toast
+        if msg and time.time() < until:
+            t = app.font.render(msg, True, TEXT)
+            tr = pygame.Rect(0, 0, t.get_width() + 24, t.get_height() + 14)
+            tr.midtop = (self.view_rect.centerx, TOPH + 12)
+            pygame.draw.rect(surf, PANEL, tr, border_radius=10)
+            pygame.draw.rect(surf, SEL, tr, 1, border_radius=10)
+            surf.blit(t, t.get_rect(center=tr.center))
+        if self.help_open:
+            self.draw_ghelp(surf)
+
+    def draw_ghelp(self, surf):
+        W, H = surf.get_size()
+        app = self.app
+        dim = pygame.Surface((W, H), pygame.SRCALPHA)
+        dim.fill((*DIM, 150))
+        surf.blit(dim, (0, 0))
+        lines = G_HELP
+        half = (len(lines) + 1) // 2
+        bw, bh = 620, 62 + half * 22 + 40
+        box = pygame.Rect(0, 0, bw, bh)
+        box.center = (W // 2, H // 2)
+        pygame.draw.rect(surf, PANEL, box, border_radius=14)
+        pygame.draw.rect(surf, PART_LINE, box, 1, border_radius=14)
+        t = app.ui_h.render('gas lab keys', True, TEXT)
+        surf.blit(t, (box.x + 24, box.y + 18))
+        for i, ln in enumerate(lines):
+            col, row = divmod(i, half)
+            s_ = app.ui.render(ln, True, TEXT)
+            surf.blit(s_, (box.x + 24 + col * 300, box.y + 58 + row * 22))
+        t = app.ui_s.render('click anywhere to close', True, TEXT_DIM)
+        surf.blit(t, (box.x + 24, box.bottom - 28))
 
     # masks over the padded grid
     def seg_mask(self, a, b, r):
@@ -6181,6 +7387,8 @@ class GasMode:
     # input
     def handle(self, e):
         # returns 'quit' when esc should close the game
+        if self.chrome_event(e):
+            return None
         if e.type == pygame.KEYDOWN:
             k = e.key
             ctrl = bool(e.mod & pygame.KMOD_CTRL)
@@ -6194,8 +7402,8 @@ class GasMode:
                     self.pasting = False
                 elif self.sel:
                     self.sel = None
-                elif self.link_sensor or self.link_target or self.rod_first:
-                    self.link_sensor = self.link_target = self.rod_first = None
+                elif self.link_sensor or self.link_target or self.rod_first or self.chain_first:
+                    self.link_sensor = self.link_target = self.rod_first = self.chain_first = None
                     self.app.say('stopped linking')
                 else:
                     return 'quit'
@@ -6218,6 +7426,12 @@ class GasMode:
                     self.app.say('click to paste, esc or rmb to stop')
                 else:
                     self.app.say('nothing copied yet')
+            elif k == pygame.K_r and not ctrl:
+                self.toggle_physics(shift)
+            elif k in (pygame.K_LEFT, pygame.K_RIGHT) and not ctrl:
+                self.world_scroll(-1 if k == pygame.K_LEFT else 1)
+            elif k == pygame.K_DELETE and self.sel and not (ctrl and shift):
+                self.delete_selection()
             elif k == pygame.K_m:
                 self.sym = (self.sym + 1) % 4
                 self.app.say(['symmetry off', 'mirror left/right', 'mirror up/down', 'mirror both'][self.sym])
@@ -6279,15 +7493,14 @@ class GasMode:
         elif e.type == pygame.MOUSEWHEEL:
             if self.cog_prev:
                 self.cog_prev['n'] = max(4, min(60, self.cog_prev['n'] + e.y))
-            elif pygame.mouse.get_pos()[0] < PAL_W:
-                self.mat_scroll -= e.y * 42
-                self.clamp_scroll()
+            elif not self.in_view(pygame.mouse.get_pos()):
+                pass
             elif pygame.key.get_mods() & pygame.KMOD_CTRL:
                 self.zoom_at(pygame.mouse.get_pos(), e.y)
             else:
                 self.size = max(0, min(36, self.size + e.y))
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 2:
-            if e.pos[0] >= PAL_W and self.zcs is not None:
+            if self.in_view(e.pos) and self.zcs is not None:
                 self.pan_from = (e.pos, self.panx, self.pany)
         elif e.type == pygame.MOUSEBUTTONUP and e.button == 2:
             self.pan_from = None
@@ -6296,20 +7509,7 @@ class GasMode:
             self.panx = px + e.pos[0] - mx
             self.pany = py + e.pos[1] - my
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button in (1, 3):
-            if e.pos[0] < PAL_W:
-                for i, t in enumerate(G_TOOLS):
-                    if self.tool_rect(i).collidepoint(e.pos):
-                        self.tool = t
-                for i, (m, _) in enumerate(G_MATS):
-                    r = self.mat_rect(i)
-                    if r.collidepoint(e.pos) and r.top >= self.mat_top() - 4 and r.bottom <= self.list_bottom + 2:
-                        self.mat = m
-                        if m not in ('VALVE', 'IGNITER', 'CONTROL ROD'):
-                            self.link_sensor = None
-                        if m != 'LINK':
-                            self.link_target = None
-                        if m != 'ROD':
-                            self.rod_first = None
+            if not self.in_view(e.pos):
                 return None
             c = self.cell(e.pos)
             if self.pasting:
@@ -6365,6 +7565,22 @@ class GasMode:
                         else:
                             self.app.say('pick a different hinge')
                         self.rod_first = None
+                    return None
+                if self.mat == 'WHEEL':
+                    self.app.say(self.sim.toggle_wheel(fx, fy))
+                    self.dirty = True
+                    return None
+                if self.mat == 'CHAIN':
+                    sh_ = self.sim.near_shaft(fx, fy)
+                    if sh_ is None:
+                        self.app.say('click a shaft or cog')
+                    elif self.chain_first is None:
+                        self.chain_first = sh_
+                        self.app.say('now click the other shaft (esc to cancel)')
+                    else:
+                        self.app.say(self.sim.add_chain(self.chain_first, sh_))
+                        self.chain_first = None
+                        self.dirty = True
                     return None
                 if self.mat == 'LINK':
                     if kd == G_LINK:
@@ -6474,6 +7690,28 @@ class GasMode:
                     self.apply(self.rect_mask(d['start'], d['cur'], solid), 1.0)
         return None
 
+    def toggle_physics(self, shift=False):
+        if not self.sel:
+            self.app.say('use the SELECT tool on something first, then R')
+            return
+        (ax, ay), (bx, by) = self.sel
+        sim = self.sim
+        n = sim.release_frames(ax + 1, ay + 1, bx + 1, by + 1) + sim.release_rbodies(ax + 1, ay + 1, bx + 1, by + 1)
+        if n:
+            self.app.say('physics off')
+            self.sel = None
+        else:
+            rb = None if shift else sim.make_rbody(ax + 1, ay + 1, bx + 1, by + 1)
+            if rb:
+                self.app.say('free body: it falls, tumbles and spins (R again to freeze it)')
+                self.sel = None
+            else:
+                err = sim.make_frame(ax + 1, ay + 1, bx + 1, by + 1)
+                self.app.say(err or 'physics object: shafts, blocks and gas inside ride along (R again to turn it off)')
+                if not err:
+                    self.sel = None
+        self.dirty = True
+
     def update(self, dt):
         if self.sel and self.tool != 'SELECT' and not self.pasting:
             self.sel = None         # the selection box goes away once you pick another tool
@@ -6491,6 +7729,12 @@ class GasMode:
                 if time.perf_counter() - t0 > 0.022:
                     break       # slow pc: keep the frame rate, run the sim slower
             self.sim.move_debris(done, dt)
+            fd = self.sim.follow_frame() if self.sim.frames else 0
+            if fd:
+                self.start_slide(fd)
+                self.pins = [(x - G_SLAB * fd, y) for (x, y) in self.pins if 0 <= x - G_SLAB * fd < GW]
+                self.hist = {}
+                self.sel = None
             while self.sim.news:
                 self.app.say(self.sim.news.pop(0))
             self.hist_n += 1
@@ -6511,6 +7755,7 @@ class GasMode:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self.sim.save(self.path)
+            self.sim.save_world(self.world_path)
         except OSError as err:
             print('gas save failed:', err)
         self.dirty = False
@@ -6549,6 +7794,94 @@ class GasMode:
             img.blit(top, (0, 0))
         return img
 
+    def smooth_objects(self, surf):
+        # blocks and physics objects move in whole cells inside the sim, but are drawn where they really are:
+        # the picture of the object is lifted off the grid and put back shifted by its sub-cell offset
+        sim, cs = self.sim, self.cs
+        sw, sh_ = surf.get_size()
+        objs = [(f['x0'], f['y0'], f['w'], f['h'], f['fx'], f['fy']) for f in sim.frames]
+        for b in sim.bodies:
+            if sim.frame_at(b['x'] + b['w'] / 2.0, b['y'] + b['h'] / 2.0, 0) is None:
+                objs.append((b['x'], b['y'], b['w'], b['h'], b['fx'], b['fy']))
+        for cx, cy, w, h, fx, fy in objs:
+            if abs(fx) < 0.02 and abs(fy) < 0.02:
+                continue
+            R = pygame.Rect(self.x0 + int((cx - 1) * cs), self.y0 + int((cy - 1) * cs), w * cs, h * cs)
+            if not R.inflate(2 * cs, 2 * cs).colliderect((0, 0, sw, sh_)):
+                continue
+            spr = pygame.Surface(R.size)
+            spr.blit(surf, (0, 0), R)
+            ox, oy = int(round(fx * cs)), int(round(fy * cs))
+            # the strip the object leaves behind gets the gas colors from just outside of it
+            if ox:
+                col_x = R.x - 1 if ox > 0 else R.right
+                if 0 <= col_x < sw:
+                    line = pygame.Surface((1, R.h))
+                    line.blit(surf, (0, 0), (col_x, R.y, 1, R.h))
+                    strip = pygame.transform.scale(line, (abs(ox), R.h))
+                    surf.blit(strip, (R.x if ox > 0 else R.right - abs(ox), R.y))
+            if oy:
+                row_y = R.y - 1 if oy > 0 else R.bottom
+                if 0 <= row_y < sh_:
+                    line = pygame.Surface((R.w, 1))
+                    line.blit(surf, (0, 0), (R.x, row_y, R.w, 1))
+                    strip = pygame.transform.scale(line, (R.w, abs(oy)))
+                    surf.blit(strip, (R.x, R.y if oy > 0 else R.bottom - abs(oy)))
+            surf.blit(spr, (R.x + ox, R.y + oy))
+
+    def draw_rbodies(self, surf):
+        sim, cs = self.sim, self.cs
+        for rb in sim.rbs:
+            key = (id(rb), cs)
+            spr = self.rb_spr.get(key)
+            if spr is None:
+                S = int((rb['r'] + 2) * 2 * cs)
+                spr = pygame.Surface((S, S), pygame.SRCALPHA)
+                ii, jj = np.nonzero(rb['grid'] >= 0)
+                for a, b, i in zip(ii.tolist(), jj.tolist(), rb['grid'][ii, jj].tolist()):
+                    spr.fill(tuple(int(v) for v in rb['col'][i]),
+                             (S // 2 + int(round((a - rb['cmx'] + 0.5 - 0.5) * cs)) - 0, S // 2 + int(round((b - rb['cmy'] + 0.5 - 0.5) * cs)), cs + 1, cs + 1))
+                if len(self.rb_spr) > 64:
+                    self.rb_spr.clear()
+                self.rb_spr[key] = spr
+            rot = pygame.transform.rotozoom(spr, -math.degrees(rb['th']), 1.0)
+            c = (self.x0 + int((rb['x'] - 1) * cs), self.y0 + int((rb['y'] - 1) * cs))
+            surf.blit(rot, rot.get_rect(center=c))
+
+    def draw_chain(self, surf, ch, scr):
+        sim, cs = self.sim, self.cs
+        a, b = ch['a'], ch['b']
+        oa, ob = sim.foff(a['x'], a['y']), sim.foff(b['x'], b['y'])
+        A = scr(a['x'], a['y'], oa)
+        B = scr(b['x'], b['y'], ob)
+        ra, rb = (a['R'] + a.get('tl', 0) / 2 + 0.6) * cs, (b['R'] + b.get('tl', 0) / 2 + 0.6) * cs
+        dx, dy = B[0] - A[0], B[1] - A[1]
+        L = math.hypot(dx, dy)
+        if L < abs(ra - rb) + 2:
+            return
+        phi = math.atan2(dy, dx)
+        al = math.acos((ra - rb) / L)
+        gap = max(5, cs + 2)
+        for sgn in (1, -1):
+            n = phi + sgn * al
+            cn, sn = math.cos(n), math.sin(n)
+            p1 = (A[0] + ra * cn, A[1] + ra * sn)
+            p2 = (B[0] + rb * cn, B[1] + rb * sn)
+            pygame.draw.line(surf, (24, 26, 32), p1, p2, max(4, cs))
+            pygame.draw.line(surf, (150, 156, 170), p1, p2, 2)
+            ln = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            if ln < 2:
+                continue
+            ux, uy = (p2[0] - p1[0]) / ln, (p2[1] - p1[1]) / ln
+            off = (a['th'] * sim.cpitch(a) * cs * sgn) % gap
+            t = off
+            while t < ln:
+                q = (p1[0] + ux * t, p1[1] + uy * t)
+                pygame.draw.circle(surf, (210, 214, 224), (int(q[0]), int(q[1])), 2)
+                t += gap
+        for sh, P, r_ in ((a, A, ra), (b, B, rb)):
+            pygame.draw.circle(surf, (150, 156, 170), P, int(r_), 1)
+
     # drawing
     def draw(self, surf):
         W, H = surf.get_size()
@@ -6556,8 +7889,10 @@ class GasMode:
         surf.fill(BG)
         arr = self.sim.render(self.view)
         cs0 = self.cs
-        vx0, vx1 = max(0, (PAL_W - self.x0) // cs0), min(GW, -(-(W - self.x0) // cs0))
-        vy0, vy1 = max(0, -self.y0 // cs0), min(GH, -(-(H - self.y0) // cs0))
+        vr = self.view_rect
+        surf.set_clip(vr)
+        vx0, vx1 = max(0, (vr.x - self.x0) // cs0), min(GW, -(-(vr.right - self.x0) // cs0))
+        vy0, vy1 = max(0, (vr.y - self.y0) // cs0), min(GH, -(-(vr.bottom - self.y0) // cs0))
         arr = np.ascontiguousarray(arr[vx0:vx1, vy0:vy1])
         if self.smooth and cs0 >= 3:
             img = self.smooth_img(arr, vx0, vx1, vy0, vy1)
@@ -6566,6 +7901,8 @@ class GasMode:
             if cs0 != 1:
                 img = pygame.transform.scale(img, ((vx1 - vx0) * cs0, (vy1 - vy0) * cs0))
         surf.blit(img, (self.x0 + vx0 * cs0, self.y0 + vy0 * cs0))
+        self.smooth_objects(surf)
+        self.draw_rbodies(surf)
         ds = max(2, self.cs)
         for d in self.sim.debris:
             surf.fill(d[5], (self.x0 + int((d[0] - 1) * self.cs), self.y0 + int((d[1] - 1) * self.cs), ds, ds))
@@ -6602,23 +7939,33 @@ class GasMode:
                                                                     self.clip['w'] * cs, self.clip['h'] * cs), 1)
         # shafts, rods and hinges
         sim = self.sim
-        def scr(px, py):
-            return (int(self.x0 + (px - 1) * cs), int(self.y0 + (py - 1) * cs))
+        def scr(px, py, off=(0.0, 0.0)):
+            return (int(self.x0 + (px + off[0] - 1) * cs), int(self.y0 + (py + off[1] - 1) * cs))
         def draw_teeth(sh):
             P = 2 * math.pi / sh['teeth']
+            fo = sim.foff(sh['x'], sh['y'])
             for i in range(sh['teeth']):
                 a0 = sh['th'] + i * P
                 a1 = a0 + P / 2
                 Ri, Ro = sh['R'] - 0.5, sh['R'] + sh['tl']
-                pts = [scr(sh['x'] + Ri * math.cos(a), sh['y'] + Ri * math.sin(a)) for a in (a0, a1)] + \
-                      [scr(sh['x'] + Ro * math.cos(a), sh['y'] + Ro * math.sin(a)) for a in (a1, a0)]
+                pts = [scr(sh['x'] + Ri * math.cos(a), sh['y'] + Ri * math.sin(a), fo) for a in (a0, a1)] + \
+                      [scr(sh['x'] + Ro * math.cos(a), sh['y'] + Ro * math.sin(a), fo) for a in (a1, a0)]
                 pygame.draw.polygon(surf, (70, 78, 100), pts)
                 pygame.draw.polygon(surf, (150, 160, 182), pts, 1)
         for sh in sim.shafts:
-            c0 = scr(sh['x'], sh['y'])
+            so = sim.foff(sh['x'], sh['y'])
+            c0 = scr(sh['x'], sh['y'], so)
             R = int(sh['R'] * cs)
             if sh.get('teeth'):
                 draw_teeth(sh)
+            if sh.get('wheel'):
+                RT = int((sh['R'] + G_WHEEL_T) * cs)
+                pygame.draw.circle(surf, (22, 22, 26), c0, RT)
+                pygame.draw.circle(surf, (70, 70, 80), c0, RT, 1)
+                for k in range(14):
+                    a_ = sh['th'] + k * 2 * math.pi / 14
+                    pygame.draw.line(surf, (60, 60, 70), (c0[0] + (R + 1) * math.cos(a_), c0[1] + (R + 1) * math.sin(a_)),
+                                     (c0[0] + (RT - 1) * math.cos(a_), c0[1] + (RT - 1) * math.sin(a_)), max(2, cs // 2))
             pygame.draw.circle(surf, (52, 58, 76), c0, R)
             pygame.draw.circle(surf, (150, 160, 182), c0, R, 2)
             for k in range(4):
@@ -6627,13 +7974,16 @@ class GasMode:
             pygame.draw.circle(surf, (150, 160, 182), c0, 3)
             rpm = sh['om'] / (2 * math.pi) * self.sps * 60
             t = self.app.tiny.render(f'{rpm:.0f} rpm', True, (200, 205, 220))
-            surf.blit(t, (c0[0] - t.get_width() // 2, c0[1] + R + 3))
+            surf.blit(t, (c0[0] - t.get_width() // 2, c0[1] + R + 3 + (int(G_WHEEL_T * cs) if sh.get('wheel') else 0)))
+        for ch in sim.chains:
+            self.draw_chain(surf, ch, scr)
         for r in sim.rods:
             pa, pb = sim.hinge_pos(r['a']), sim.hinge_pos(r['b'])
-            pygame.draw.line(surf, (30, 32, 40), scr(pa[0], pa[1]), scr(pb[0], pb[1]), max(4, cs + 1))
-            pygame.draw.line(surf, (200, 204, 214), scr(pa[0], pa[1]), scr(pb[0], pb[1]), max(2, cs - 1))
+            oa, ob = sim.hoff(r['a']), sim.hoff(r['b'])
+            pygame.draw.line(surf, (30, 32, 40), scr(pa[0], pa[1], oa), scr(pb[0], pb[1], ob), max(4, cs + 1))
+            pygame.draw.line(surf, (200, 204, 214), scr(pa[0], pa[1], oa), scr(pb[0], pb[1], ob), max(2, cs - 1))
         for h in sim.hinges:
-            hp = scr(*sim.hinge_pos(h)[:2])
+            hp = scr(*sim.hinge_pos(h)[:2], sim.hoff(h))
             pygame.draw.circle(surf, (20, 22, 28), hp, max(4, cs))
             pygame.draw.circle(surf, SEL if h is self.rod_first else (235, 235, 245), hp, max(3, cs - 1))
         if self.cog_prev:
@@ -6644,6 +7994,15 @@ class GasMode:
         if d_ and d_['tool'] in ('SHAFT', 'COG'):
             (ax, ay), (bx, by) = d_['start'], d_['cur']
             pygame.draw.circle(surf, SEL, scr(ax + 1.5, ay + 1.5), int(max(3, math.hypot(bx - ax, by - ay)) * cs), 1)
+        # physics objects get a thin outline and a tag
+        for f in sim.frames:
+            fr = pygame.Rect(self.x0 + int((f['x0'] - 1 + f['fx']) * cs), self.y0 + int((f['y0'] - 1 + f['fy']) * cs), f['w'] * cs, f['h'] * cs)
+            pygame.draw.rect(surf, (120, 220, 255), fr.inflate(4, 4), 1)
+            tg = self.app.tiny.render('physics', True, (120, 220, 255))
+            surf.blit(tg, (fr.x, fr.y - tg.get_height() - 3))
+        if self.chain_first:
+            q = self.chain_first
+            pygame.draw.circle(surf, SEL, scr(q['x'], q['y'], sim.foff(q['x'], q['y'])), int((q['R'] + 1) * cs), 2)
         # circuit links: line to whatever they're connected to, with their id
         for (x, y), lk in self.sim.glinks.items():
             if lk['tgt'] is None:
@@ -6674,7 +8033,7 @@ class GasMode:
                 for lx, ly in zip(xs.tolist(), ys.tolist()):
                     r = (self.x0 + (lx - 1) * cs, self.y0 + (ly - 1) * cs, cs, cs)
                     pygame.draw.rect(surf, SEL, r, 1)
-        if mp[0] >= PAL_W and self.tool != 'FILL':
+        if self.in_view(mp) and self.tool != 'FILL' and not any(r_.collidepoint(mp) for r_, _, _ in self.sel_buttons()):
             rr = max(7, int((self.size + 0.5) * cs))
             pts = [mp]
             if self.sym:
@@ -6690,25 +8049,15 @@ class GasMode:
                 pygame.draw.line(surf, SEL, (q[0], q[1] + rr - 2), (q[0], q[1] + rr + 5), 2)
         # hover readout
         c = self.cell(mp, clamp=False)
-        if c and mp[0] >= PAL_W:
+        if c and self.in_view(mp):
             t = self.app.small.render(self.sim.info(*c), True, TEXT)
             r = pygame.Rect(0, 0, t.get_width() + 12, t.get_height() + 6)
-            r.bottomright = (W - 8, H - 8)
+            r.bottomright = (vr.right - 8, vr.bottom - 8)
             pygame.draw.rect(surf, PANEL, r)
             pygame.draw.rect(surf, PART_LINE, r, 1)
             surf.blit(t, (r.x + 6, r.y + 3))
-        # palette
-        pygame.draw.rect(surf, PANEL, (0, 0, PAL_W, H))
-        pygame.draw.line(surf, PANEL_LINE, (PAL_W - 1, 0), (PAL_W - 1, H))
-        self.app.label(surf, 'GAS LAB', TEXT, (PAL_W // 2, 18))
-        for i, t in enumerate(G_TOOLS):
-            r = self.tool_rect(i)
-            on = t == self.tool
-            pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
-            pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
-            surf.blit(self.app.small.render(t, True, TEXT), (r.x + 8, r.y + 2))
         if self.view:
-            lw, lx, ly = 300, (W + PAL_W) // 2 - 150, H - 46
+            lw, lx, ly = 300, vr.centerx - 150, vr.bottom - 46
             stops = (G_RAMP_P, G_RAMP_T, G_RAMP_S)[self.view - 1]
             strip = ramp(np.linspace(0, 1, lw)[:, None] * np.ones((1, 12)), stops).astype(np.uint8)
             surf.blit(pygame.surfarray.make_surface(strip), (lx, ly))
@@ -6731,10 +8080,10 @@ class GasMode:
                 t_ = self.app.tiny.render(lab, True, TEXT)
                 surf.blit(t_, (mx_ - t_.get_width() // 2, ly + 17))
             t_ = self.app.small.render(f'{G_VIEWS[self.view]} ({unit})   t = next view', True, TEXT_DIM)
-            surf.blit(t_, ((W + PAL_W) // 2 - t_.get_width() // 2, ly - 20))
+            surf.blit(t_, (vr.centerx - t_.get_width() // 2, ly - 20))
         # thrust probes
         if self.sim.probes:
-            by = 10
+            by = vr.y + 10
             for i, ((px_, py_), pr) in enumerate(self.sim.probes.items()):
                 fx, fy = pr['f']
                 mag = math.hypot(fx, fy)
@@ -6753,7 +8102,7 @@ class GasMode:
                 if abs(fx) > 0.25 * mag:
                     dirs.append('right' if fx > 0 else 'left')
                 imp = math.hypot(*pr['imp'])
-                gx, gy, gw_, gh_ = PAL_W + 10, by, 250, 74
+                gx, gy, gw_, gh_ = vr.x + 10, by, 250, 74
                 pygame.draw.rect(surf, PANEL, (gx, gy, gw_, gh_))
                 pygame.draw.rect(surf, PANEL_LINE, (gx, gy, gw_, gh_), 1)
                 surf.blit(self.app.small.render(f'T{i + 1}  thrust {mag:.1f}  {" + ".join(dirs) or "-"}', True, (255, 190, 90)), (gx + 6, gy + 4))
@@ -6776,7 +8125,7 @@ class GasMode:
             rs = [self.app.small.render(t, True, TEXT) for t in lines]
             bw = max(r_.get_width() for r_ in rs) + 16
             bh = len(rs) * 17 + 8
-            box = pygame.Rect(W - bw - 10, 10, bw, bh)
+            box = pygame.Rect(vr.right - bw - 10, vr.y + 10, bw, bh)
             pygame.draw.rect(surf, PANEL, box)
             pygame.draw.rect(surf, PANEL_LINE, box, 1)
             for i, r_ in enumerate(rs):
@@ -6787,7 +8136,7 @@ class GasMode:
                 if not h or len(h) < 2:
                     continue
                 gw, gh = 240, 58
-                gr = pygame.Rect(W - gw - 10, gy, gw, gh)
+                gr = pygame.Rect(vr.right - gw - 10, gy, gw, gh)
                 pygame.draw.rect(surf, PANEL, gr)
                 pygame.draw.rect(surf, PANEL_LINE, gr, 1)
                 for col_, idx, nm in (((110, 180, 255), 0, 'atm'), ((255, 140, 90), 1, 'C')):
@@ -6801,52 +8150,17 @@ class GasMode:
                     surf.blit(t_, (gr.x + 6 + idx * 110, gr.y + 3))
                 surf.blit(self.app.tiny.render(str(i + 1), True, SEL), (gr.right - 12, gr.y + 3))
                 gy += gh + 6
-        self.list_bottom = H - (len(G_HELP) * 15 + 30) - 6
-        self.clamp_scroll()
-        surf.blit(self.app.small.render('MATERIAL  (scroll)', True, TEXT_DIM), (12, self.mat_top() - 20))
-        surf.set_clip(pygame.Rect(0, self.mat_top() - 2, PAL_W - 1, self.list_bottom - self.mat_top() + 4))
-        for i, (m, comp) in enumerate(G_MATS):
-            r = self.mat_rect(i)
-            if r.bottom < self.mat_top() or r.top > self.list_bottom:
-                continue
-            on = m == self.mat
-            pygame.draw.rect(surf, ACTIVE if on else PART_BG, r)
-            pygame.draw.rect(surf, SEL if on else PANEL_LINE, r, 1)
-            if m in G_SENSOR_TYPES:
-                sw = G_SENSOR_COLOR[G_SENSOR_TYPES[m]]
-            elif m == 'LINK':
-                sw = G_SOLIDS[G_LINK][2]
-            elif m == 'THRUST PROBE':
-                sw = (255, 170, 60)
-            elif m == 'WATER':
-                sw = (60, 130, 230)
-            elif m in G_MECH:
-                sw = (200, 204, 214)
-            elif comp:
-                sw = tuple(int(sum(G_COLOR[G_IDX[s]][ch] * f for s, f in comp.items()) * 1.4) for ch in range(3))
-                sw = tuple(min(255, x) for x in sw)
-            else:
-                sw = G_SOLIDS[G_SOLID_MATS[m]][2] if m in G_SOLID_MATS else \
-                    (G_BLOCK_COLOR if m == 'BLOCK' else (6, 8, 16))
-            pygame.draw.rect(surf, sw, (r.x, r.y, 4, r.h))
-            surf.blit(self.app.small.render(m, True, TEXT), (r.x + 10, r.y + 2))
+        if self.slide > 0.02 and self.slide_img is not None:
+            S = G_SLAB * self.cs * self.slide_dir
+            new = surf.subsurface(vr).copy()
+            surf.set_clip(vr)
+            surf.blit(self.slide_img, (vr.x + (self.slide - 1) * S, vr.y))
+            surf.blit(new, (vr.x + self.slide * S, vr.y))
+            self.slide *= 0.8
+        else:
+            self.slide, self.slide_img = 0.0, None
         surf.set_clip(None)
-        hy = H - (len(G_HELP) * 15 + 30)
-        for i, t in enumerate(G_HELP):
-            surf.blit(self.app.small.render(t, True, TEXT_DIM), (12, hy + i * 15))
-        st = f"x{self.speed}" + ('  PAUSED' if self.paused else '') + ('' if not self.sym else '  sym ' + 'xyb'[self.sym - 1]) + ('  void' if self.sim.void else '' if self.sim.open else '  closed') \
-            + ('' if self.sim.gravity else '  no g')
-        surf.blit(self.app.small.render(st, True, SEL if self.paused else TEXT), (12, H - 22))
-        ct = self.app.small.render(_CR_A, True, TEXT_DIM)
-        surf.blit(ct, (W - ct.get_width() - 10, H - 18))
-        msg, until = self.app.toast
-        if msg and time.time() < until:
-            t = self.app.font.render(msg, True, TEXT)
-            tr = pygame.Rect(0, 0, t.get_width() + 24, t.get_height() + 14)
-            tr.midtop = ((W + PAL_W) // 2, 12)
-            pygame.draw.rect(surf, PANEL, tr)
-            pygame.draw.rect(surf, SEL, tr, 1)
-            surf.blit(t, t.get_rect(center=tr.center))
+        self.draw_chrome(surf)
 
 
 def main():
