@@ -4,6 +4,7 @@ import colorsys
 import hashlib
 import io
 import random
+import re
 import heapq
 import math
 import json
@@ -45,16 +46,21 @@ RU = 12             # wire router grid, half a cell
 MARGIN = 15         # wires keep this far from parts when they can
 PERIODS = [5, 10, 25, 50, 100, 250, 500, 1000]   # clock half-periods in ticks
 MONO = 'dejavusansmono,consolas,couriernew,menlo,monospace'
+SANS = 'segoeui,helveticaneue,inter,dejavusans,arial'
+TOPH = 44           # top bar height (circuit screen)
+RPW = 248           # parts panel width, on the right
+VX0, VY0 = 0, TOPH  # where the work area starts on screen
 FONT = None         # set by App, used to size LABEL parts
+ICON_MODE = False   # drawing a tiny part preview: no text
 
 
 def w2s(x, y):
     # world pixels -> screen pixels
-    return PAL_W + (x - CAMX) * ZOOM, (y - CAMY) * ZOOM
+    return VX0 + (x - CAMX) * ZOOM, VY0 + (y - CAMY) * ZOOM
 
 
 def s2w(x, y):
-    return (x - PAL_W) / ZOOM + CAMX, y / ZOOM + CAMY
+    return (x - VX0) / ZOOM + CAMX, (y - VY0) / ZOOM + CAMY
 
 
 def sc(v, lo=1):
@@ -153,7 +159,8 @@ THEMES = {
         SEL=(255, 208, 80), ACTIVE=(22, 64, 96), LAMP_ON=(255, 226, 120),
         SEG_OFF=(27, 40, 68), SEG_DEFAULT=(240, 245, 255), PREVIEW=(150, 190, 235),
         HDR_LOGIC=(92, 70, 160), HDR_INPUT=(176, 112, 38), HDR_OUTPUT=(28, 128, 140),
-        HDR_MEM=(160, 58, 120), HDR_CHIP=(50, 112, 190), HDR_TEXT=(255, 255, 255), DIM=(0, 0, 0)),
+        HDR_MEM=(160, 58, 120), HDR_CHIP=(50, 112, 190), HDR_TEXT=(255, 255, 255), DIM=(0, 0, 0),
+        CARD=(19, 31, 54), CARD_HI=(27, 45, 76)),
     'light': dict(
         BG=(234, 240, 248), GRID=(214, 223, 236), GRID2=(196, 208, 226),
         PANEL=(222, 230, 242), PANEL_LINE=(140, 162, 196),
@@ -163,7 +170,8 @@ THEMES = {
         SEL=(226, 140, 0), ACTIVE=(206, 230, 250), LAMP_ON=(255, 200, 40),
         SEG_OFF=(214, 222, 236), SEG_DEFAULT=(20, 30, 50), PREVIEW=(70, 110, 170),
         HDR_LOGIC=(132, 112, 206), HDR_INPUT=(222, 150, 60), HDR_OUTPUT=(60, 164, 176),
-        HDR_MEM=(200, 100, 166), HDR_CHIP=(70, 130, 210), HDR_TEXT=(255, 255, 255), DIM=(20, 30, 50)),
+        HDR_MEM=(200, 100, 166), HDR_CHIP=(70, 130, 210), HDR_TEXT=(255, 255, 255), DIM=(20, 30, 50),
+        CARD=(246, 249, 253), CARD_HI=(232, 240, 252)),
 }
 
 
@@ -226,15 +234,33 @@ PAL_ITEMS = ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GATE', 'LAMP', 'DISPLAY', '
              'NOT', 'BUF', 'TOGGLE', 'DELAY', 'EXTENDER', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR',
              'SR LATCH', 'NV LATCH', 'GAS IN', 'GAS OUT', 'PIN', 'LABEL']
 
+PAL_CATS = [('INPUT', ['SOURCE', 'SWITCH', 'BUTTON', 'CLOCK', 'GAS IN']),
+            ('OUTPUT', ['LAMP', 'DISPLAY', 'TOUCH', '7SEG', 'SCOPE', 'GAS OUT']),
+            ('LOGIC', ['GATE', 'NOT', 'BUF', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR']),
+            ('MEMORY', ['SR LATCH', 'NV LATCH', 'TOGGLE', 'DELAY', 'EXTENDER']),
+            ('CHIPS', ['PIN']),
+            ('OTHER', ['LABEL'])]
+PAL_NICE = {'7SEG': '7-segment', 'GAS IN': 'Gas in', 'GAS OUT': 'Gas out', 'SR LATCH': 'SR latch',
+            'NV LATCH': 'NV latch', 'PIN': 'Chip pin', 'GATE': 'Pass gate'}
+ICON_TXT = {'SOURCE': 'ON', 'CLOCK': 'CLK', 'GAS IN': 'GAS', 'GAS OUT': 'GAS', 'LAMP': '', 'GATE': 'GATE',
+            'SR LATCH': 'SR', 'NV LATCH': 'NV', 'TOGGLE': 'T', 'DELAY': 'DLY', 'EXTENDER': 'EXT',
+            'LABEL': 'Aa'}
+S_ALIAS = {'BTN': 'BUTTON', 'SW': 'SWITCH', 'LED': 'LAMP', 'SEG': '7SEG', 'CLK': 'CLOCK'}
+HELP2 = [('enter', 'compile / build'), ('drag from panel', 'add a part'), ('pin to pin', 'draw a wire'),
+         ('drag background', 'box select'), ('ctrl+click', 'add to selection'), ('ctrl+c x v a', 'copy cut paste all'),
+         ('del', 'delete'), ('g', 'make a chip'), ('u', 'open a chip'), ('ctrl+s', 'save chip (asks a name)'),
+         ('drag chip to panel', 'save it as a chip'),
+         ('wheel', 'zoom'), ('rmb drag', 'pan'), ('home', 'reset view'), ('rmb click', 'delete'),
+         ('double-click', 'rename'), ('space / n', 'pause / step'), ('up / down', 'speed'),
+         ('l', 'light / dark'), ('tab', 'gas lab'), ('` (backtick)', 'script panel'),
+         ('ctrl+enter', 'run script'), ('ctrl+f', 'search parts'), ('f5', 'check for update')]
+S_HELP = [('on NAME', 'switch on'), ('off NAME', 'switch off'), ('toggle NAME', 'flip a switch'),
+          ('press NAME', 'press a button'), ('wait 10', 'ticks (or 0.5s, 200ms)'),
+          ('', ''), ('NAME', 'a label you gave a part'), ('', 'or KIND#n, like SWITCH#1'),
+          ('# comment', 'NAMES tab lists them all'), ('', ''),
+          ('one step per line, top to bottom,', ''), ('a wait pauses the macro.', '')]
 RUN_KEYS = {pygame.K_SPACE, pygame.K_UP, pygame.K_DOWN, pygame.K_l, pygame.K_t,
             pygame.K_n, pygame.K_HOME, pygame.K_TAB, pygame.K_RETURN, pygame.K_KP_ENTER}
-HELP = ['enter = compile / build', 'drag out parts', 'pin-pin = wire', 'drag bg = select', 'ctrl+click = add',
-        'ctrl+c x v a', 'del = delete', 'g = make chip', 'u = open chip',
-        'ctrl+s = chip to file',
-        'wheel = zoom', 'rmb drag = pan', 'home = reset', 'rmb click = del',
-        'dbl-click: name', 'space / n', 'up/dn = speed', 'l light',
-        'clr: ctrl+sh+del', 'tab = gas lab', 'f5 = check update']
-HELP_H = 8 + len(HELP) * 15 + 26
 SEG_NAMES = 'abcdefg'
 # kinds with an editable description in the body (double-click the empty space)
 DESC_KINDS = set(GATES) | {'SOURCE', 'SWITCH', 'BUTTON', 'GATE', 'LAMP', 'SR LATCH', 'NV LATCH', 'TOGGLE'}
@@ -346,17 +372,38 @@ def wire_pts(a, b):
     return [a, (mx, a[1]), (mx, b[1]), b]
 
 
+def round_pts(pts):
+    # orthogonal polyline with its corners rounded off
+    if len(pts) < 3:
+        return pts
+    R = max(3.0, 7 * ZOOM)
+    out = [pts[0]]
+    for i in range(1, len(pts) - 1):
+        a, b, c = pts[i - 1], pts[i], pts[i + 1]
+        d1, d2 = math.hypot(b[0] - a[0], b[1] - a[1]), math.hypot(c[0] - b[0], c[1] - b[1])
+        if d1 == 0 or d2 == 0 or abs((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])) < 1e-6:
+            out.append(b)
+            continue
+        r = min(R, d1 / 2, d2 / 2)
+        p1 = (b[0] + (a[0] - b[0]) * r / d1, b[1] + (a[1] - b[1]) * r / d1)
+        p2 = (b[0] + (c[0] - b[0]) * r / d2, b[1] + (c[1] - b[1]) * r / d2)
+        for t in (0, 0.25, 0.5, 0.75, 1.0):
+            u = 1 - t
+            out.append((u * u * p1[0] + 2 * u * t * b[0] + t * t * p2[0],
+                        u * u * p1[1] + 2 * u * t * b[1] + t * t * p2[1]))
+    out.append(pts[-1])
+    return out
+
+
 def draw_wire(surf, pts, color, w):
-    # outline in the opposite color so a wire never melts into the background or grid
-    inv = (255 - color[0], 255 - color[1], 255 - color[2])
-    ow = w + 2
-    pygame.draw.lines(surf, inv, False, pts, ow)
-    for q in pts[1:-1]:
-        pygame.draw.rect(surf, inv, (q[0] - ow // 2, q[1] - ow // 2, ow, ow))
+    pts = round_pts(pts)
+    if len(pts) < 2:
+        return
     pygame.draw.lines(surf, color, False, pts, w)
-    if w > 1:
+    if w > 2:
+        r = w // 2
         for q in pts[1:-1]:
-            pygame.draw.rect(surf, color, (q[0] - w // 2, q[1] - w // 2, w, w))
+            pygame.draw.circle(surf, color, (int(q[0]), int(q[1])), r)
 
 
 def poly_len(pts):
@@ -700,6 +747,489 @@ def wrap(font, text, width):
     return lines
 
 
+# ---------------------------------------------------------------- script (macro) panel
+S_CMDS = ('on', 'off', 'toggle', 'press', 'click', 'wait')
+S_TOK = re.compile(r'(#.*|//.*)|("[^"]*")|(\b\d+(?:\.\d+)?(?:ms|s)?\b)|(\S+)|(\s+)')
+S_EXAMPLES = [
+    ('load', '# flip a switch, press a few buttons, one after another\non SWITCH#1\nwait 10\npress BUTTON#1\nwait 5\npress BUTTON#2\nwait 5\noff SWITCH#1\n'),
+    ('blink', '# flip the first switch on and off\non SWITCH#1\nwait 20\noff SWITCH#1\nwait 20\non SWITCH#1\nwait 20\noff SWITCH#1\n'),
+    ('seconds', '# waits can be in seconds too\ntoggle SWITCH#1\nwait 0.5s\ntoggle SWITCH#1\nwait 200ms\npress BUTTON#1\n'),
+]
+
+
+def s_tokens(s):
+    # split a script line into words, "quoted names" stay in one piece
+    out = []
+    for m in re.finditer(r'"([^"]*)"|(\S+)', s):
+        out.append(m.group(1) if m.group(1) is not None else m.group(2))
+    return out
+
+
+def s_strip(raw):
+    # drop # and // comments (only where a word starts, so SWITCH#1 survives)
+    q = False
+    for i, ch in enumerate(raw):
+        if ch == '"':
+            q = not q
+        elif not q and (ch == '#' or raw[i:i + 2] == '//') and (i == 0 or raw[i - 1] in ' \t'):
+            return raw[:i]
+    return raw
+
+
+def s_dur(tok):
+    # '10' ticks, '0.5s' seconds, '200ms' -> (number, unit)
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)(ms|s)?', tok.lower())
+    if not m:
+        raise ValueError(f'"{tok}" is not a time (try 10, 0.5s or 200ms)')
+    return float(m.group(1)), (m.group(2) or 't')
+
+
+def s_parse(text):
+    # -> (program, {row: error}); a program is a list of on / off / toggle / press / wait steps
+    prog, errs = [], {}
+    for ln, raw in enumerate(text.split('\n')):
+        s = s_strip(raw).strip()
+        toks = s_tokens(s) if s else []
+        if not toks:
+            continue
+        cmd, args = toks[0].lower(), toks[1:]
+        if cmd not in S_CMDS:
+            errs[ln] = f'unknown command "{toks[0]}" (on off toggle press wait)'
+        elif cmd == 'wait':
+            if len(args) != 1:
+                errs[ln] = 'usage: wait 10   (ticks, or 0.5s, 200ms)'
+                continue
+            try:
+                prog.append(dict(op='wait', dur=s_dur(args[0]), ln=ln))
+            except ValueError as ex:
+                errs[ln] = str(ex)
+        elif not args:
+            errs[ln] = f'usage: {cmd} NAME'
+        else:
+            prog.append(dict(op=cmd, names=args, ln=ln))
+    return prog, errs
+
+
+class Runner:
+    # runs a script one sim tick at a time, so "wait 10" means ten ticks of the circuit
+    def __init__(self, app):
+        self.app = app
+        self.active = False
+        self.prog = []
+        self.pc = 0
+        self.wait = 0
+        self.ticks = 0
+
+    def log(self, text, kind='info'):
+        self.app.log_add(f't{self.ticks} · {text}', kind)
+
+    def start(self, text):
+        app = self.app
+        prog, errs = s_parse(text)
+        ed = app.ed
+        ed.err = dict(errs)
+        for ins in prog:
+            for nm in ins.get('names', ()):
+                ps = app.find_parts(nm)
+                if not ps:
+                    ed.err[ins['ln']] = f'no part named "{nm}"'
+                elif ins['op'] in ('on', 'off', 'toggle') and any(p.kind != 'SWITCH' for p in ps):
+                    ed.err[ins['ln']] = f'"{nm}" is not a switch'
+                elif ins['op'] in ('press', 'click') and any(p.kind not in ('BUTTON', 'TOUCH', 'SWITCH') for p in ps):
+                    ed.err[ins['ln']] = f'"{nm}" is not a button'
+        if ed.err:
+            for ln in sorted(ed.err):
+                app.log_add(f'line {ln + 1}: {ed.err[ln]}', 'err')
+            app.say('fix the script first (see the log)')
+            return False
+        if not prog:
+            app.log_add('nothing to run', 'err')
+            return False
+        self.prog, self.pc, self.wait, self.ticks = prog, 0, 0, 0
+        self.active = True
+        app.log_add('script started', 'info')
+        return True
+
+    def stop(self, why='stopped', kind='info'):
+        if self.active:
+            self.app.log_add(f't{self.ticks} · {why}', kind)
+        self.active = False
+        self.app.ed.run_row = -1
+
+    def ticks_of(self, dur):
+        v, u = dur
+        if u == 's':
+            v *= self.app.rate
+        elif u == 'ms':
+            v *= self.app.rate / 1000.0
+        return max(1, int(round(v)))
+
+    def before_tick(self):
+        if not self.active:
+            return
+        app = self.app
+        self.ticks += 1
+        if self.wait > 0:
+            self.wait -= 1
+            if self.wait > 0:
+                return
+        while self.pc < len(self.prog):
+            ins = self.prog[self.pc]
+            self.pc += 1
+            app.ed.run_row = ins['ln']
+            op = ins['op']
+            if op == 'wait':
+                self.wait = self.ticks_of(ins['dur'])
+                return
+            for nm in ins['names']:
+                for p in app.find_parts(nm):
+                    if op == 'on':
+                        p.on = True
+                    elif op == 'off':
+                        p.on = False
+                    elif op == 'toggle' and p.kind == 'SWITCH':
+                        p.on = not p.on
+                    else:
+                        app.run_click(p)
+            self.log(f'{op} {" ".join(ins["names"])}', 'ok')
+        self.stop('done', 'ok')
+
+
+class Editor:
+    # small multi-line text box for the script panel
+    LH = 18
+
+    def __init__(self):
+        self.lines = ['']
+        self.cx = self.cy = 0
+        self.anchor = None
+        self.scroll = 0
+        self.focus = False
+        self.undo, self.redo = [], []
+        self.last_edit = 0
+        self.last_kind = ''
+        self.err = {}
+        self.run_row = -1
+        self.clip = ''
+        self.font = None
+        self.gutter = 40
+
+    def text(self):
+        return '\n'.join(self.lines)
+
+    def set_text(self, t):
+        self.lines = str(t).replace('\r', '').split('\n') or ['']
+        self.cx = self.cy = 0
+        self.anchor = None
+        self.scroll = 0
+        self.undo, self.redo = [], []
+        self.err = {}
+
+    # -- selection / editing helpers
+    def sel_range(self):
+        if self.anchor is None or self.anchor == (self.cx, self.cy):
+            return None
+        a, b = self.anchor, (self.cx, self.cy)
+        if (a[1], a[0]) > (b[1], b[0]):
+            a, b = b, a
+        return a, b
+
+    def selected(self):
+        r = self.sel_range()
+        if not r:
+            return ''
+        (x0, y0), (x1, y1) = r
+        if y0 == y1:
+            return self.lines[y0][x0:x1]
+        return '\n'.join([self.lines[y0][x0:]] + self.lines[y0 + 1:y1] + [self.lines[y1][:x1]])
+
+    def snap(self, kind):
+        now = pygame.time.get_ticks()
+        if kind != self.last_kind or now - self.last_edit > 700:
+            self.undo.append((list(self.lines), self.cx, self.cy))
+            del self.undo[:-200]
+        self.redo.clear()
+        self.last_kind, self.last_edit = kind, now
+
+    def del_sel(self):
+        r = self.sel_range()
+        if not r:
+            return False
+        (x0, y0), (x1, y1) = r
+        self.lines[y0:y1 + 1] = [self.lines[y0][:x0] + self.lines[y1][x1:]]
+        self.cx, self.cy = x0, y0
+        self.anchor = None
+        return True
+
+    def insert(self, s):
+        self.del_sel()
+        parts = s.replace('\r', '').split('\n')
+        line = self.lines[self.cy]
+        head, tail = line[:self.cx], line[self.cx:]
+        if len(parts) == 1:
+            self.lines[self.cy] = head + parts[0] + tail
+            self.cx += len(parts[0])
+        else:
+            self.lines[self.cy:self.cy + 1] = [head + parts[0]] + parts[1:-1] + [parts[-1] + tail]
+            self.cy += len(parts) - 1
+            self.cx = len(parts[-1])
+        self.anchor = None
+
+    def move(self, dx, dy, shift):
+        if shift and self.anchor is None:
+            self.anchor = (self.cx, self.cy)
+        elif not shift:
+            self.anchor = None
+        self.cy = max(0, min(len(self.lines) - 1, self.cy + dy))
+        self.cx = max(0, min(len(self.lines[self.cy]), self.cx))
+        if dx:
+            self.cx += dx
+            if self.cx < 0:
+                if self.cy > 0:
+                    self.cy -= 1
+                    self.cx = len(self.lines[self.cy])
+                else:
+                    self.cx = 0
+            elif self.cx > len(self.lines[self.cy]):
+                if self.cy < len(self.lines) - 1:
+                    self.cy += 1
+                    self.cx = 0
+                else:
+                    self.cx = len(self.lines[self.cy])
+
+    def get_clip(self):
+        try:
+            if pygame.scrap.get_init():
+                t = pygame.scrap.get_text()
+                if t:
+                    return t
+        except Exception:
+            pass
+        return self.clip
+
+    def put_clip(self, t):
+        self.clip = t
+        try:
+            if not pygame.scrap.get_init():
+                pygame.scrap.init()
+            pygame.scrap.put_text(t)
+        except Exception:
+            pass
+
+    def key(self, e):
+        k, mod = e.key, e.mod
+        ctrl, shift = bool(mod & pygame.KMOD_CTRL), bool(mod & pygame.KMOD_SHIFT)
+        if ctrl:
+            if k == pygame.K_a:
+                self.anchor = (0, 0)
+                self.cy = len(self.lines) - 1
+                self.cx = len(self.lines[self.cy])
+            elif k == pygame.K_c:
+                if self.selected():
+                    self.put_clip(self.selected())
+            elif k == pygame.K_x:
+                if self.selected():
+                    self.put_clip(self.selected())
+                    self.snap('cut')
+                    self.del_sel()
+            elif k == pygame.K_v:
+                t = self.get_clip()
+                if t:
+                    self.snap('paste')
+                    self.insert(t)
+            elif k == pygame.K_z:
+                if self.undo:
+                    self.redo.append((list(self.lines), self.cx, self.cy))
+                    self.lines, self.cx, self.cy = self.undo.pop()
+                    self.anchor = None
+            elif k == pygame.K_y:
+                if self.redo:
+                    self.undo.append((list(self.lines), self.cx, self.cy))
+                    self.lines, self.cx, self.cy = self.redo.pop()
+                    self.anchor = None
+            elif k in (pygame.K_LEFT, pygame.K_RIGHT):
+                if shift and self.anchor is None:
+                    self.anchor = (self.cx, self.cy)
+                elif not shift:
+                    self.anchor = None
+                line = self.lines[self.cy]
+                if k == pygame.K_LEFT:
+                    i = self.cx
+                    while i > 0 and line[i - 1] == ' ':
+                        i -= 1
+                    while i > 0 and line[i - 1] != ' ':
+                        i -= 1
+                    self.cx = i
+                else:
+                    i = self.cx
+                    while i < len(line) and line[i] == ' ':
+                        i += 1
+                    while i < len(line) and line[i] != ' ':
+                        i += 1
+                    self.cx = i
+            return
+        if k == pygame.K_LEFT:
+            if self.sel_range() and not shift:
+                a, b = self.sel_range()
+                self.cx, self.cy = a
+                self.anchor = None
+            else:
+                self.move(-1, 0, shift)
+        elif k == pygame.K_RIGHT:
+            if self.sel_range() and not shift:
+                a, b = self.sel_range()
+                self.cx, self.cy = b
+                self.anchor = None
+            else:
+                self.move(1, 0, shift)
+        elif k == pygame.K_UP:
+            self.move(0, -1, shift)
+        elif k == pygame.K_DOWN:
+            self.move(0, 1, shift)
+        elif k == pygame.K_HOME:
+            self.move(-len(self.lines[self.cy]), 0, shift)
+        elif k == pygame.K_END:
+            self.move(len(self.lines[self.cy]), 0, shift)
+        elif k == pygame.K_PAGEUP:
+            self.move(0, -10, shift)
+        elif k == pygame.K_PAGEDOWN:
+            self.move(0, 10, shift)
+        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.snap('enter')
+            self.del_sel()
+            line = self.lines[self.cy]
+            ind = len(line) - len(line.lstrip(' '))
+            word = line.strip().split(' ')[0].lower() if line.strip() else ''
+            if word in ('repeat', 'forever', 'if', 'else'):
+                ind += 2
+            self.insert('\n' + ' ' * ind)
+        elif k == pygame.K_BACKSPACE:
+            self.snap('del')
+            if not self.del_sel():
+                if self.cx > 0:
+                    line = self.lines[self.cy]
+                    n = 1
+                    if line[:self.cx].strip() == '' and self.cx >= 2:
+                        n = 2 if self.cx % 2 == 0 else 1
+                    self.lines[self.cy] = line[:self.cx - n] + line[self.cx:]
+                    self.cx -= n
+                elif self.cy > 0:
+                    prev = self.lines[self.cy - 1]
+                    self.lines[self.cy - 1] = prev + self.lines[self.cy]
+                    del self.lines[self.cy]
+                    self.cy -= 1
+                    self.cx = len(prev)
+        elif k == pygame.K_DELETE:
+            self.snap('del')
+            if not self.del_sel():
+                line = self.lines[self.cy]
+                if self.cx < len(line):
+                    self.lines[self.cy] = line[:self.cx] + line[self.cx + 1:]
+                elif self.cy < len(self.lines) - 1:
+                    self.lines[self.cy] = line + self.lines[self.cy + 1]
+                    del self.lines[self.cy + 1]
+        elif k == pygame.K_TAB:
+            self.snap('tab')
+            self.insert('  ')
+        elif e.unicode and e.unicode.isprintable():
+            self.snap('type')
+            self.insert(e.unicode)
+
+    # -- mouse
+    def pos_at(self, pos, rect):
+        row = max(0, min(len(self.lines) - 1, self.scroll + (pos[1] - rect.y - 4) // self.LH))
+        x = pos[0] - rect.x - self.gutter - 6
+        line = self.lines[row]
+        col = 0
+        for i in range(len(line) + 1):
+            if self.font.size(line[:i])[0] > x + 3:
+                break
+            col = i
+        return col, row
+
+    def click(self, pos, rect, shift=False):
+        self.focus = True
+        col, row = self.pos_at(pos, rect)
+        if shift and self.anchor is None:
+            self.anchor = (self.cx, self.cy)
+        elif not shift:
+            self.anchor = (col, row)
+        self.cx, self.cy = col, row
+
+    def drag(self, pos, rect):
+        self.cx, self.cy = self.pos_at(pos, rect)
+
+    def wheel(self, dy, rect):
+        vis = max(1, (rect.h - 8) // self.LH)
+        self.scroll = max(0, min(max(0, len(self.lines) - vis), self.scroll - dy * 3))
+
+    def draw(self, surf, rect, col):
+        # col: dict of colors
+        f = self.font
+        vis = max(1, (rect.h - 8) // self.LH)
+        if self.cy < self.scroll:
+            self.scroll = self.cy
+        elif self.cy >= self.scroll + vis:
+            self.scroll = self.cy - vis + 1
+        self.scroll = max(0, min(max(0, len(self.lines) - vis), self.scroll))
+        pygame.draw.rect(surf, col['bg'], rect, border_radius=8)
+        old = surf.get_clip()
+        surf.set_clip(rect.inflate(-2, -2).clip(old))
+        gx = rect.x + self.gutter
+        pygame.draw.rect(surf, col['gut'], (rect.x, rect.y, self.gutter, rect.h), border_top_left_radius=8, border_bottom_left_radius=8)
+        sel = self.sel_range()
+        for r in range(self.scroll, min(len(self.lines), self.scroll + vis + 1)):
+            y = rect.y + 4 + (r - self.scroll) * self.LH
+            line = self.lines[r]
+            if r == self.run_row:
+                pygame.draw.rect(surf, col['run'], (rect.x + 2, y - 1, rect.w - 4, self.LH), border_radius=4)
+            elif r in self.err:
+                pygame.draw.rect(surf, col['errbg'], (rect.x + 2, y - 1, rect.w - 4, self.LH), border_radius=4)
+            elif r == self.cy and self.focus and not sel:
+                pygame.draw.rect(surf, col['cur'], (gx, y - 1, rect.w - self.gutter - 2, self.LH), border_radius=4)
+            if sel:
+                (x0, y0), (x1, y1) = sel
+                if y0 <= r <= y1:
+                    a = x0 if r == y0 else 0
+                    b = x1 if r == y1 else len(line) + 1
+                    xa = gx + 6 + f.size(line[:a])[0]
+                    xb = gx + 6 + f.size(line[:b])[0] + (4 if b > len(line) else 0)
+                    pygame.draw.rect(surf, col['sel'], (xa, y - 1, max(3, xb - xa), self.LH))
+            num = f.render(str(r + 1), True, col['err'] if r in self.err else col['dim'])
+            surf.blit(num, (rect.x + self.gutter - 8 - num.get_width(), y + (self.LH - num.get_height()) // 2 - 1))
+            first = True
+            for m in S_TOK.finditer(line):
+                t = m.group(0)
+                if m.group(5):
+                    continue
+                if m.group(1):
+                    c = col['cmt']
+                elif first:
+                    c = col['cmd'] if t.lower() in S_CMDS else col['err']
+                    first = False
+                elif m.group(2):
+                    c = col['str']
+                elif m.group(3):
+                    c = col['num']
+                elif t.lower() in ('on', 'off'):
+                    c = col['kw']
+                else:
+                    c = col['name']
+                img = f.render(t, True, c)
+                surf.blit(img, (gx + 6 + f.size(line[:m.start()])[0], y + (self.LH - img.get_height()) // 2 - 1))
+            if r in self.err:
+                pygame.draw.circle(surf, col['err'], (rect.x + 7, y + self.LH // 2 - 1), 3)
+        if self.focus and (pygame.time.get_ticks() // 500) % 2 == 0:
+            y = rect.y + 4 + (self.cy - self.scroll) * self.LH
+            x = gx + 6 + f.size(self.lines[self.cy][:self.cx])[0]
+            pygame.draw.line(surf, col['caret'], (x, y), (x, y + self.LH - 3), 2)
+        surf.set_clip(old)
+        if len(self.lines) > vis:
+            th = max(18, int(rect.h * vis / len(self.lines)))
+            ty = rect.y + int((rect.h - th) * self.scroll / max(1, len(self.lines) - vis))
+            pygame.draw.rect(surf, col['dim'], (rect.right - 5, ty, 3, th), border_radius=2)
+
+
 # ---------------------------------------------------------------- compiled circuit
 _TBL = None
 
@@ -1031,6 +1561,11 @@ class App:
         self.small = pygame.font.SysFont(MONO, 13)
         self.tiny = pygame.font.SysFont(MONO, 11, bold=True)
         self.descf = pygame.font.SysFont(MONO, 11)
+        self.ui = pygame.font.SysFont(SANS, 14)
+        self.ui_b = pygame.font.SysFont(SANS, 14, bold=True)
+        self.ui_s = pygame.font.SysFont(SANS, 12)
+        self.ui_h = pygame.font.SysFont(SANS, 17, bold=True)
+        self.edf = pygame.font.SysFont(MONO, 13)
         self.edit_field = 'title'
         global FONT
         FONT = self.font
@@ -1041,6 +1576,7 @@ class App:
         self.updater = None
         self.modal_img = None
         self.editing = None     # part being renamed
+        self.namebox = None     # chip name prompt: dict(part, text, fresh)
         self.edit_on = False
         self.edit_text = ''
         self.edit_fresh = False
@@ -1048,6 +1584,14 @@ class App:
         self.sel = set()        # selected parts
         self.clip = None        # copied parts + the wires between them
         self.pal_scroll = 0
+        self.search, self.search_focus, self.cat_open, self.icons = '', False, {}, {}
+        self.dock_open, self.dock_h, self.dock_tab, self.dock_drag = False, 260, 'SCRIPT', None
+        self.ed = Editor()
+        self.ed.font = self.edf
+        self.ed.set_text('# macro: on / off / toggle / press / wait\n# example:  on SWITCH#1   then   wait 10   then   press BUTTON#1\n# ctrl+enter runs it, the ? button lists the commands\n')
+        self.runner = Runner(self)
+        self.script_log, self.log_scroll, self.names_scroll, self.ex_i = [], 0, 0, 0
+        self.help_open = False
         self.topo_key = None    # cached net layout, rebuilt when parts/wires change
         self.root = {}
         self.out_pins = []
@@ -1410,14 +1954,25 @@ class App:
         self.advance(n)
 
     def advance(self, n):
-        if self.cmp:
-            self.cmp.run(n)
-        else:
-            for _ in range(n):
-                self.step()
+        r = self.runner
+        i = 0
+        while i < n:
+            if r.active:
+                r.before_tick()     # the script gets a go before every tick
+                k = 1
+            else:
+                k = n - i
+            if self.cmp:
+                self.cmp.run(k)
+            else:
+                for _ in range(k):
+                    self.step()
+            i += k
 
     def toggle_run(self):
         if self.running:
+            if self.runner.active:
+                self.runner.stop('stopped (build mode)')
             if self.cmp:
                 self.cmp.stop()
                 self.cmp = None
@@ -1707,7 +2262,7 @@ class App:
         idx = {p.uid: i for i, p in enumerate(self.parts)}
         data = dict(
             version=2, made_by=AUTHOR, rate=self.rate, light=self.light,
-            view=[CAMX, CAMY, ZOOM],
+            view=[CAMX, CAMY, ZOOM], script=self.ed.text(), dock=self.dock_open, dock_h=self.dock_h,
             parts=[self.part_to_dict(p) for p in self.parts],
             wires=[[idx[a.uid], ia, idx[b.uid], ib] for a, ia, b, ib in self.wires])
         try:
@@ -1752,6 +2307,10 @@ class App:
             if isinstance(v, list) and len(v) == 3:
                 CAMX, CAMY = float(v[0]), float(v[1])
                 ZOOM = max(MIN_ZOOM, min(MAX_ZOOM, float(v[2])))
+            if isinstance(data.get('script'), str):
+                self.ed.set_text(data['script'][:20000])
+            self.dock_open = bool(data.get('dock'))
+            self.dock_h = max(130, min(600, int(data.get('dock_h', 260))))
             set_theme(self.light)
             self.reset_caches()
         except (KeyError, TypeError, ValueError, IndexError):
@@ -1762,11 +2321,9 @@ class App:
 
     def reset_caches(self):
         self.grid_cache = None
+        self.icons = {}
 
     # ------------------------------------------------------------ helpers
-    def pal_area(self, H):
-        return 36, H - HELP_H
-
     def pal_items(self):
         return PAL_ITEMS + ['CHIP: ' + n for n in self.chip_defs]
 
@@ -1791,15 +2348,86 @@ class App:
                 pass
 
     def save_chip(self):
+        # ctrl+s / button: ask for a name for the selected chip
         chips = [p for p in self.parts if p in self.sel and p.kind == 'CHIP']
         if len(chips) != 1:
-            self.say('select one chip, then ctrl+s')
+            self.say('select a chip (or drag one onto the CHIPS panel)')
             return
-        p = chips[0]
-        name = (p.label or 'CHIP')[:MAX_LABEL]
+        self.ask_chip_name(chips[0])
+
+    def ask_chip_name(self, p):
+        self.finish_edit(False) if self.editing else None
+        self.namebox = dict(part=p, text=(p.label or 'CHIP')[:MAX_LABEL], fresh=True)
+        pygame.key.set_repeat(400, 35)
+
+    def namebox_key(self, e):
+        nb = self.namebox
+        k = e.key
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            name = nb['text'].strip()
+            if not name:
+                self.say('give it a name first')
+                return
+            self.namebox = None
+            pygame.key.set_repeat()
+            self.write_chip(nb['part'], name[:MAX_LABEL])
+        elif k == pygame.K_ESCAPE:
+            self.namebox = None
+            pygame.key.set_repeat()
+        elif k == pygame.K_BACKSPACE:
+            nb['text'] = '' if nb['fresh'] else nb['text'][:-1]
+            nb['fresh'] = False
+        elif e.unicode and e.unicode.isprintable():
+            if nb['fresh']:
+                nb['text'], nb['fresh'] = '', False
+            if len(nb['text']) < MAX_LABEL:
+                nb['text'] += e.unicode
+
+    def namebox_rects(self, W, H):
+        box = pygame.Rect(0, 0, 380, 150)
+        box.center = (W // 2, H // 2)
+        field = pygame.Rect(box.x + 24, box.y + 54, box.w - 48, 36)
+        ok = pygame.Rect(0, 0, 90, 30)
+        ok.bottomright = (box.right - 24, box.bottom - 16)
+        cancel = pygame.Rect(0, 0, 90, 30)
+        cancel.bottomright = (ok.x - 10, box.bottom - 16)
+        return box, field, ok, cancel
+
+    def namebox_mouse(self, e):
+        if e.type != pygame.MOUSEBUTTONDOWN or e.button != 1:
+            return
+        _, _, ok, cancel = self.namebox_rects(*pygame.display.get_surface().get_size())
+        if ok.collidepoint(e.pos):
+            self.namebox_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, unicode=''))
+        elif cancel.collidepoint(e.pos):
+            self.namebox_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE, unicode=''))
+
+    def draw_namebox(self, surf):
+        W, H = surf.get_size()
+        nb = self.namebox
+        dim = pygame.Surface((W, H), pygame.SRCALPHA)
+        dim.fill((*DIM, 150))
+        surf.blit(dim, (0, 0))
+        box, field, ok, cancel = self.namebox_rects(W, H)
+        pygame.draw.rect(surf, PANEL, box, border_radius=12)
+        pygame.draw.rect(surf, PART_LINE, box, 1, border_radius=12)
+        self.label(surf, 'name your chip', TEXT, (box.centerx, box.y + 26))
+        pygame.draw.rect(surf, BG, field, border_radius=8)
+        pygame.draw.rect(surf, SEL, field, 1, border_radius=8)
+        caret = '_' if (pygame.time.get_ticks() // 400) % 2 == 0 else ' '
+        t = self.font.render(nb['text'] + caret, True, SEL if nb['fresh'] else TEXT)
+        surf.blit(t, (field.x + 10, field.centery - t.get_height() // 2))
+        mp = pygame.mouse.get_pos()
+        for r, lab, hot in ((cancel, 'cancel', False), (ok, 'save', True)):
+            pygame.draw.rect(surf, SEL if hot else CARD_HI if r.collidepoint(mp) else CARD, r, border_radius=8)
+            self.label(surf, lab, BG if hot else TEXT, r.center)
+
+    def write_chip(self, p, name):
         safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in name).strip('_') or 'chip'
         d = json.loads(json.dumps(p.defn))
         d['name'] = name
+        p.label = name
+        self.dirty = True
         d['made_by'] = AUTHOR
         try:
             os.makedirs(self.chips_dir(), exist_ok=True)
@@ -1811,7 +2439,7 @@ class App:
             self.say(f'could not save chip ({err.__class__.__name__})')
             return
         self.scan_chips()
-        self.say(f'chip saved, find it in the parts list as CHIP: {name}')
+        self.say(f'saved "{name}", it is in the CHIPS list now')
 
     def new_part(self, k):
         if k.startswith('CHIP: '):
@@ -1824,15 +2452,6 @@ class App:
                 self.say("that chip file is broken")
                 return None
         return Part(k)
-
-    def pal_rect(self, i):
-        return pygame.Rect(12, 40 + i * 26 - self.pal_scroll, PAL_W - 24, 22)
-
-    def scroll_palette(self, dy):
-        _, H = pygame.display.get_surface().get_size()
-        top, bot = self.pal_area(H)
-        most = max(0, 40 + len(self.pal_items()) * 26 - bot)
-        self.pal_scroll = max(0, min(most, self.pal_scroll + dy))
 
     def pin_at(self, pos, r=6):
         best, bd = None, r + 1
@@ -1977,7 +2596,7 @@ class App:
         self.topo_key = None
         self.sel = {chip}
         self.dirty = True
-        self.say('chip made, dbl-click to name it, u opens it')
+        self.say('chip made, drag it onto the parts panel to name + save it')
 
     def unpack(self):
         chips = [p for p in self.parts if p in self.sel and p.kind == 'CHIP']
@@ -2005,6 +2624,16 @@ class App:
 
     def on_escape(self):
         # True if esc did something (so the game doesn't quit)
+        if self.namebox:
+            self.namebox = None
+            pygame.key.set_repeat()
+            return True
+        if self.help_open:
+            self.help_open = False
+            return True
+        if self.ed.focus or self.search_focus:
+            self.set_focus(None)
+            return True
         if self.drag and self.drag.get('carry'):
             self.cancel_carry()
             return True
@@ -2033,6 +2662,14 @@ class App:
         self.dirty = True
         if d['moved']:
             self.last_click = (None, 0)     # a drag isn't half a double-click
+        lay_ = self.layout()
+        if (d['moved'] and not d['new'] and len(group) == 1 and group[0].kind == 'CHIP'
+                and lay_['right'].collidepoint(pos)):
+            for p, (gx, gy) in zip(group, d['orig']):
+                p.gx, p.gy = gx, gy
+            self.sel = {group[0]}
+            self.ask_chip_name(group[0])
+            return
         if self.group_collides(group):
             if d['new']:
                 for p in group:
@@ -2041,8 +2678,8 @@ class App:
             else:
                 for p, (gx, gy) in zip(group, d['orig']):
                     p.gx, p.gy = gx, gy
-        elif pos[0] < PAL_W and d['moved']:
-            for p in group:             # dropped back on the palette
+        elif not self.in_work(pos) and d['moved']:
+            for p in group:             # dropped back on the panel
                 if p in self.parts:
                     self.remove_part(p)
         elif not d['moved'] and d['hit'] is not None:
@@ -2200,6 +2837,14 @@ class App:
                 if ok:
                     u.close_news() if u.state != 'failed' else u.dismiss()
             return
+        if self.namebox:
+            if e.type == pygame.KEYDOWN:
+                self.namebox_key(e)
+            else:
+                self.namebox_mouse(e)
+            return
+        if self.ui_event(e):
+            return
         if self.running:
             # run mode: nothing can be edited, only clicked
             if e.type == pygame.KEYDOWN:
@@ -2207,7 +2852,7 @@ class App:
                     self.on_key(e)
                 return
             if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-                if e.pos[0] >= PAL_W:
+                if self.in_work(e.pos):
                     p = self.part_at(e.pos)
                     if p:
                         self.run_click(p)
@@ -2223,9 +2868,7 @@ class App:
             self.on_key(e)
         elif e.type == pygame.MOUSEWHEEL:
             mp = pygame.mouse.get_pos()
-            if mp[0] < PAL_W:
-                self.scroll_palette(-e.y * 26)
-            else:
+            if self.in_work(mp):
                 self.zoom_at(mp, 1.12 ** e.y)
         elif e.type == pygame.MOUSEBUTTONDOWN:
             self.on_down(e)
@@ -2242,8 +2885,8 @@ class App:
         global CAMX, CAMY, ZOOM
         wx, wy = s2w(*mp)
         ZOOM = max(MIN_ZOOM, min(MAX_ZOOM, ZOOM * f))
-        CAMX = wx - (mp[0] - PAL_W) / ZOOM
-        CAMY = wy - mp[1] / ZOOM
+        CAMX = wx - (mp[0] - VX0) / ZOOM
+        CAMY = wy - (mp[1] - VY0) / ZOOM
         self.dirty = True
         d = self.drag
         if d and d['kind'] == 'part' and d.get('carry'):
@@ -2328,7 +2971,7 @@ class App:
                 if e.button == 3:
                     self.cancel_carry()
                 return
-            if self.drag is None and mx >= PAL_W:
+            if self.drag is None and self.in_work(e.pos):
                 self.drag = dict(kind='pan', start=e.pos, cam=(CAMX, CAMY), moved=False,
                                  button=e.button)
             return
@@ -2338,24 +2981,7 @@ class App:
             d, self.drag = self.drag, None
             self.finish_part_drag(d, e.pos)
             return
-        _, H = pygame.display.get_surface().get_size()
-        if mx < PAL_W:
-            top, bot = self.pal_area(H)
-            if top <= my <= bot:
-                for i, k in enumerate(self.pal_items()):
-                    if self.pal_rect(i).collidepoint(e.pos):
-                        p = self.new_part(k)
-                        if p is None:
-                            break
-                        d = dict(kind='part', parts=[p], rel=[(0, 0)],
-                                 ox=p.d['w'] * C * ZOOM // 2, oy=p.d['h'] * C * ZOOM // 2, start=e.pos,
-                                 moved=True, new=True, carry=False, hit=None, orig=None)
-                        self.place_group(d, mx, my)
-                        self.parts.append(p)
-                        self.topo_key = None
-                        self.sel.clear()
-                        self.drag = d
-                        break
+        if not self.in_work(e.pos):
             return
         mods = pygame.key.get_mods()
         ctrl = bool(mods & pygame.KMOD_CTRL)
@@ -2448,34 +3074,40 @@ class App:
 
     def box_rect(self, d):
         (x0, y0), (x1, y1) = d['start'], d['cur']
-        x0, x1 = max(PAL_W, min(x0, x1)), max(PAL_W, max(x0, x1))
-        return pygame.Rect(x0, min(y0, y1), x1 - x0, abs(y1 - y0))
+        w = self.layout()['work']
+        x0, x1 = max(w.x, min(x0, x1)), min(w.right, max(x0, x1))
+        y0, y1 = max(w.y, min(y0, y1)), min(w.bottom, max(y0, y1))
+        return pygame.Rect(x0, y0, max(0, x1 - x0), max(0, y1 - y0))
 
     # ------------------------------------------------------------ draw
     def label(self, surf, text, color, center):
         t = self.font.render(text, True, color)
         surf.blit(t, t.get_rect(center=center))
 
-    def draw_grid(self, surf, W, H):
-        surf.fill(BG)
+    def draw_grid(self, surf, lay):
+        work = lay['work']
+        surf.fill(PANEL)
+        pygame.draw.rect(surf, BG, work)
+        old = surf.get_clip()
+        surf.set_clip(work)
         step = C * ZOOM
         i0 = int(CAMX // C)
-        i1 = int((CAMX + (W - PAL_W) / ZOOM) // C) + 1
+        i1 = int((CAMX + work.w / ZOOM) // C) + 1
         for i in range(i0, i1 + 1):
             major = i % 4 == 0
             if step < 9 and not major:
                 continue
-            x = round(PAL_W + (i * C - CAMX) * ZOOM)
-            if x >= PAL_W:
-                pygame.draw.line(surf, GRID2 if major else GRID, (x, 0), (x, H))
+            x = round(VX0 + (i * C - CAMX) * ZOOM)
+            pygame.draw.line(surf, GRID2 if major else GRID, (x, work.y), (x, work.bottom))
         j0 = int(CAMY // C)
-        j1 = int((CAMY + H / ZOOM) // C) + 1
+        j1 = int((CAMY + work.h / ZOOM) // C) + 1
         for j in range(j0, j1 + 1):
             major = j % 4 == 0
             if step < 9 and not major:
                 continue
-            y = round((j * C - CAMY) * ZOOM)
-            pygame.draw.line(surf, GRID2 if major else GRID, (PAL_W, y), (W, y))
+            y = round(VY0 + (j * C - CAMY) * ZOOM)
+            pygame.draw.line(surf, GRID2 if major else GRID, (work.x, y), (work.right, y))
+        surf.set_clip(old)
 
     def net_color(self, s):
         if not s:
@@ -2553,7 +3185,7 @@ class App:
         r = p.rect()
         k = p.kind
         editing = p is self.editing
-        txt = ZOOM >= 0.55          # skip text when zoomed way out
+        txt = ZOOM >= 0.55 and not ICON_MODE          # skip text when zoomed way out
         if k == 'LABEL':
             text = self.label_text(p)
             r = pygame.Rect(r.x, r.y, round(label_w(text) * C * ZOOM), r.h)
@@ -2563,9 +3195,10 @@ class App:
                 self.label(surf, text, SEL if editing and self.edit_fresh else TEXT, r.center)
             return
         hdrh = sc(HDR)
+        rad = max(2, sc(5))
         if k in ('DISPLAY', 'TOUCH'):
-            pygame.draw.rect(surf, p.rgb if p.glow > 0 and p.rgb else PART_BG, r)
-            pygame.draw.rect(surf, SEL if editing else (ON if p.flash > 0 else PART_LINE), r, 1)
+            pygame.draw.rect(surf, p.rgb if p.glow > 0 and p.rgb else PART_BG, r, border_radius=rad)
+            pygame.draw.rect(surf, SEL if editing else (ON if p.flash > 0 else PART_LINE), r, 1, border_radius=rad)
         else:
             body = PART_BG
             if k == 'LAMP' and p.glow > 0:
@@ -2573,9 +3206,9 @@ class App:
             elif k == 'SOURCE' or (k == 'SWITCH' and p.on) or (k == 'BUTTON' and p.flash > 0) \
                     or (k in ('CLOCK', 'SR LATCH', 'NV LATCH', 'GATE') and (p.out and (k != 'GATE' or p.drive))):
                 body = ACTIVE
-            pygame.draw.rect(surf, body, r)
+            pygame.draw.rect(surf, body, r, border_radius=rad)
             hdr = pygame.Rect(r.x, r.y, r.w, hdrh)
-            pygame.draw.rect(surf, cat_color(k), hdr)
+            pygame.draw.rect(surf, cat_color(k), hdr, border_top_left_radius=rad, border_top_right_radius=rad)
             if txt:
                 text = self.label_text(p)
                 if text.strip():
@@ -2583,7 +3216,7 @@ class App:
                     surf.set_clip(hdr.inflate(-4, 0))
                     surf.blit(t, t.get_rect(center=hdr.center))
                     surf.set_clip(None)
-            pygame.draw.rect(surf, SEL if editing else PART_LINE, r, 1)
+            pygame.draw.rect(surf, SEL if editing else PART_LINE, r, 1, border_radius=rad)
             cx, cy = r.centerx, r.y + hdrh + (r.h - hdrh) // 2
             if k in DESC_KINDS and txt:
                 text = self.desc_text(p)
@@ -2601,13 +3234,13 @@ class App:
                     surf.set_clip(None)
             if k == 'SWITCH':
                 track = pygame.Rect(cx - sc(12), cy - sc(5), sc(24), sc(10))
-                pygame.draw.rect(surf, TEXT_DIM, track, 1)
+                pygame.draw.rect(surf, TEXT_DIM, track, 1, border_radius=sc(5))
                 kx = track.right - sc(10) if p.on else track.x + sc(2)
-                pygame.draw.rect(surf, ON if p.on else TEXT_DIM, (kx, track.y + sc(2), sc(8), sc(6)))
+                pygame.draw.rect(surf, ON if p.on else TEXT_DIM, (kx, track.y + sc(2), sc(8), sc(6)), border_radius=sc(3))
             elif k == 'BUTTON':
                 b = pygame.Rect(cx - sc(10), cy - sc(5), sc(20), sc(10))
-                pygame.draw.rect(surf, ON if p.flash > 0 else PART_BG, b)
-                pygame.draw.rect(surf, TEXT_DIM, b, 1)
+                pygame.draw.rect(surf, ON if p.flash > 0 else PART_BG, b, border_radius=sc(4))
+                pygame.draw.rect(surf, TEXT_DIM, b, 1, border_radius=sc(4))
             elif k in ('GAS IN', 'GAS OUT') and txt:
                 t = self.tiny.render(f'link {p.pidx + 1}', True, TEXT_DIM)
                 surf.blit(t, t.get_rect(center=(cx, cy)))
@@ -2645,8 +3278,8 @@ class App:
         o, i_ = (sc(7, 3), sc(3, 2)) if small else (sc(9, 4), sc(5, 2))
         for i in range(len(p.d['pins'])):
             q = p.pin_pos(i)
-            pygame.draw.rect(surf, BG, (q[0] - o // 2, q[1] - o // 2, o, o))
-            pygame.draw.rect(surf, pcol(p, i), (q[0] - i_ // 2, q[1] - i_ // 2, i_, i_))
+            pygame.draw.circle(surf, BG, q, o // 2 + 1)
+            pygame.draw.circle(surf, pcol(p, i), q, max(2, i_ // 2 + 1))
             if not txt:
                 continue
             if k == '7SEG':
@@ -2663,9 +3296,699 @@ class App:
                 else:
                     surf.blit(t, t.get_rect(midright=(q[0] - sc(7), q[1])))
 
+    # ------------------------------------------------------------ chrome: top bar, parts panel, script dock
+    def layout(self):
+        W, H = pygame.display.get_surface().get_size()
+        rp = min(RPW, max(170, W // 3))
+        dh = 0
+        if self.dock_open:
+            dh = max(130, min(self.dock_h, H - TOPH - 150))
+        return dict(W=W, H=H, rp=rp, top=pygame.Rect(0, 0, W, TOPH),
+                    right=pygame.Rect(W - rp, TOPH, rp, H - TOPH),
+                    work=pygame.Rect(0, TOPH, W - rp, H - TOPH - dh),
+                    dock=pygame.Rect(0, H - dh, W - rp, dh) if dh else None)
+
+    def in_work(self, pos):
+        return self.layout()['work'].collidepoint(pos)
+
+    @staticmethod
+    def nice(k):
+        if k.startswith('CHIP: '):
+            return k[6:]
+        return PAL_NICE.get(k) or (k if k in GATES else k.capitalize())
+
+    def pal_cats(self):
+        out = []
+        for name, kinds in PAL_CATS:
+            ks = list(kinds)
+            if name == 'CHIPS':
+                ks += ['CHIP: ' + n for n in self.chip_defs]
+            out.append((name, ks))
+        return out
+
+    def pal_layout(self, rp):
+        q = self.search.strip().lower()
+        pad, gap = 10, 8
+        tw = (rp.w - 2 * pad - gap) // 2
+        th = 86
+        rows, y = [], 0
+        for name, ks in self.pal_cats():
+            if q:
+                ks = [k for k in ks if q in self.nice(k).lower() or q in k.lower()]
+                if not ks:
+                    continue
+            op = True if q else self.cat_open.get(name, True)
+            rows.append(dict(t='hdr', cat=name, n=len(ks), open=op, rect=pygame.Rect(pad, y, rp.w - 2 * pad, 28)))
+            y += 30
+            if op:
+                for i, k in enumerate(ks):
+                    rows.append(dict(t='tile', kind=k, rect=pygame.Rect(pad + (i % 2) * (tw + gap), y + (i // 2) * (th + gap), tw, th)))
+                y += -(-len(ks) // 2) * (th + gap)
+            y += 4
+        return rows, y
+
+    def pal_geom(self, lay):
+        rp = lay['right']
+        search = pygame.Rect(rp.x + 10, rp.y + 38, rp.w - 20, 28)
+        area = pygame.Rect(rp.x, rp.y + 74, rp.w, rp.h - 74 - 24)
+        return search, area
+
+    def pal_clamp(self, lay):
+        rows, total = self.pal_layout(lay['right'])
+        _, area = self.pal_geom(lay)
+        self.pal_scroll = max(0, min(max(0, total - area.h), self.pal_scroll))
+        return rows, total
+
+    def part_icon(self, k, w, h):
+        cd = self.chip_defs.get(k[6:]) if k.startswith('CHIP: ') else None
+        key = (k, w, h, self.light, id(cd))
+        s = self.icons.get(key)
+        if s is not None:
+            return s
+        global CAMX, CAMY, ZOOM, VX0, VY0, ICON_MODE
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        p = self.new_part(k)
+        if p is not None:
+            pw = (label_w(p.label or 'LABEL') if p.kind == 'LABEL' else p.d['w']) * C
+            ph = p.d['h'] * C
+            z = min((w - 12) / pw, (h - 10) / ph, 0.9)
+            keep = (CAMX, CAMY, ZOOM, VX0, VY0)
+            ZOOM, CAMX, CAMY = z, 0.0, 0.0
+            VX0, VY0 = (w - pw * z) / 2, (h - ph * z) / 2
+            ICON_MODE = True
+            try:
+                self.draw_part(s, p, lambda a, b: FLOAT)
+            finally:
+                ICON_MODE = False
+                CAMX, CAMY, ZOOM, VX0, VY0 = keep
+            tx = ICON_TXT.get(k, k if k in GATES else '')
+            if k.startswith('CHIP: '):
+                tx = ''
+            if tx:
+                t = self.tiny.render(tx, True, TEXT_DIM)
+                s.blit(t, t.get_rect(center=(w // 2, h // 2 + 5)))
+        self.icons[key] = s
+        return s
+
+    # -- naming parts for the script
+    def part_names(self):
+        counts, out = {}, []
+        for p in sorted(self.parts, key=lambda q: (q.gy, q.gx)):
+            if p.kind == 'LABEL':
+                continue
+            counts[p.kind] = counts.get(p.kind, 0) + 1
+            out.append((f'{p.kind}#{counts[p.kind]}', p))
+        return out
+
+    def find_parts(self, name):
+        nm = name.strip().lower()
+        m = re.fullmatch(r'(.+?)#(\d+)', nm)
+        if m:
+            kind = S_ALIAS.get(m.group(1).upper(), m.group(1).upper())
+            want = f'{kind}#{int(m.group(2))}'.lower()
+            return [p for d, p in self.part_names() if d.lower() == want]
+        return [p for p in self.parts
+                if nm in {x.lower() for x in (p.label, p.label_on, p.label_off) if x}]
+
+    def part_value(self, p):
+        find, drv = self.netstate()
+        if p.kind == 'SOURCE':
+            return True
+        pins = p.d['pins']
+        outs = [i for i, q in enumerate(pins) if q[2] == 'out']
+        ins = [i for i, q in enumerate(pins) if q[2] == 'in']
+        i = outs[0] if outs else (ins[0] if ins else None)
+        if i is None:
+            return False
+        return drv.get(find(self.k(p, i))) == {1}
+
+    def log_add(self, text, kind='info'):
+        self.script_log.append((text, kind))
+        del self.script_log[:-400]
+        self.log_scroll = 0
+
+    def script_run(self):
+        if self.runner.active:
+            self.runner.stop('restarted')
+        self.ed.err = {}
+        if not self.running:
+            self.toggle_run()
+        self.paused = False
+        self.runner.start(self.ed.text())
+
+    def script_stop(self):
+        if self.runner.active:
+            self.runner.stop('stopped')
+        else:
+            self.say('no script is running')
+
+    def set_focus(self, what):
+        # what: 'ed', 'search' or None
+        self.ed.focus = what == 'ed'
+        self.search_focus = what == 'search'
+        if what:
+            pygame.key.set_repeat(400, 35)
+        elif not self.editing:
+            pygame.key.set_repeat()
+
+    # -- top bar
+    def top_buttons(self, lay):
+        W = lay['W']
+        y, h = 7, 30
+        compact = W < 940
+        x0 = 10 if compact else 176
+        b = [(pygame.Rect(x0, y, 84, h), 'noop', 'Circuits', 'seg_on'),
+             (pygame.Rect(x0 + 84, y, 84, h), 'gas', 'Gas lab', 'seg')]
+        cw = lay['work'].w
+        x = x0 + 190 if compact else max(368, (cw - 330) // 2 + 100)
+        b.append((pygame.Rect(x, y, 92, h), 'run', 'Stop' if self.running else 'Run', 'primary'))
+        x += 98
+        b.append((pygame.Rect(x, y, 34, h), 'pause', '', 'pause'))
+        x += 40
+        b.append((pygame.Rect(x, y, 34, h), 'step', '', 'step'))
+        x += 50
+        b.append((pygame.Rect(x, y, 28, h), 'rate-', '', 'minus'))
+        b.append((pygame.Rect(x + 28, y, 82, h), 'noop', f'{self.rate} Hz', 'label'))
+        b.append((pygame.Rect(x + 110, y, 28, h), 'rate+', '', 'plus'))
+        rx = W - 14
+        for act, lab, kind, w in (('help', '', 'help', 34), ('theme', '', 'theme', 34), ('script', '' if compact else 'Script', 'toggle', 34 if compact else 88)):
+            rx -= w
+            b.append((pygame.Rect(rx, y, w, h), act, lab, kind))
+            rx -= 6
+        return b
+
+    def do_action(self, act):
+        global CAMX, CAMY, ZOOM
+        if act == 'run':
+            self.toggle_run()
+        elif act == 'pause':
+            self.paused = not self.paused
+        elif act == 'step':
+            if not self.running:
+                self.say('press Run first')
+            else:
+                self.paused = True
+                for p in self.sim_parts:
+                    p.glow = 0.0
+                    p.seg_glow = [0.0] * 7
+                if self.runner.active:
+                    self.runner.before_tick()
+                self.advance(1)
+        elif act == 'rate-':
+            self.rate = max(1, self.rate // 2)
+            self.dirty = True
+        elif act == 'rate+':
+            self.rate = min(MAX_RATE, self.rate * 2)
+            self.dirty = True
+        elif act == 'script':
+            self.dock_open = not self.dock_open
+            if not self.dock_open:
+                self.set_focus(None)
+            self.dirty = True
+        elif act == 'theme':
+            self.light = not self.light
+            set_theme(self.light)
+            self.reset_caches()
+            self.dirty = True
+        elif act == 'help':
+            self.help_open = not self.help_open
+        elif act == 'gas':
+            if np is None:
+                self.say('gas lab needs numpy (pip install numpy)')
+            else:
+                self.mode = 'gas'
+        elif act == 'chipsave':
+            self.save_chip()
+        elif act == 'script_run':
+            self.script_run()
+        elif act == 'script_stop':
+            self.script_stop()
+        elif act == 'script_example':
+            name, text = S_EXAMPLES[self.ex_i % len(S_EXAMPLES)]
+            self.ex_i += 1
+            self.ed.snap('example')
+            self.ed.set_text(text)
+            self.ed.undo = []
+            self.say(f'example: {name}')
+            self.dirty = True
+        elif act == 'log_clear':
+            self.script_log = []
+
+    # -- dock
+    def dock_geom(self, dock):
+        head = pygame.Rect(dock.x, dock.y, dock.w, 38)
+        body = pygame.Rect(dock.x + 10, dock.y + 44, dock.w - 20, dock.h - 52)
+        tabs = [(pygame.Rect(dock.x + 12 + i * 92, dock.y + 6, 86, 28), t) for i, t in enumerate(('SCRIPT', 'NAMES'))]
+        btns, rx = [], dock.right - 12
+        for act, lab, w in (('log_clear', 'Clear log', 84), ('script_example', 'Example', 80), ('script_stop', 'Stop', 64), ('script_run', 'Run script', 104)):
+            if dock.w < 620 and act in ('log_clear', 'script_example'):
+                continue
+            rx -= w
+            btns.append((pygame.Rect(rx, dock.y + 6, w, 28), act, lab))
+            rx -= 6
+        lw = max(180, int(body.w * 0.36))
+        ed = pygame.Rect(body.x, body.y, body.w - lw - 10, body.h)
+        lg = pygame.Rect(ed.right + 10, body.y, lw, body.h)
+        return head, body, tabs, btns, ed, lg
+
+    def names_layout(self, body):
+        rows, x, y, rh = [], 0, 0, 28
+        for d, p in self.part_names():
+            shown = p.label or p.label_on or p.label_off or d
+            tag = d if shown != d else ''
+            t = (shown + ('   ' + tag if tag else ''))
+            w = self.ui_s.size(t)[0] + 22
+            if x + w > body.w and x:
+                x, y = 0, y + rh + 6
+            rows.append((pygame.Rect(body.x + x, body.y + y, w, rh), d, p, t))
+            x += w + 6
+        return rows, y + rh
+
+    def log_lines(self, w):
+        out = []
+        for text, kind in self.script_log:
+            for i, ln in enumerate(wrap(self.ui_s, text, w - 16) or ['']):
+                out.append((('   ' if i else '') + ln, kind))
+        return out
+
+    def ed_colors(self):
+        if self.light:
+            return dict(bg=(251, 253, 255), gut=(236, 241, 249), run=(196, 224, 246), errbg=(250, 214, 214),
+                        cur=(240, 245, 252), sel=(176, 206, 240), dim=(140, 152, 176), err=(205, 50, 50),
+                        cmt=(130, 144, 168), cmd=(0, 100, 190), str=(170, 110, 0), num=(200, 100, 20),
+                        kw=(20, 140, 80), name=(30, 42, 66), caret=(20, 30, 50))
+        return dict(bg=(9, 15, 28), gut=(13, 22, 40), run=(26, 66, 98), errbg=(70, 28, 36),
+                    cur=(15, 26, 46), sel=(38, 82, 136), dim=(86, 108, 146), err=(240, 100, 100),
+                    cmt=(92, 116, 150), cmd=(100, 200, 255), str=(240, 200, 110), num=(255, 170, 90),
+                    kw=(120, 225, 160), name=(214, 228, 248), caret=(214, 228, 248))
+
+    # -- events for all the chrome. True = used up
+    def ui_event(self, e):
+        lay = self.layout()
+        ed = self.ed
+        if self.help_open:
+            if e.type in (pygame.MOUSEBUTTONDOWN, pygame.KEYDOWN):
+                self.help_open = False
+            return e.type != pygame.MOUSEMOTION
+        if e.type == pygame.KEYDOWN:
+            if self.editing:
+                return False
+            ctrl = bool(e.mod & pygame.KMOD_CTRL)
+            if ed.focus:
+                if ctrl and e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.script_run()
+                else:
+                    ed.key(e)
+                    self.dirty = True
+                return True
+            if self.search_focus:
+                if e.key == pygame.K_BACKSPACE:
+                    self.search = self.search[:-1]
+                elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.set_focus(None)
+                elif e.unicode and e.unicode.isprintable():
+                    self.search = (self.search + e.unicode)[:24]
+                self.pal_scroll = 0
+                return True
+            if ctrl and e.key == pygame.K_f:
+                self.set_focus('search')
+                return True
+            if e.key == pygame.K_F1:
+                self.help_open = True
+                return True
+            if e.key == pygame.K_BACKQUOTE:
+                self.do_action('script')
+                return True
+            if ctrl and e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.dock_open = True
+                self.script_run()
+                return True
+            return False
+        pos = getattr(e, 'pos', None)
+        if e.type == pygame.MOUSEWHEEL:
+            pos = pygame.mouse.get_pos()
+            if lay['right'].collidepoint(pos):
+                rows, total = self.pal_layout(lay['right'])
+                _, area = self.pal_geom(lay)
+                self.pal_scroll = max(0, min(max(0, total - area.h), self.pal_scroll - e.y * 40))
+                return True
+            if lay['dock'] and lay['dock'].collidepoint(pos):
+                head, body, tabs, btns, edr, lg = self.dock_geom(lay['dock'])
+                if self.dock_tab == 'SCRIPT' and edr.collidepoint(pos):
+                    ed.wheel(e.y, edr)
+                elif self.dock_tab == 'SCRIPT' and lg.collidepoint(pos):
+                    self.log_scroll = max(0, self.log_scroll + e.y * 2)
+                elif self.dock_tab == 'NAMES':
+                    self.names_scroll = max(0, self.names_scroll - e.y * 30)
+                return True
+            return lay['top'].collidepoint(pos)
+        if e.type == pygame.MOUSEMOTION:
+            if self.dock_drag == 'resize':
+                self.dock_h = lay['H'] - e.pos[1]
+                return True
+            if self.dock_drag == 'ed' and lay['dock']:
+                ed.drag(e.pos, self.dock_geom(lay['dock'])[4])
+                return True
+            return False
+        if e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+            if self.dock_drag:
+                self.dock_drag = None
+                return True
+            return False
+        if e.type != pygame.MOUSEBUTTONDOWN or e.button != 1:
+            if e.type == pygame.MOUSEBUTTONDOWN and (lay['right'].collidepoint(pos) or lay['top'].collidepoint(pos)
+                                                    or (lay['dock'] and lay['dock'].collidepoint(pos))):
+                return True
+            return False
+        if self.drag and self.drag.get('carry'):
+            return False
+        pos = e.pos
+        if lay['top'].collidepoint(pos):
+            self.set_focus(None)
+            for r, act, _, _ in self.top_buttons(lay):
+                if r.collidepoint(pos):
+                    self.do_action(act)
+                    break
+            return True
+        dock = lay['dock']
+        if dock and (dock.collidepoint(pos) or abs(pos[1] - dock.y) <= 3 and pos[0] < dock.right):
+            if abs(pos[1] - dock.y) <= 3:
+                self.dock_drag = 'resize'
+                return True
+            head, body, tabs, btns, edr, lg = self.dock_geom(dock)
+            for r, t in tabs:
+                if r.collidepoint(pos):
+                    self.dock_tab = t
+                    self.set_focus(None)
+                    return True
+            for r, act, _ in btns:
+                if r.collidepoint(pos) and (act != 'log_clear' or self.dock_tab == 'SCRIPT'):
+                    self.do_action(act)
+                    return True
+            if self.dock_tab == 'SCRIPT':
+                if edr.collidepoint(pos):
+                    self.set_focus('ed')
+                    ed.click(pos, edr, bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
+                    self.dock_drag = 'ed'
+                else:
+                    self.set_focus(None)
+            else:
+                self.set_focus(None)
+                rows, total = self.names_layout(body)
+                for r, d, p, t in rows:
+                    if r.move(0, -self.names_scroll).collidepoint(pos):
+                        name = p.label or p.label_on or p.label_off or d
+                        ins = f'"{name}"' if ' ' in name else name
+                        self.dock_tab = 'SCRIPT'
+                        self.set_focus('ed')
+                        ed.snap('name')
+                        ed.insert(ins)
+                        self.dirty = True
+                        break
+            return True
+        rp = lay['right']
+        if rp.collidepoint(pos):
+            search, area = self.pal_geom(lay)
+            if search.collidepoint(pos):
+                self.set_focus('search')
+                return True
+            self.set_focus(None)
+            if area.collidepoint(pos):
+                rows, total = self.pal_clamp(lay)
+                for row in rows:
+                    r = row['rect'].move(area.x, area.y - self.pal_scroll)
+                    if not r.collidepoint(pos):
+                        continue
+                    if row['t'] == 'hdr':
+                        if row['cat'] == 'CHIPS' and pos[0] > r.right - 78:
+                            self.save_chip()
+                        else:
+                            self.cat_open[row['cat']] = not row['open']
+                        return True
+                    if self.running:
+                        self.say('stop the run to add parts')
+                        return True
+                    p = self.new_part(row['kind'])
+                    if p is None:
+                        return True
+                    d = dict(kind='part', parts=[p], rel=[(0, 0)],
+                             ox=p.d['w'] * C * ZOOM // 2, oy=p.d['h'] * C * ZOOM // 2, start=pos,
+                             moved=True, new=True, carry=False, hit=None, orig=None)
+                    self.place_group(d, *pos)
+                    self.parts.append(p)
+                    self.topo_key = None
+                    self.sel.clear()
+                    self.drag = d
+                    return True
+            return True
+        if lay['work'].collidepoint(pos):
+            self.set_focus(None)
+        return False
+
+    # -- drawing
+    def draw_icon(self, surf, name, r, color):
+        cx, cy = r.center
+        if name == 'play':
+            pygame.draw.polygon(surf, color, [(cx - 5, cy - 7), (cx + 7, cy), (cx - 5, cy + 7)])
+        elif name == 'stop':
+            pygame.draw.rect(surf, color, (cx - 6, cy - 6, 12, 12), border_radius=2)
+        elif name == 'pause':
+            pygame.draw.rect(surf, color, (cx - 6, cy - 6, 4, 12), border_radius=1)
+            pygame.draw.rect(surf, color, (cx + 2, cy - 6, 4, 12), border_radius=1)
+        elif name == 'step':
+            pygame.draw.polygon(surf, color, [(cx - 6, cy - 6), (cx + 3, cy), (cx - 6, cy + 6)])
+            pygame.draw.rect(surf, color, (cx + 4, cy - 6, 3, 12), border_radius=1)
+        elif name == 'minus':
+            pygame.draw.rect(surf, color, (cx - 5, cy - 1, 10, 2), border_radius=1)
+        elif name == 'plus':
+            pygame.draw.rect(surf, color, (cx - 5, cy - 1, 10, 2), border_radius=1)
+            pygame.draw.rect(surf, color, (cx - 1, cy - 5, 2, 10), border_radius=1)
+        elif name == 'help':
+            t = self.ui_b.render('?', True, color)
+            surf.blit(t, t.get_rect(center=r.center))
+        elif name == 'theme':
+            pygame.draw.circle(surf, color, (cx, cy), 7, 2)
+            pygame.draw.rect(surf, color, (cx, cy - 7, 8, 14))
+            pygame.draw.circle(surf, color, (cx, cy), 7, 2)
+        elif name == 'script':
+            pygame.draw.lines(surf, color, False, [(cx - 5, cy - 5), (cx - 10, cy), (cx - 5, cy + 5)], 2)
+            pygame.draw.lines(surf, color, False, [(cx + 5, cy - 5), (cx + 10, cy), (cx + 5, cy + 5)], 2)
+
+    def draw_btn(self, surf, r, label, kind, mp, active=False, icon=None):
+        hov = r.collidepoint(mp)
+        if kind == 'primary':
+            fill, line, txt = (OFF if self.running else ON), (OFF if self.running else ON), (8, 16, 30)
+            if hov:
+                fill = tuple(min(255, c + 24) for c in fill)
+            pygame.draw.rect(surf, fill, r, border_radius=8)
+            self.draw_icon(surf, 'stop' if self.running else 'play', pygame.Rect(r.x + 8, r.y, 22, r.h), txt)
+            t = self.ui_b.render(label, True, txt)
+            surf.blit(t, t.get_rect(midleft=(r.x + 34, r.centery)))
+            return
+        if kind == 'label':
+            t = self.ui.render(label, True, TEXT)
+            surf.blit(t, t.get_rect(center=r.center))
+            return
+        on = active or kind == 'seg_on'
+        pygame.draw.rect(surf, ACTIVE if on else (CARD_HI if hov else CARD), r, border_radius=8)
+        pygame.draw.rect(surf, ON if on else (PART_LINE if hov else PANEL_LINE), r, 1, border_radius=8)
+        col = ON if on else TEXT
+        if icon:
+            self.draw_icon(surf, icon, pygame.Rect(r.x, r.y, 26 if label else r.w, r.h), col)
+        if label:
+            t = self.ui.render(label, True, col)
+            surf.blit(t, t.get_rect(center=(r.centerx + (10 if icon else 0), r.centery)))
+
+    def draw_top(self, surf, lay, mp):
+        top = lay['top']
+        pygame.draw.rect(surf, PANEL, top)
+        pygame.draw.line(surf, PANEL_LINE, (0, top.bottom - 1), (top.right, top.bottom - 1))
+        if lay['W'] >= 940:
+            t = self.ui_h.render('logic sandbox', True, TEXT)
+            surf.blit(t, (16, top.centery - t.get_height() // 2))
+        for r, act, label, kind in self.top_buttons(lay):
+            icon = {'pause': 'pause', 'step': 'step', 'minus': 'minus', 'plus': 'plus', 'help': 'help',
+                    'theme': 'theme', 'toggle': 'script'}.get(kind)
+            active = (kind == 'pause' and self.paused) or (kind == 'toggle' and self.dock_open) \
+                or (kind == 'help' and self.help_open)
+            self.draw_btn(surf, r, label, kind, mp, active, icon)
+        if self.runner.active:
+            st, col = 'script running', SEL
+        elif self.running:
+            st, col = ('compiled' if self.cmp else 'running'), ON
+        else:
+            st, col = 'build mode', TEXT_DIM
+        if self.paused and self.running:
+            st, col = st + ' · paused', SEL
+        for r, act, label, kind in self.top_buttons(lay):
+            if act == 'rate+' and lay['W'] >= 1100:
+                s = self.ui_s.render(st, True, col)
+                surf.blit(s, (r.right + 14, top.centery - s.get_height() // 2))
+                break
+
+    def draw_right(self, surf, lay, mp):
+        rp = lay['right']
+        pygame.draw.rect(surf, PANEL, rp)
+        pygame.draw.line(surf, PANEL_LINE, (rp.x, rp.y), (rp.x, rp.bottom))
+        t = self.ui_h.render('Parts', True, TEXT)
+        surf.blit(t, (rp.x + 14, rp.y + 8))
+        search, area = self.pal_geom(lay)
+        pygame.draw.rect(surf, BG, search, border_radius=8)
+        pygame.draw.rect(surf, ON if self.search_focus else PANEL_LINE, search, 1, border_radius=8)
+        if self.search or self.search_focus:
+            s = self.ui.render(self.search + ('|' if self.search_focus and (pygame.time.get_ticks() // 450) % 2 == 0 else ''), True, TEXT)
+        else:
+            s = self.ui.render('search · Ctrl+F', True, TEXT_DIM)
+        surf.blit(s, (search.x + 10, search.centery - s.get_height() // 2))
+        rows, total = self.pal_clamp(lay)
+        old = surf.get_clip()
+        surf.set_clip(area.clip(old))
+        for row in rows:
+            r = row['rect'].move(area.x, area.y - self.pal_scroll)
+            if r.bottom < area.y or r.top > area.bottom:
+                continue
+            if row['t'] == 'hdr':
+                col = TEXT_DIM
+                arrow = [(r.x + 6, r.centery - 3), (r.x + 14, r.centery - 3), (r.x + 10, r.centery + 3)] if row['open'] \
+                    else [(r.x + 7, r.centery - 5), (r.x + 7, r.centery + 5), (r.x + 13, r.centery)]
+                pygame.draw.polygon(surf, col, arrow)
+                s = self.ui_s.render(row['cat'], True, col)
+                surf.blit(s, (r.x + 22, r.centery - s.get_height() // 2))
+                n = self.ui_s.render(str(row['n']), True, col)
+                if row['cat'] == 'CHIPS':
+                    b = pygame.Rect(r.right - 74, r.y + 2, 74, r.h - 4)
+                    pygame.draw.rect(surf, CARD_HI if b.collidepoint(mp) else CARD, b, border_radius=6)
+                    pygame.draw.rect(surf, PANEL_LINE, b, 1, border_radius=6)
+                    s2 = self.ui_s.render('save chip', True, TEXT)
+                    surf.blit(s2, s2.get_rect(center=b.center))
+                    surf.blit(n, (b.x - n.get_width() - 8, r.centery - n.get_height() // 2))
+                else:
+                    surf.blit(n, (r.right - n.get_width() - 4, r.centery - n.get_height() // 2))
+                continue
+            hov = r.collidepoint(mp) and area.collidepoint(mp)
+            pygame.draw.rect(surf, CARD_HI if hov else CARD, r, border_radius=10)
+            pygame.draw.rect(surf, cat_color(row['kind']) if hov else PANEL_LINE, r, 1, border_radius=10)
+            ic = self.part_icon(row['kind'], r.w - 8, 54)
+            surf.blit(ic, (r.x + 4, r.y + 4))
+            nm = self.nice(row['kind'])
+            while len(nm) > 3 and self.ui_s.size(nm)[0] > r.w - 10:
+                nm = nm[:-2] + '…'
+            s = self.ui_s.render(nm, True, TEXT)
+            surf.blit(s, s.get_rect(midtop=(r.centerx, r.y + 62)))
+        surf.set_clip(old)
+        if total > area.h:
+            th = max(24, int(area.h * area.h / total))
+            ty = area.y + int((area.h - th) * self.pal_scroll / max(1, total - area.h))
+            pygame.draw.rect(surf, PANEL_LINE, (rp.right - 5, ty, 3, th), border_radius=2)
+        ct = self.ui_s.render(_CR_A, True, TEXT_DIM)
+        while ct.get_width() > rp.w - 16 and len(_CR_A) > 4:
+            ct = pygame.transform.smoothscale(ct, (rp.w - 16, ct.get_height()))
+        surf.blit(ct, (rp.x + 8, rp.bottom - 20))
+
+    def draw_dock(self, surf, lay, mp):
+        dock = lay['dock']
+        if not dock:
+            return
+        pygame.draw.rect(surf, PANEL, dock)
+        pygame.draw.line(surf, PANEL_LINE, (dock.x, dock.y), (dock.right, dock.y))
+        pygame.draw.line(surf, ON if self.dock_drag == 'resize' else PANEL_LINE, (dock.centerx - 18, dock.y + 1), (dock.centerx + 18, dock.y + 1), 3)
+        head, body, tabs, btns, edr, lg = self.dock_geom(dock)
+        for r, t in tabs:
+            on = t == self.dock_tab
+            if on:
+                pygame.draw.rect(surf, CARD, r, border_radius=8)
+            s = self.ui_b.render(t, True, ON if on else TEXT_DIM)
+            surf.blit(s, s.get_rect(center=r.center))
+            if on:
+                pygame.draw.line(surf, ON, (r.x + 10, r.bottom + 2), (r.right - 10, r.bottom + 2), 2)
+        for r, act, lab in btns:
+            if act == 'log_clear' and self.dock_tab != 'SCRIPT':
+                continue
+            if act == 'script_run':
+                fill = ON if not self.runner.active else SEL
+                if r.collidepoint(mp):
+                    fill = tuple(min(255, c + 24) for c in fill)
+                pygame.draw.rect(surf, fill, r, border_radius=8)
+                self.draw_icon(surf, 'play', pygame.Rect(r.x + 4, r.y, 24, r.h), (8, 16, 30))
+                s = self.ui_b.render('Restart' if self.runner.active else lab, True, (8, 16, 30))
+                surf.blit(s, s.get_rect(midleft=(r.x + 30, r.centery)))
+            else:
+                pygame.draw.rect(surf, CARD_HI if r.collidepoint(mp) else CARD, r, border_radius=8)
+                pygame.draw.rect(surf, PANEL_LINE, r, 1, border_radius=8)
+                s = self.ui.render(lab, True, TEXT)
+                surf.blit(s, s.get_rect(center=r.center))
+        if self.dock_tab == 'SCRIPT':
+            self.ed.font = self.edf
+            self.ed.draw(surf, edr, self.ed_colors())
+            pygame.draw.rect(surf, PANEL_LINE, edr, 1, border_radius=8)
+            pygame.draw.rect(surf, BG, lg, border_radius=8)
+            pygame.draw.rect(surf, PANEL_LINE, lg, 1, border_radius=8)
+            old = surf.get_clip()
+            surf.set_clip(lg.inflate(-2, -2).clip(old))
+            lines = self.log_lines(lg.w)
+            lh = 16
+            vis = max(1, (lg.h - 12) // lh)
+            self.log_scroll = max(0, min(max(0, len(lines) - vis), self.log_scroll))
+            end = len(lines) - self.log_scroll
+            show = lines[max(0, end - vis):end]
+            cols = {'info': TEXT_DIM, 'ok': OFF, 'fail': SHORT, 'err': SHORT, 'print': TEXT}
+            if not lines:
+                s = self.ui_s.render('output shows up here', True, TEXT_DIM)
+                surf.blit(s, (lg.x + 10, lg.y + 8))
+            for i, (txt, kind) in enumerate(show):
+                s = self.ui_s.render(txt, True, cols.get(kind, TEXT))
+                surf.blit(s, (lg.x + 8, lg.y + 6 + i * lh))
+            surf.set_clip(old)
+        else:
+            rows, total = self.names_layout(body)
+            self.names_scroll = max(0, min(max(0, total - body.h), self.names_scroll))
+            old = surf.get_clip()
+            surf.set_clip(body.clip(old))
+            if not rows:
+                s = self.ui.render('no parts yet, add some and their names show up here', True, TEXT_DIM)
+                surf.blit(s, (body.x + 4, body.y + 6))
+            for r, d, p, t in rows:
+                r = r.move(0, -self.names_scroll)
+                if r.bottom < body.y or r.y > body.bottom:
+                    continue
+                hov = r.collidepoint(mp)
+                pygame.draw.rect(surf, CARD_HI if hov else CARD, r, border_radius=8)
+                pygame.draw.rect(surf, cat_color(p.kind) if hov else PANEL_LINE, r, 1, border_radius=8)
+                s = self.ui_s.render(t, True, TEXT)
+                surf.blit(s, s.get_rect(center=r.center))
+            surf.set_clip(old)
+
+    def draw_help(self, surf, lay):
+        W, H = lay['W'], lay['H']
+        dim = pygame.Surface((W, H), pygame.SRCALPHA)
+        dim.fill((*DIM, 150))
+        surf.blit(dim, (0, 0))
+        box = pygame.Rect(0, 0, min(W - 40, 860), min(H - 40, 560))
+        box.center = (W // 2, H // 2)
+        pygame.draw.rect(surf, PANEL, box, border_radius=14)
+        pygame.draw.rect(surf, PART_LINE, box, 1, border_radius=14)
+        half = box.w // 2
+        s = self.ui_h.render('Controls', True, TEXT)
+        surf.blit(s, (box.x + 24, box.y + 18))
+        s = self.ui_h.render('Script commands', True, TEXT)
+        surf.blit(s, (box.x + half + 10, box.y + 18))
+        for i, (a, b) in enumerate(HELP2):
+            y = box.y + 54 + i * 20
+            surf.blit(self.ui_s.render(a, True, ON), (box.x + 24, y))
+            surf.blit(self.ui_s.render(b, True, TEXT_DIM), (box.x + 24 + 128, y))
+        y = box.y + 54
+        for i, (a, b) in enumerate(S_HELP):
+            surf.blit(self.edf.render(a, True, ON), (box.x + half + 10, y + i * 20))
+            surf.blit(self.ui_s.render(b, True, TEXT_DIM), (box.x + half + 10 + 190, y + i * 20))
+        s = self.ui_s.render('click anywhere to close', True, TEXT_DIM)
+        surf.blit(s, s.get_rect(midbottom=(box.centerx, box.bottom - 12)))
+
     def draw(self, surf):
         W, H = surf.get_size()
-        self.draw_grid(surf, W, H)
+        lay = self.layout()
+        work = lay['work']
+        self.draw_grid(surf, lay)
+        surf.set_clip(work)
         find, drv = self.netstate()
         mp = pygame.mouse.get_pos()
 
@@ -2688,13 +4011,13 @@ class App:
             pa, ia = self.drag['a']
             draw_wire(surf, wire_pts(pa.pin_pos(ia), mp), PREVIEW, 2)
 
-        view = pygame.Rect(PAL_W, 0, W - PAL_W, H)
+        view = work
         for p in self.parts:
             if p.rect().colliderect(view):
                 self.draw_part(surf, p, pcol)
 
         for p in self.sel:
-            pygame.draw.rect(surf, SEL, p.rect().inflate(6, 6), 2)
+            pygame.draw.rect(surf, SEL, p.rect().inflate(6, 6), 2, border_radius=9)
 
         # red tint on dragged parts that are over something (can't be placed there)
         d = self.drag
@@ -2714,47 +4037,13 @@ class App:
             surf.blit(tint, r.topleft)
             pygame.draw.rect(surf, SEL, r, 1)
 
-        # palette
-        pygame.draw.rect(surf, PANEL, (0, 0, PAL_W, H))
-        pygame.draw.line(surf, PANEL_LINE, (PAL_W - 1, 0), (PAL_W - 1, H))
-        self.label(surf, 'PARTS', TEXT, (PAL_W // 2, 18))
-        top, bot = self.pal_area(H)
-        self.scroll_palette(0)
-        surf.set_clip(pygame.Rect(0, top, PAL_W - 1, bot - top))
-        for i, k in enumerate(self.pal_items()):
-            r = self.pal_rect(i)
-            if r.bottom < top or r.top > bot:
-                continue
-            hov = r.collidepoint(mp) and top <= mp[1] <= bot
-            pygame.draw.rect(surf, PART_BG, r)
-            pygame.draw.rect(surf, PART_LINE if hov else PANEL_LINE, r, 1)
-            pygame.draw.rect(surf, cat_color(k), (r.x, r.y, 4, r.h))
-            t = self.small.render(k, True, TEXT)
-            surf.blit(t, (r.x + 10, r.centery - t.get_height() // 2))
         surf.set_clip(None)
-        hy = H - HELP_H
-        pygame.draw.line(surf, PANEL_LINE, (8, hy), (PAL_W - 8, hy))
-        for i, t in enumerate(HELP):
-            surf.blit(self.small.render(t, True, TEXT_DIM), (12, hy + 8 + i * 15))
-        surf.blit(self.small.render(f"{self.rate} ticks/s", True, TEXT), (12, H - 22))
-        ct = self.small.render(_CR_A, True, TEXT_DIM)
-        surf.blit(ct, (surf.get_width() - ct.get_width() - 10, H - 18))
-        W_ = surf.get_width()
-        mt = self.font.render('RUN (compiled)' if self.running and self.cmp else 'RUN' if self.running else 'BUILD, enter = run',
-                              True, ON if self.running else SEL)
-        mr = pygame.Rect(W_ - mt.get_width() - 24, 8, mt.get_width() + 14, mt.get_height() + 6)
-        pygame.draw.rect(surf, PANEL, mr)
-        pygame.draw.rect(surf, ON if self.running else SEL, mr, 1)
-        surf.blit(mt, (mr.x + 7, mr.y + 3))
-        if self.paused:
-            t = self.font.render('PAUSED', True, SEL)
-            pr = pygame.Rect(PAL_W + 10, 8, t.get_width() + 14, t.get_height() + 6)
-            pygame.draw.rect(surf, PANEL, pr)
-            pygame.draw.rect(surf, SEL, pr, 1)
-            surf.blit(t, (pr.x + 7, pr.y + 3))
+        self.draw_right(surf, lay, mp)
+        self.draw_dock(surf, lay, mp)
+        self.draw_top(surf, lay, mp)
 
         # pin label on hover
-        if mp[0] >= PAL_W and not (d and d['kind'] in ('part', 'box')):
+        if work.collidepoint(mp) and not (d and d['kind'] in ('part', 'box')) and not self.help_open:
             hit = self.pin_at(mp)
             if hit:
                 p, i = hit
@@ -2765,17 +4054,22 @@ class App:
                     x = mp[0] - w - 6
                 if y + h > H:
                     y = mp[1] - h - 6
-                pygame.draw.rect(surf, PANEL, (x, y, w, h))
-                pygame.draw.rect(surf, PART_LINE, (x, y, w, h), 1)
+                pygame.draw.rect(surf, PANEL, (x, y, w, h), border_radius=6)
+                pygame.draw.rect(surf, PART_LINE, (x, y, w, h), 1, border_radius=6)
                 surf.blit(t, (x + 5, y + 3))
 
         if self.toast[0] and time.time() < self.toast[1]:
             t = self.font.render(self.toast[0], True, TEXT)
             tr = pygame.Rect(0, 0, t.get_width() + 24, t.get_height() + 14)
-            tr.midtop = ((W + PAL_W) // 2, 12)
-            pygame.draw.rect(surf, PANEL, tr)
-            pygame.draw.rect(surf, SEL, tr, 1)
+            tr.midtop = (work.centerx, work.y + 12)
+            pygame.draw.rect(surf, PANEL, tr, border_radius=10)
+            pygame.draw.rect(surf, SEL, tr, 1, border_radius=10)
             surf.blit(t, t.get_rect(center=tr.center))
+
+        if self.help_open:
+            self.draw_help(surf, lay)
+        if self.namebox:
+            self.draw_namebox(surf)
 
         u = self.updater
         if u and u.modal():
