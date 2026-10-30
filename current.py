@@ -5573,6 +5573,7 @@ class GasSim:
             fxp = float((inner * (pe[:-2, 1:-1] * gas[:-2, 1:-1] - pe[2:, 1:-1] * gas[2:, 1:-1])).sum())
             fyp = float((inner * (pe[1:-1, :-2] * gas[1:-1, :-2] - pe[1:-1, 2:] * gas[1:-1, 2:])).sum())
             m = self.frame_mass(f)
+            vx_old = f['vx']
             f['vx'] = (f['vx'] + fxp * G_PUSH / m) * G_FRAME_DAMP
             f['vy'] = (f['vy'] + fyp * G_PUSH / m + (G_BODY_G if self.gravity else 0)) * G_FRAME_DAMP
             own = self.frame_cogs(f)
@@ -5592,6 +5593,7 @@ class GasSim:
                     sh['om'] -= Rw * j / I
             f['vx'] = max(-0.9, min(0.9, f['vx']))
             f['vy'] = max(-0.9, min(0.9, f['vy']))
+            self.slosh(f, f['vx'] - vx_old)
             for axis in (0, 1):
                 vk, fk = ('vx', 'fx') if axis == 0 else ('vy', 'fy')
                 v = f[vk]
@@ -5617,6 +5619,26 @@ class GasSim:
                     self.roll_region(f, ddx, ddy)
                     f[fk] -= d
                     own = self.frame_cogs(f)
+
+    def slosh(self, f, dv):
+        # speeding up makes the water lag behind: push it toward the back wall
+        if not self.gravity or abs(dv) < 0.002:
+            return
+        x0, y0, w, h = f['x0'], f['y0'], f['w'], f['h']
+        sl = (slice(x0, x0 + w), slice(y0, y0 + h))
+        L = self.liq[sl]
+        if not L.any():
+            return
+        F = ~self.solid[sl]
+        q = min(0.45, abs(dv) * 30)
+        if dv > 0:      # accelerating right, water slides left
+            amt = np.minimum(L[1:] * q, np.maximum(G_LIQ_CAP - L[:-1], 0)) * (F[1:] & F[:-1])
+            L[1:] -= amt
+            L[:-1] += amt
+        else:
+            amt = np.minimum(L[:-1] * q, np.maximum(G_LIQ_CAP - L[1:], 0)) * (F[1:] & F[:-1])
+            L[:-1] -= amt
+            L[1:] += amt
 
     def add_cog(self, x, y, R, tl, n):
         for sh in self.shafts:
@@ -7994,12 +8016,6 @@ class GasMode:
         if d_ and d_['tool'] in ('SHAFT', 'COG'):
             (ax, ay), (bx, by) = d_['start'], d_['cur']
             pygame.draw.circle(surf, SEL, scr(ax + 1.5, ay + 1.5), int(max(3, math.hypot(bx - ax, by - ay)) * cs), 1)
-        # physics objects get a thin outline and a tag
-        for f in sim.frames:
-            fr = pygame.Rect(self.x0 + int((f['x0'] - 1 + f['fx']) * cs), self.y0 + int((f['y0'] - 1 + f['fy']) * cs), f['w'] * cs, f['h'] * cs)
-            pygame.draw.rect(surf, (120, 220, 255), fr.inflate(4, 4), 1)
-            tg = self.app.tiny.render('physics', True, (120, 220, 255))
-            surf.blit(tg, (fr.x, fr.y - tg.get_height() - 3))
         if self.chain_first:
             q = self.chain_first
             pygame.draw.circle(surf, SEL, scr(q['x'], q['y'], sim.foff(q['x'], q['y'])), int((q['R'] + 1) * cs), 2)
