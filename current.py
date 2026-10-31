@@ -95,7 +95,17 @@ def local_path(path):
     return os.path.join(APP_DIR, *path.split('/'))
 
 
+HARD = False
+
+
 def save_path():
+    p = base_save_path()
+    if HARD:
+        return os.path.join(os.path.dirname(p), 'hard', os.path.basename(p))
+    return p
+
+
+def base_save_path():
     p = os.environ.get('LOGICSIM_SAVE')
     if p:
         return p
@@ -107,13 +117,13 @@ def save_path():
 
 
 def version_path():
-    return os.path.join(os.path.dirname(save_path()), 'version.txt')
+    return os.path.join(os.path.dirname(base_save_path()), 'version.txt')
 
 
 FROZEN = getattr(sys, 'frozen', False)      # running as the packaged exe
 if FROZEN:
     # the exe can't overwrite itself, so updates live next to the save and the launcher runs them
-    APP_DIR = os.path.join(os.path.dirname(save_path()), 'code')
+    APP_DIR = os.path.join(os.path.dirname(base_save_path()), 'code')
     MAIN_LOCAL = os.path.join(APP_DIR, REPO_MAIN)
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -139,7 +149,7 @@ def github_token():
     t = os.environ.get('LOGICSIM_TOKEN')
     if t:
         return t.strip()
-    for d in (APP_DIR, os.path.dirname(save_path())):
+    for d in (APP_DIR, os.path.dirname(base_save_path())):
         try:
             with open(os.path.join(d, 'token.txt')) as f:
                 return f.read().strip()
@@ -461,8 +471,8 @@ def ssl_context():
 
 def log_update(msg):
     try:
-        os.makedirs(os.path.dirname(save_path()), exist_ok=True)
-        with open(os.path.join(os.path.dirname(save_path()), 'update.log'), 'a') as f:
+        os.makedirs(os.path.dirname(base_save_path()), exist_ok=True)
+        with open(os.path.join(os.path.dirname(base_save_path()), 'update.log'), 'a') as f:
             f.write(time.strftime('%H:%M:%S ') + msg + '\n')
     except OSError:
         pass
@@ -489,7 +499,7 @@ def locked_screen(surf):
 
 
 def news_path(ext):
-    return os.path.join(os.path.dirname(save_path()), 'whatsnew.' + ext)
+    return os.path.join(os.path.dirname(base_save_path()), 'whatsnew.' + ext)
 
 
 class Updater:
@@ -4241,6 +4251,8 @@ G_BODY_G = 0.0015   # block gravity
 G_COOL = 0.0004     # hot gas slowly radiating heat away
 G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
 G_VISC = 0.02
+G_CROP = True       # only simulate columns where something is going on
+G_CROP_M = 6
 G_SUB = 1           # flow sub-steps per step: gas moves, jets and shocks run this much faster
 G_UMAX = 0.95        # fastest flow on a cell face (cells / step)
 G_COLL = 5.0         # how much fast flow ignores sideways pressure (keeps jets narrow), 0 = off
@@ -5121,9 +5133,9 @@ class GasSim:
             if not any(q.get('wheel') for q in self.frame_shafts(f)):
                 continue
             cx = f['x0'] + f['w'] / 2.0
-            if cx > self.W2 - 44:
+            if cx > self.W2 - 64:
                 return 1 if self.scroll_world(1) is None else 0
-            if cx < 44:
+            if cx < 64:
                 return -1 if self.scroll_world(-1) is None else 0
         return 0
 
@@ -5420,6 +5432,40 @@ class GasSim:
         x0, x1, y0, y1 = x0 + lo_x, x0 + hi_x, y0 + lo_y, y0 + hi_y
         w, h = x1 - x0 + 1, y1 - y0 + 1
         self.frames.append(dict(x0=int(x0), y0=int(y0), w=int(w), h=int(h), fx=0.0, fy=0.0, vx=0.0, vy=0.0))
+        return None
+
+    def attach_frame(self, x0, y0, x1, y1):
+        # grow the physics object next to the selection so the new parts ride along with it
+        x0, x1 = sorted((max(1, x0), min(self.W2 - 2, x1)))
+        y0, y1 = sorted((max(1, y0), min(self.H2 - 2, y1)))
+        near = [f for f in self.frames
+                if not (x1 < f['x0'] - 1 or x0 > f['x0'] + f['w'] or y1 < f['y0'] - 1 or y0 > f['y0'] + f['h'])]
+        if len(near) != 1:
+            return 'select the new parts so they touch one physics object' if not near else 'that touches more than one physics object'
+        f = near[0]
+        nx0, ny0 = min(x0, f['x0']), min(y0, f['y0'])
+        nx1, ny1 = max(x1, f['x0'] + f['w'] - 1), max(y1, f['y0'] + f['h'] - 1)
+        # only grow to what is actually solid / a shaft, so empty air doesn't count
+        sl = (slice(x0, x1 + 1), slice(y0, y1 + 1))
+        occ = self.solid[sl] | (self.kind[sl] > 0)
+        xs, ys = np.nonzero(occ)
+        if len(xs):
+            gx0, gx1, gy0, gy1 = x0 + xs.min(), x0 + xs.max(), y0 + ys.min(), y0 + ys.max()
+        else:
+            gx0, gx1, gy0, gy1 = f['x0'], f['x0'], f['y0'], f['y0']
+        nx0, ny0 = min(gx0, f['x0']), min(gy0, f['y0'])
+        nx1, ny1 = max(gx1, f['x0'] + f['w'] - 1), max(gy1, f['y0'] + f['h'] - 1)
+        for o in self.frames:
+            if o is not f and not (nx1 < o['x0'] or nx0 >= o['x0'] + o['w'] or ny1 < o['y0'] or ny0 >= o['y0'] + o['h']):
+                return 'that would run into another physics object'
+        if any(((rb['cx'] >= nx0) & (rb['cx'] <= nx1) & (rb['cy'] >= ny0) & (rb['cy'] <= ny1)).any() for rb in self.rbs):
+            return 'that would run into a spinning body'
+        for b in self.bodies:
+            inx = not (b['x'] + b['w'] - 1 < nx0 or b['x'] > nx1 or b['y'] + b['h'] - 1 < ny0 or b['y'] > ny1)
+            full = nx0 <= b['x'] and b['x'] + b['w'] - 1 <= nx1 and ny0 <= b['y'] and b['y'] + b['h'] - 1 <= ny1
+            if inx and not full:
+                return 'that cuts a block in half'
+        f['x0'], f['y0'], f['w'], f['h'] = int(nx0), int(ny0), int(nx1 - nx0 + 1), int(ny1 - ny0 + 1)
         return None
 
     def release_frames(self, x0, y0, x1, y1):
@@ -6229,46 +6275,51 @@ class GasSim:
             adj &= ~sol
             n[:, adj] *= 0.85
 
-    def step(self):
-        n, T, sol = self.n, self.T, self.solid
-        ring = self.ring
-        if self.open:
-            sol[ring] = False
-            if self.void:
-                n[:, ring] = 0
-            else:
-                n[:, ring] = self.amb_ring
-            T[ring] = 293
-        else:
-            sol[ring] = True
-            n[:, ring] = 0
-        self.age += 1
-        # blocks and cracking walls work on the whole grid before the gas moves
-        if self.bodies or self.shafts or self.frames or self.rbs or self.cogmask.any() or self.sensors or G_RELIEF in self.has \
-                or (self.age % 4 == 0 and self.strength.any()):
-            p0 = n.sum(0) * T / 293
-            if self.bodies or self.shafts:
-                self.move_bodies(p0)
-            if self.frames:
-                self.move_frames(p0)
-            if self.rbs or self.cogmask.any():
-                self.move_rbodies(p0)
-            if self.sensors:
-                self.sense(p0)
-            if self.age % 4 == 0:
-                self.check_breaks(p0)    # walls crack when the pressure across them is too much
-            if G_RELIEF in self.has:
-                self.update_relief(p0)
-            sol = self.solid
-            n[:, sol] = 0
-        if self.glinks:
-            self.links_tick()
-        # only push around the gases that actually exist right now (much faster)
-        if self.age % 120 == 0:
-            live = n.reshape(n.shape[0], -1).max(1) > 1e-7
-            self.active = set(np.nonzero(live)[0].tolist()) | ({0, 1} if self.open else set())
-        idx = np.array(sorted(self.active) or [0])
-        full = n
+    def active_spans(self, n, T, sol, idx):
+        # which column ranges actually have something going on (None = just simulate everything)
+        if not self.open or self.void or G_TURB in self.has or not G_CROP:
+            return None
+        W2 = self.W2
+        d = np.abs(n[idx] - self.amb_field[idx]).max(0) > 3e-3
+        d &= ~sol
+        col = d.any(1)
+        col |= (np.abs(T - 293) * ~sol > 0.5).any(1)
+        um = (np.abs(self.u) > 0.01).any(1)
+        col[:-1] |= um
+        col[1:] |= um
+        col |= (np.abs(self.v) > 0.01).any(1)
+        col |= ((self.kind > 3) | (self.liq > 0)).any(1)
+        col |= self.cogmask.any(1)
+        col |= self.spark_t.any(1)
+        for f in self.frames:
+            col[max(0, f['x0'] - 2):f['x0'] + f['w'] + 3] = True
+        for b in self.bodies:
+            col[max(0, int(b['x']) - 2):int(b['x'] + b['w']) + 3] = True
+        for rb in self.rbs:
+            col[max(0, int(rb['cx'].min()) - 3):int(rb['cx'].max()) + 4] = True
+        for sh in self.shafts:
+            col[max(0, int(sh['x'] - sh['R']) - 3):int(sh['x'] + sh['R']) + 4] = True
+        for (x, y) in list(self.sensors) + list(self.glinks) + list(self.probes):
+            col[max(0, x - 3):x + 4] = True
+        xs = np.flatnonzero(col)
+        if not len(xs):
+            return []
+        M = G_CROP_M
+        spans = []
+        lo = hi = xs[0]
+        for x in xs[1:]:
+            if x - hi > 2 * M:
+                spans.append((lo, hi))
+                lo = x
+            hi = x
+        spans.append((lo, hi))
+        out = [(max(0, a - M), min(W2, b + M + 1)) for a, b in spans]
+        if out[0][1] - out[0][0] >= W2 - 4 and len(out) == 1:
+            return None
+        return out
+
+    def flow_core(self, full, T, sol, idx):
+        n = full
         for _sub in range(G_SUB):
             n = full[idx]
             cvv, Mv = self.cvv[idx], self.Mv[idx]
@@ -6380,7 +6431,59 @@ class GasSim:
             if exm is not None:
                 T[exm] = exT
             full[idx] = n
-        n = full
+
+    def step(self):
+        n, T, sol = self.n, self.T, self.solid
+        ring = self.ring
+        if self.open:
+            sol[ring] = False
+            if self.void:
+                n[:, ring] = 0
+            else:
+                n[:, ring] = self.amb_ring
+            T[ring] = 293
+        else:
+            sol[ring] = True
+            n[:, ring] = 0
+        self.age += 1
+        # blocks and cracking walls work on the whole grid before the gas moves
+        if self.bodies or self.shafts or self.frames or self.rbs or self.cogmask.any() or self.sensors or G_RELIEF in self.has \
+                or (self.age % 4 == 0 and self.strength.any()):
+            p0 = n.sum(0) * T / 293
+            if self.bodies or self.shafts:
+                self.move_bodies(p0)
+            if self.frames:
+                self.move_frames(p0)
+            if self.rbs or self.cogmask.any():
+                self.move_rbodies(p0)
+            if self.sensors:
+                self.sense(p0)
+            if self.age % 4 == 0:
+                self.check_breaks(p0)    # walls crack when the pressure across them is too much
+            if G_RELIEF in self.has:
+                self.update_relief(p0)
+            sol = self.solid
+            n[:, sol] = 0
+        if self.glinks:
+            self.links_tick()
+        # only push around the gases that actually exist right now (much faster)
+        if self.age % 120 == 0:
+            live = n.reshape(n.shape[0], -1).max(1) > 1e-7
+            self.active = set(np.nonzero(live)[0].tolist()) | ({0, 1} if self.open else set())
+        idx = np.array(sorted(self.active) or [0])
+        spans = self.active_spans(n, T, sol, idx)
+        self.last_spans = spans
+        if spans is None:
+            self.flow_core(n, T, sol, idx)
+        else:
+            keep = (self.n, self.T, self.solid, self.kind, self.aux, self.liq, self.u, self.v)
+            for (c0, c1) in spans:
+                self.n, self.T, self.solid = keep[0][:, c0:c1], keep[1][c0:c1], keep[2][c0:c1]
+                self.kind, self.aux, self.liq = keep[3][c0:c1], keep[4][c0:c1], keep[5][c0:c1]
+                self.u, self.v = keep[6][c0:c1 - 1], keep[7][c0:c1]
+                self.flow_core(self.n, self.T, self.solid, idx)
+            self.n, self.T, self.solid, self.kind, self.aux, self.liq, self.u, self.v = keep
+        n = self.n
         S = n.shape[0]
         if self.has & {G_FILTER, G_HEATER, G_COOLER, G_SOURCE, G_VENT}:
             self.devices(n, T, sol)
@@ -6918,6 +7021,8 @@ class GasMode:
             self.help_open = not self.help_open
         elif act == 'phys':
             self.toggle_physics()
+        elif act == 'attach':
+            self.attach_physics()
         elif act == 'copy':
             (ax, ay), (bx, by) = self.sel
             self.clip = sim.copy_region(ax + 1, ay + 1, bx + 1, by + 1)
@@ -6977,7 +7082,7 @@ class GasMode:
         (ax, ay), (bx, by) = self.sel
         cs = self.cs
         r = pygame.Rect(self.x0 + min(ax, bx) * cs, self.y0 + min(ay, by) * cs, (abs(bx - ax) + 1) * cs, (abs(by - ay) + 1) * cs)
-        items = [('phys', 'Physics  R', 100), ('copy', 'Copy', 56), ('delete', 'Delete', 62)]
+        items = [('phys', 'Physics  R', 100), ('attach', 'Attach  J', 84), ('copy', 'Copy', 56), ('delete', 'Delete', 62)]
         tw = sum(w for _, _, w in items) + 6 * (len(items) - 1)
         vr = self.view_rect
         x = max(vr.x + 4, min(vr.right - tw - 4, r.centerx - tw // 2))
@@ -7450,8 +7555,11 @@ class GasMode:
                     self.app.say('nothing copied yet')
             elif k == pygame.K_r and not ctrl:
                 self.toggle_physics(shift)
+            elif k == pygame.K_j and not ctrl:
+                self.attach_physics()
             elif k in (pygame.K_LEFT, pygame.K_RIGHT) and not ctrl:
-                self.world_scroll(-1 if k == pygame.K_LEFT else 1)
+                if self.slide < 0.35:
+                    self.world_scroll(-1 if k == pygame.K_LEFT else 1)
             elif k == pygame.K_DELETE and self.sel and not (ctrl and shift):
                 self.delete_selection()
             elif k == pygame.K_m:
@@ -7711,6 +7819,17 @@ class GasMode:
                     solid = self.mat in G_SOLID_MATS
                     self.apply(self.rect_mask(d['start'], d['cur'], solid), 1.0)
         return None
+
+    def attach_physics(self):
+        if not self.sel:
+            self.app.say('select the new parts (touching the physics object), then J')
+            return
+        (ax, ay), (bx, by) = self.sel
+        err = self.sim.attach_frame(ax + 1, ay + 1, bx + 1, by + 1)
+        self.app.say(err or 'attached, it rides along now')
+        if not err:
+            self.sel = None
+        self.dirty = True
 
     def toggle_physics(self, shift=False):
         if not self.sel:
@@ -8172,17 +8291,89 @@ class GasMode:
             surf.set_clip(vr)
             surf.blit(self.slide_img, (vr.x + (self.slide - 1) * S, vr.y))
             surf.blit(new, (vr.x + self.slide * S, vr.y))
-            self.slide *= 0.8
+            self.slide = max(0.0, self.slide * 0.9 - 0.012)
         else:
             self.slide, self.slide_img = 0.0, None
         surf.set_clip(None)
         self.draw_chrome(surf)
 
 
+HARD_CIRCUIT = [('INPUT', ['SOURCE', 'SWITCH', 'BUTTON']), ('OUTPUT', ['LAMP', 'DISPLAY', 'TOUCH']),
+                ('LOGIC', ['NAND']), ('CHIPS', ['PIN'])]
+
+
+def apply_hard():
+    # hard: circuits only get NAND and the basics, gas has no mixtures and every part can break
+    global HARD, G_TOUGH
+    HARD = True
+    PAL_CATS[:] = HARD_CIRCUIT
+    PAL_ITEMS[:] = [k for _, ks in HARD_CIRCUIT for k in ks]
+    G_TOUGH = ()
+    for i, sd in enumerate(G_SOLIDS):
+        if sd and sd[1] == 0:
+            G_SOLIDS[i] = (sd[0], 120 if sd[0] == 'STEEL' else 30, sd[2])
+    G_CATS[:] = [(n, [m for m in ms if m != 'VACUUM'] if n == 'GASES' else ms) for n, ms in G_CATS if n != 'MIXES']
+    G_CATS[[n for n, _ in G_CATS].index('GASES')][1].append('VACUUM')
+
+
+def pick_difficulty(surf):
+    # boot screen: returns True for hard
+    clock = pygame.time.Clock()
+    f = pygame.font.SysFont('consolas,dejavusansmono,monospace', 20)
+    big = pygame.font.SysFont('consolas,dejavusansmono,monospace', 40, bold=True)
+    opts = [('EASY', 'everything unlocked (how it works now)', (110, 200, 140)),
+            ('HARD', 'circuits: only NAND, source, switch, button, lamp, display, touch, pin\ngas lab: no premixed gases, every part can break', (235, 110, 90))]
+    while True:
+        surf = pygame.display.get_surface()
+        w, h = surf.get_size()
+        surf.fill((12, 12, 18))
+        t = big.render('logic sandbox', True, (230, 232, 245))
+        surf.blit(t, t.get_rect(center=(w // 2, h // 2 - 190)))
+        boxes = []
+        for i, (nm, desc, col) in enumerate(opts):
+            r = pygame.Rect(0, 0, 560, 130)
+            r.center = (w // 2, h // 2 - 70 + i * 160)
+            hot = r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(surf, (30, 32, 44) if hot else (22, 24, 34), r, border_radius=10)
+            pygame.draw.rect(surf, col, r, 2, border_radius=10)
+            surf.blit(big.render(nm + '  [' + str(i + 1) + ']', True, col), (r.x + 22, r.y + 14))
+            for j, ln in enumerate(desc.split('\n')):
+                surf.blit(f.render(ln, True, (190, 195, 212)), (r.x + 22, r.y + 70 + j * 24))
+            boxes.append(r)
+        pygame.display.flip()
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                return None
+            if e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_1, pygame.K_e, pygame.K_KP1):
+                    return False
+                if e.key in (pygame.K_2, pygame.K_h, pygame.K_KP2):
+                    return True
+                if e.key == pygame.K_ESCAPE:
+                    return None
+            if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                for i, r in enumerate(boxes):
+                    if r.collidepoint(e.pos):
+                        return bool(i)
+        clock.tick(60)
+
+
 def main():
     pygame.init()
     pygame.display.set_caption('logic sandbox  |  ' + AUTHOR)
     pygame.display.set_mode((1280, 800), pygame.RESIZABLE)
+    if '--hard' in sys.argv:
+        choice = True
+    elif '--easy' in sys.argv:
+        choice = False
+    else:
+        choice = pick_difficulty(pygame.display.get_surface())
+    if choice is None:
+        pygame.quit()
+        return
+    if choice:
+        apply_hard()
+        pygame.display.set_caption('logic sandbox (HARD)  |  ' + AUTHOR)
     clock = pygame.time.Clock()
     app = App()
     app.load()
@@ -8255,9 +8446,9 @@ def main():
         try:
             if FROZEN:
                 env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')   # fresh unpack for the new process
-                subprocess.Popen([sys.executable] + sys.argv[1:], env=env)
+                subprocess.Popen([sys.executable] + sys.argv[1:] + (['--hard'] if HARD and '--hard' not in sys.argv else ['--easy'] if '--easy' not in sys.argv and '--hard' not in sys.argv else []), env=env)
             else:
-                subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + (['--hard'] if HARD and '--hard' not in sys.argv else ['--easy'] if '--easy' not in sys.argv and '--hard' not in sys.argv else []))
         except Exception as err:
             log_update(f'restart failed: {err!r}, start the game again by hand')
 
