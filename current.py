@@ -4549,8 +4549,11 @@ def _build_kernels(jit):
 
 if HAVE_NUMBA:
     try:
-        k_force, k_active, k_move = _build_kernels(
-            lambda f: njit(parallel=True, fastmath=True, cache=not getattr(sys, 'frozen', False))(f))
+        try:
+            k_force, k_active, k_move = _build_kernels(lambda f: njit(parallel=True, fastmath=True, cache=True)(f))
+        except Exception:
+            # no cache possible (running from inside a bundle), compile each launch instead
+            k_force, k_active, k_move = _build_kernels(lambda f: njit(parallel=True, fastmath=True)(f))
     except Exception:
         HAVE_NUMBA = False
 
