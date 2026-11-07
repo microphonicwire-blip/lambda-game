@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pygame pyinstaller numpy certifi nuitka
+      - run: pip install pygame pyinstaller numpy certifi nuitka numba
       - name: compile the game, launcher and guard to native code
         shell: bash
         run: |
@@ -41,7 +41,7 @@ jobs:
           mkdir pk
           cp entry.py pk/
           cd pk
-          pyinstaller --onefile ${{ matrix.win }} --name logicsim --paths ../work/out --hidden-import current --hidden-import guard entry.py
+          pyinstaller --onefile ${{ matrix.win }} --name logicsim --paths ../work/out --hidden-import current --hidden-import guard --collect-all numba --collect-all llvmlite entry.py
           if [ "$RUNNER_OS" = "Linux" ]; then mv dist/logicsim dist/logicsim-linux; fi
           ls dist
       - uses: actions/upload-artifact@v4
