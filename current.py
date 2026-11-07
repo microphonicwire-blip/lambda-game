@@ -4165,6 +4165,11 @@ G_REACT = dict(D=0.22, LOSS=0.012, ABS_W=0.01, ROD=0.9, K=3.4, GAIN=0.3, F0=0.38
                SRC=0.003, POWER=6.0, DECAY_K=0.9, DECAY_T=0.0007, MELT=1300.0)
 G_PASS = (G_FILTER, G_CHECK, G_PUMP, G_TURB)    # gas flows through these cells
 G_LAT = 4896.0          # latent heat of water / R, in K (boils at 373K at 1 atm)
+G_MOL_C = 30.0          # heat capacity of a molten fuel cell
+G_MOL_K = 0.05          # how well it hands heat to the gas around it
+G_MOL_COOL = 0.0008     # radiates away slowly
+G_MOL_BURN = 1000.0     # K, molten fuel hotter than this eats through walls
+G_MOL_FREEZE = 950.0    # K, below this the puddle sets solid again
 G_LIQ_CAP = 4.0         # liquid water a cell can hold
 G_LIQ_ITERS = 5       # quick water moves per sim step
 G_PHASE = 0.3           # how fast steam condenses / water evaporates toward equilibrium
@@ -4176,6 +4181,10 @@ G_TURB_COUPLE = 0.3     # how hard the rotor drags the gas along (and the gas dr
 G_HEAT_LEVELS = [400, 600, 900, 1400, 2200]     # K
 G_COOL_LEVELS = [270, 230, 180, 120, 77]        # K
 G_RATE = 0.12       # source emit rate per step
+G_PUMP_PMAX = 0      # pumps stall when what's ahead of them gets this thick (atm), 0 = never (hard mode sets 20)
+G_CELL_M = 0.05      # one cell is 5 cm wide and 1 m deep, so 1 atm on one cell face = 5066 N
+G_DEPTH_M = 1.0
+G_STEP_S = 0.005     # seconds per sim step, for impulse
 G_PUMP_V = 0.45     # pump face speed
 # signals shared with the circuit side (GAS IN / GAS OUT parts): link id -> 0/1
 GAS_TX = {}         # gas lab -> circuits
@@ -4226,7 +4235,7 @@ G_MATS = [('WALL', None), ('STEEL', None), ('GLASS', None), ('BLOCK', None), ('I
           ('SF6', {'SF6': 1}), ('DIESEL', {'C12H26': 1}), ('WATER', None),
           ('H2+O2 2:1', {'H2': 2 / 3, 'O2': 1 / 3}), ('CH4+O2 1:2', {'CH4': 1 / 3, 'O2': 2 / 3}),
           ('C3H8+O2 1:5', {'C3H8': 1 / 6, 'O2': 5 / 6}), ('CO+O2 2:1', {'CO': 2 / 3, 'O2': 1 / 3}), ('DIESEL+AIR', {'C12H26': 0.011, 'N2': 0.78, 'O2': 0.209}),
-          ('VACUUM', None)]
+          ('VACUUM', None), ('HEAT BRUSH', None), ('COOL BRUSH', None)]
 G_SOLID_MATS = {'WALL': G_WALL, 'STEEL': G_STEEL, 'GLASS': G_GLASS, 'IGNITER': G_IGNITER,
                 'VALVE': G_VALVE, 'FILTER': G_FILTER, 'CHECK VALVE': G_CHECK, 'HEATER': G_HEATER,
                 'COOLER': G_COOLER, 'PUMP': G_PUMP, 'SOURCE': G_SOURCE, 'VENT': G_VENT,
@@ -4251,6 +4260,7 @@ G_BODY_G = 0.0015   # block gravity
 G_COOL = 0.0004     # hot gas slowly radiating heat away
 G_WALLCOOL = 0.01   # walls soak up heat from gas touching them
 G_VISC = 0.02
+G_NUMBA = True      # use the compiled kernels when numba is installed
 G_CROP = True       # only simulate columns where something is going on
 G_CROP_M = 6
 G_SUB = 1           # flow sub-steps per step: gas moves, jets and shocks run this much faster
@@ -4259,7 +4269,7 @@ G_COLL = 5.0         # how much fast flow ignores sideways pressure (keeps jets 
 G_ADV = 0.8         # flow carries its own momentum: speeds up in narrow pipes, pressure drops there (bernoulli)
 G_CATS = [('WALLS', ['WALL', 'STEEL', 'GLASS', 'BLOCK']),
           ('FLOW', ['VALVE', 'FILTER', 'CHECK VALVE', 'PUMP', 'VENT', 'RELIEF VALVE', 'TURBINE']),
-          ('HEAT & POWER', ['IGNITER', 'HEATER', 'COOLER', 'EXCHANGER', 'SOURCE', 'URANIUM', 'CONTROL ROD']),
+          ('HEAT & POWER', ['HEAT BRUSH', 'COOL BRUSH', 'IGNITER', 'HEATER', 'COOLER', 'EXCHANGER', 'SOURCE', 'URANIUM', 'CONTROL ROD']),
           ('MECHANICS', ['SHAFT', 'COG', 'HINGE', 'ROD', 'CHAIN', 'WHEEL']),
           ('SENSORS', ['BLK SENSOR', 'TEMP SENSOR', 'PRES SENSOR', 'HINGE SENSOR', 'TIMER', 'LINK', 'THRUST PROBE']),
           ('GASES', ['AIR', 'HYDROGEN', 'PROPANE', 'METHANE', 'OXYGEN', 'HELIUM', 'CO2', 'NITROGEN', 'STEAM', 'ARGON', 'NEON',
@@ -4291,6 +4301,297 @@ G_RAMP_S = [(0, (8, 10, 30)), (0.3, (30, 70, 200)), (0.6, (40, 200, 230)), (0.85
 G_VIEWS = ['normal', 'pressure', 'temperature', 'speed']
 
 
+# fast gas kernels (numba, runs on all cores). without numba the plain numpy path below is used
+try:
+    if os.environ.get('LOGICSIM_NONUMBA'):
+        raise ImportError
+    try:
+        os.environ.setdefault('NUMBA_CACHE_DIR', os.path.join(os.path.dirname(base_save_path()), 'jit'))
+    except Exception:
+        pass
+    import numba
+    from numba import njit, prange
+    HAVE_NUMBA = True
+except Exception:
+    HAVE_NUMBA = False
+
+
+def _build_kernels(jit):
+    @jit
+    def k_force(n, idx, cvv, Mv, T, sol, u, v, p, C, rho, uo, vo, gravity, K, coll, visc, adv, damp, buoy):
+        # stage 1: pressure, buoyancy, viscosity, advection, friction. reads u,v and writes uo,vo
+        W, H = T.shape
+        S = idx.shape[0]
+        for i in prange(W):
+            for j in range(H):
+                c = 0.0
+                t = 0.0
+                r = 0.0
+                for k in range(S):
+                    x = n[idx[k], i, j]
+                    c += cvv[k] * x
+                    t += x
+                    r += Mv[k] * x
+                C[i, j] = c
+                p[i, j] = t * T[i, j] / 293.0
+                rho[i, j] = r / 29.0 + 0.02
+        # after pressure push (and buoyancy), kept in uo, vo
+        for i in prange(W - 1):
+            for j in range(H):
+                ku = min(K / (0.5 * (rho[i, j] + rho[i + 1, j])), 0.25 / (max(p[i, j], p[i + 1, j]) + 1e-3))
+                if coll != 0.0 and j >= 1 and j <= H - 2:
+                    vb = 0.25 * (v[i, j - 1] + v[i, j] + v[i + 1, j - 1] + v[i + 1, j])
+                    ku = ku / (1.0 + coll * vb * vb / 0.08)
+                uo[i, j] = u[i, j] + ku * (p[i, j] - p[i + 1, j])
+        for i in prange(W):
+            for j in range(H - 1):
+                kv = min(K / (0.5 * (rho[i, j] + rho[i, j + 1])), 0.25 / (max(p[i, j], p[i, j + 1]) + 1e-3))
+                if coll != 0.0 and i >= 1 and i <= W - 2:
+                    ub = 0.25 * (u[i - 1, j] + u[i, j] + u[i - 1, j + 1] + u[i, j + 1])
+                    kv = kv / (1.0 + coll * ub * ub / 0.08)
+                x = v[i, j] + kv * (p[i, j] - p[i, j + 1])
+                if gravity:
+                    rf = 0.5 * (rho[i, j] + rho[i, j + 1])
+                    pf = 0.5 * (p[i, j] + p[i, j + 1])
+                    if pf > 0.05:
+                        q = (rf - 0.02 - pf) / rf
+                        x += buoy * min(max(q, -3.0), 3.0)
+                vo[i, j] = x
+        # viscosity (into u, v as scratch), then advection and friction (into uo, vo)
+        for i in prange(W - 1):
+            for j in range(H):
+                x = uo[i, j]
+                if i >= 1 and i <= W - 3:
+                    x += visc * (uo[i - 1, j] + uo[i + 1, j] - 2.0 * uo[i, j])
+                if j >= 1 and j <= H - 2:
+                    x += visc * (uo[i, j - 1] + uo[i, j + 1] - 2.0 * uo[i, j])
+                u[i, j] = x
+        for i in prange(W):
+            for j in range(H - 1):
+                x = vo[i, j]
+                if i >= 1 and i <= W - 2:
+                    x += visc * (vo[i - 1, j] + vo[i + 1, j] - 2.0 * vo[i, j])
+                if j >= 1 and j <= H - 3:
+                    x += visc * (vo[i, j - 1] + vo[i, j + 1] - 2.0 * vo[i, j])
+                v[i, j] = x
+        # u, v now hold the smoothed flow; advect from them and write the result back into uo, vo
+        for i in prange(W - 1):
+            for j in range(H):
+                x = u[i, j]
+                if adv != 0.0:
+                    if i >= 1 and i <= W - 3:
+                        d = (x - u[i - 1, j]) if x > 0 else (u[i + 1, j] - x)
+                        x -= adv * u[i, j] * d
+                    if j >= 1 and j <= H - 2:
+                        vbar = 0.25 * (v[i, j - 1] + v[i, j] + v[i + 1, j - 1] + v[i + 1, j])
+                        d = (u[i, j] - u[i, j - 1]) if vbar > 0 else (u[i, j + 1] - u[i, j])
+                        x -= adv * vbar * d
+                if sol[i, j] or sol[i + 1, j]:
+                    x = 0.0
+                uo[i, j] = x * damp
+        for i in prange(W):
+            for j in range(H - 1):
+                x = v[i, j]
+                if adv != 0.0:
+                    if j >= 1 and j <= H - 3:
+                        d = (x - v[i, j - 1]) if x > 0 else (v[i, j + 1] - x)
+                        x -= adv * v[i, j] * d
+                    if i >= 1 and i <= W - 2:
+                        ubar = 0.25 * (u[i - 1, j] + u[i, j] + u[i - 1, j + 1] + u[i, j + 1])
+                        d = (v[i, j] - v[i - 1, j]) if ubar > 0 else (v[i + 1, j] - v[i, j])
+                        x -= adv * ubar * d
+                if sol[i, j] or sol[i, j + 1]:
+                    x = 0.0
+                vo[i, j] = x * damp
+
+    @jit
+    def k_active(n, idx, amb, T, sol, u, v, kind, liq, mol, cog, spark, col):
+        # which columns have something going on
+        W, H = T.shape
+        S = idx.shape[0]
+        for i in prange(W):
+            a = False
+            for j in range(H):
+                if not sol[i, j]:
+                    if abs(T[i, j] - 293.0) > 0.5:
+                        a = True
+                    for k in range(S):
+                        if abs(n[idx[k], i, j] - amb[k, j]) > 3e-3:
+                            a = True
+                if kind[i, j] > 3 or liq[i, j] > 0 or mol[i, j] > 0 or cog[i, j] or spark[i, j] > 0:
+                    a = True
+                if i < W - 1 and abs(u[i, j]) > 0.01:
+                    a = True
+                if i > 0 and abs(u[i - 1, j]) > 0.01:
+                    a = True
+                if j < H - 1 and abs(v[i, j]) > 0.01:
+                    a = True
+            col[i] = a
+
+    @jit
+    def k_move(n, idx, cvv, T, sol, chk, u, v, C, Eo, nn, Tn, up, un, vp, vn, s, umax, diff, heat, pdv):
+        # stage 2: limit flow, move gas and heat between cells. u, v are final here
+        W, H = T.shape
+        S = idx.shape[0]
+        for i in prange(W - 1):
+            for j in range(H):
+                x = min(max(u[i, j], -umax), umax)
+                u[i, j] = x
+                up[i, j] = max(x, 0.0)
+                un[i, j] = min(x, 0.0)
+        for i in prange(W):
+            for j in range(H - 1):
+                x = min(max(v[i, j], -umax), umax)
+                v[i, j] = x
+                vp[i, j] = max(x, 0.0)
+                vn[i, j] = min(x, 0.0)
+        for i in prange(W):
+            for j in range(H):
+                o = 0.0
+                if i < W - 1:
+                    o += up[i, j]
+                if i > 0:
+                    o -= un[i - 1, j]
+                if j < H - 1:
+                    o += vp[i, j]
+                if j > 0:
+                    o -= vn[i, j - 1]
+                s[i, j] = min(1.0, 0.95 / (o + 1e-9))
+        for i in prange(W):
+            for j in range(H):
+                # net flow out of the cell, for compression heating
+                div = 0.0
+                if i < W - 1:
+                    div += up[i, j] * s[i, j] + un[i, j] * s[i + 1, j]
+                if i > 0:
+                    div -= up[i - 1, j] * s[i - 1, j] + un[i - 1, j] * s[i, j]
+                if j < H - 1:
+                    div += vp[i, j] * s[i, j] + vn[i, j] * s[i, j + 1]
+                if j > 0:
+                    div -= vp[i, j - 1] * s[i, j - 1] + vn[i, j - 1] * s[i, j]
+                tot = 0.0
+                for k in range(S):
+                    tot += n[idx[k], i, j]
+                e = C[i, j] * T[i, j] - pdv * tot * T[i, j] * div
+                Eo[i, j] = max(e, 0.0)
+        for i in prange(W):
+            for j in range(H):
+                alr = 0.0
+                arr = 0.0
+                all_ = 0.0
+                arl = 0.0
+                blr = 0.0
+                brr = 0.0
+                bll = 0.0
+                brl = 0.0
+                hr = 0.0
+                hl = 0.0
+                hb = 0.0
+                ha = 0.0
+                if i < W - 1:
+                    op = not (sol[i, j] or sol[i + 1, j])
+                    d = diff if (op and not (chk[i, j] or chk[i + 1, j])) else 0.0
+                    alr = up[i, j] * s[i, j] + d
+                    arr = un[i, j] * s[i + 1, j] - d
+                    if op:
+                        hr = heat * min(C[i, j], C[i + 1, j]) * (T[i, j] - T[i + 1, j])
+                if i > 0:
+                    op = not (sol[i - 1, j] or sol[i, j])
+                    d = diff if (op and not (chk[i - 1, j] or chk[i, j])) else 0.0
+                    all_ = up[i - 1, j] * s[i - 1, j] + d
+                    arl = un[i - 1, j] * s[i, j] - d
+                    if op:
+                        hl = heat * min(C[i - 1, j], C[i, j]) * (T[i - 1, j] - T[i, j])
+                if j < H - 1:
+                    op = not (sol[i, j] or sol[i, j + 1])
+                    d = diff if (op and not (chk[i, j] or chk[i, j + 1])) else 0.0
+                    blr = vp[i, j] * s[i, j] + d
+                    brr = vn[i, j] * s[i, j + 1] - d
+                    if op:
+                        hb = heat * min(C[i, j], C[i, j + 1]) * (T[i, j] - T[i, j + 1])
+                if j > 0:
+                    op = not (sol[i, j - 1] or sol[i, j])
+                    d = diff if (op and not (chk[i, j - 1] or chk[i, j])) else 0.0
+                    bll = vp[i, j - 1] * s[i, j - 1] + d
+                    brl = vn[i, j - 1] * s[i, j] - d
+                    if op:
+                        ha = heat * min(C[i, j - 1], C[i, j]) * (T[i, j - 1] - T[i, j])
+                cn = 0.0
+                for k in range(S):
+                    q = idx[k]
+                    x0 = n[q, i, j]
+                    dn = 0.0
+                    if i < W - 1:
+                        dn -= x0 * alr + n[q, i + 1, j] * arr
+                    if i > 0:
+                        dn += n[q, i - 1, j] * all_ + x0 * arl
+                    if j < H - 1:
+                        dn -= x0 * blr + n[q, i, j + 1] * brr
+                    if j > 0:
+                        dn += n[q, i, j - 1] * bll + x0 * brl
+                    x1 = max(x0 + dn, 0.0)
+                    nn[k, i, j] = x1
+                    cn += cvv[k] * x1
+                e0 = Eo[i, j]
+                de = 0.0
+                if i < W - 1:
+                    de -= e0 * alr + Eo[i + 1, j] * arr + hr
+                if i > 0:
+                    de += Eo[i - 1, j] * all_ + e0 * arl + hl
+                if j < H - 1:
+                    de -= e0 * blr + Eo[i, j + 1] * brr + hb
+                if j > 0:
+                    de += Eo[i, j - 1] * bll + e0 * brl + ha
+                en = max(e0 + de, 0.0)
+                Tn[i, j] = en / max(cn, 1e-5) if cn > 1e-5 else 293.0
+    return k_force, k_active, k_move
+
+
+if HAVE_NUMBA:
+    try:
+        k_force, k_active, k_move = _build_kernels(
+            lambda f: njit(parallel=True, fastmath=True, cache=not getattr(sys, 'frozen', False))(f))
+    except Exception:
+        HAVE_NUMBA = False
+
+
+NB_READY = threading.Event()
+
+
+def warm_numba():
+    # compile (or load from cache) the gas kernels in the background so the game opens right away
+    if not HAVE_NUMBA:
+        return
+
+    def run():
+        try:
+            S, W, H = 3, 12, 10
+            idx = np.arange(S)
+            f = np.float32
+            n = np.ones((S, W, H), f)
+            T = np.full((W, H), 293, f)
+            sol = np.zeros((W, H), bool)
+            u, v = np.zeros((W - 1, H), f), np.zeros((W, H - 1), f)
+            cv = np.ones(S, f)
+            sc = lambda *sh: np.zeros(sh, f)
+            for nn_ in (n, np.ones((S + 2, W, H), f)[:, :, :]):
+                pass
+            k_force(n, idx, cv, cv, T, sol, u, v, sc(W, H), sc(W, H), sc(W, H), sc(W - 1, H), sc(W, H - 1), False, 0.2, 5.0, 0.02, 0.8, 0.99, 4e-4)
+            k_move(n, idx, cv, T, sol, np.zeros((W, H), bool), u, v, sc(W, H), sc(W, H), sc(S, W, H), sc(W, H),
+                   sc(W - 1, H), sc(W - 1, H), sc(W, H - 1), sc(W, H - 1), sc(W, H), 0.95, 0.02, 0.05, 0.35)
+            big = np.ones((S + 3, W + 4, H), f)[:, 2:-2, :]
+            for nn_ in (n, big):
+                k_active(nn_, idx, np.ones((S, H), f), T, sol, u, v, np.zeros((W, H), np.uint8), sc(W, H), sc(W, H),
+                         np.zeros((W, H), bool), np.zeros((W, H), np.int16), np.zeros(W, bool))
+            k_force(big, idx, cv, cv, T, sol, u, v, sc(W, H), sc(W, H), sc(W, H), sc(W - 1, H), sc(W, H - 1), True, 0.2, 5.0, 0.02, 0.8, 0.99, 4e-4)
+            k_move(big, idx, cv, T, sol, np.zeros((W, H), bool), u, v, sc(W, H), sc(W, H), sc(S, W, H), sc(W, H),
+                   sc(W - 1, H), sc(W - 1, H), sc(W, H - 1), sc(W, H - 1), sc(W, H), 0.95, 0.02, 0.05, 0.35)
+        except Exception:
+            pass
+        NB_READY.set()
+    threading.Thread(target=run, daemon=True).start()
+
+
 class GasSim:
     # 2d gas grid: each cell has amounts of each gas, a temperature, and flow on its faces.
     # walls are static cells, BLOCKs are rigid boxes that get shoved around by the gas
@@ -4317,6 +4618,10 @@ class GasSim:
         self.relief_open = np.zeros(shape, bool)    # relief valves that popped open
         self.liq = np.zeros(shape, np.float32)      # liquid water in each cell
         self.phi = np.zeros(shape, np.float32)      # neutron flux
+        self.mol = np.zeros(shape, np.float32)      # molten fuel in each cell
+        self.molT = np.full(shape, 293, np.float32)  # and how hot it is
+        self.mol_pw = 0.0                           # decay heat the puddles keep making
+        self.meltd = np.zeros(shape, np.float32)    # how far a wall has melted under molten fuel
         self.decay = np.zeros(shape, np.float32)    # decay heat stored in fuel
         self.scram = np.zeros(shape, bool)          # control rods slammed in by a sensor / circuit
         self.news = []                              # messages for the ui (meltdowns)
@@ -4368,6 +4673,9 @@ class GasSim:
         self.T[:] = 293
         self.liq[:] = 0
         self.phi[:] = 0
+        self.mol[:] = 0
+        self.meltd[:] = 0
+        self.mol_pw = 0.0
         self.decay[:] = 0
         self.n[:, self.solid] = 0
         self.u[:] = 0
@@ -4547,6 +4855,7 @@ class GasSim:
         self.valve_open[mask] = False
         self.relief_open[mask] = False
         self.liq[mask] = 0
+        self.mol[mask] = 0
         self.phi[mask] = 0
         self.decay[mask] = 0
         self.n[:, mask] = 0
@@ -4710,6 +5019,7 @@ class GasSim:
         self.valve_open[hit] = False
         self.relief_open[hit] = False
         self.liq[mask] = 0
+        self.mol[mask] = 0
         self.T[hit] = 293      # the hole starts empty and gas rushes in
         self.bodies = [b for b in self.bodies
                        if not mask[b['x']:b['x'] + b['w'], b['y']:b['y'] + b['h']].any()]
@@ -4760,6 +5070,14 @@ class GasSim:
         self.n[:, dx, dy] += self.n[:, sx, sy]
         self.n[:, sx, sy] = 0
         self.T[dx, dy] = np.where(cs + cd > 1e-6, e / np.maximum(cs + cd, 1e-6), 293)
+
+    def body_blocked(self, b, dx, dy):
+        x, y, w, h = b['x'], b['y'], b['w'], b['h']
+        if dx:
+            lx, ly = x + w if dx > 0 else x - 1, np.arange(y, y + h)
+        else:
+            lx, ly = np.arange(x, x + w), y + h if dy > 0 else y - 1
+        return bool((self.solid[lx, ly] | self.ring[lx, ly] | (self.kind[lx, ly] > 0)).any())
 
     def try_move(self, b, dx, dy):
         x, y, w, h = b['x'], b['y'], b['w'], b['h']
@@ -5064,7 +5382,8 @@ class GasSim:
                 return 'a spinning body is in the way, move it first'
         self.pack_slab(lo, hi)
         for arr in (self.T, self.kind, self.strength, self.valve_open, self.relief_open, self.liq, self.phi,
-                    self.decay, self.scram, self.aux, self.link, self.spark_t, self.cogmask, self.u, self.v):
+                    self.decay, self.scram, self.aux, self.link, self.spark_t, self.cogmask, self.u, self.v,
+                    self.mol, self.molT):
             arr[:] = np.roll(arr, -amt, axis=0)
         self.n[:] = np.roll(self.n, -amt, axis=1)
         e0 = gw - G_SLAB + 1 if d > 0 else 1         # the slab that comes in
@@ -5078,7 +5397,7 @@ class GasSim:
             self.relief_open[c_] = False
             self.scram[c_] = False
             self.cogmask[c_] = False
-            for arr in (self.liq, self.phi, self.decay, self.spark_t, self.u, self.v):
+            for arr in (self.liq, self.phi, self.decay, self.spark_t, self.u, self.v, self.mol):
                 arr[c_] = 0
             self.T[c_] = 293
             self.n[:, c_] = 0 if self.void else self.amb_field
@@ -5562,7 +5881,7 @@ class GasSim:
             ax, sh_ = 1, dy
         sl = (slice(ex0, ex1 + 1), slice(ey0, ey1 + 1))
         for arr in (self.T, self.kind, self.strength, self.valve_open, self.relief_open, self.liq, self.phi,
-                    self.decay, self.scram, self.aux, self.link, self.spark_t, self.cogmask):
+                    self.decay, self.scram, self.aux, self.link, self.spark_t, self.cogmask, self.mol, self.molT):
             arr[sl] = np.roll(arr[sl], sh_, axis=ax)
         ns = (slice(None),) + sl
         self.n[ns] = np.roll(self.n[ns], sh_, axis=ax + 1)
@@ -5812,7 +6131,7 @@ class GasSim:
 
     def solve_rods(self):
         # velocity-level distance constraints (impulses), with a little push-back so errors don't pile up
-        for _ in range(6):
+        for _ in range(10):
             for m in self.chains:
                 a, b = m['a'], m['b']
                 ra, rb = self.cpitch(a), self.cpitch(b)
@@ -5851,7 +6170,7 @@ class GasSim:
                 tot = inv[0] + inv[1]
                 if tot < 1e-9:
                     continue
-                lam = -(vrel + 0.25 * (dist - r['L'])) / tot
+                lam = -(vrel + 0.5 * (dist - r['L'])) / tot
                 for h, P, sgn in ((r['a'], A, 1), (r['b'], B, -1)):
                     if h['kind'] == 'body':
                         b = h['ref']
@@ -6028,6 +6347,118 @@ class GasSim:
         m = part & (Cc > 1e-5)
         T[m] = E[m] / Cc[m]
 
+    def mol_step(self, n, T):
+        # molten fuel: runs downhill, spreads out, keeps its decay heat, gives heat to gas and water, sets solid again when cold
+        mol, mT = self.mol, self.molT
+        free = ~self.solid & ~self.ring      # the edge of the world holds it like a floor
+        mol[~free] = 0
+        if not mol.any():
+            return
+        if self.gravity:
+            xs = np.flatnonzero(mol.any(1))
+            ys = np.flatnonzero(mol.any(0))
+            x0, x1 = max(0, xs[0] - 2), min(mol.shape[0], xs[-1] + 3)
+            y0, y1 = max(0, ys[0] - 2), min(mol.shape[1], ys[-1] + 3)
+            L = mol[x0:x1, y0:y1]
+            E = L * mT[x0:x1, y0:y1]
+            F = free[x0:x1, y0:y1]
+            ff = F[:, :-1] & F[:, 1:]
+            fx = F[:-1] & F[1:]
+            fd1 = F[:-1, :-1] & F[1:, 1:]
+            fd2 = F[1:, :-1] & F[:-1, 1:]
+
+            def flow(a, b, amt):
+                fr = amt / np.maximum(L[a], 1e-9)
+                dE = fr * E[a]
+                E[a] -= dE
+                E[b] += dE
+                L[a] -= amt
+                L[b] += amt
+            D = (slice(None), slice(None, -1))
+            U = (slice(None), slice(1, None))
+            for it in range(2):
+                flow(D, U, np.minimum(L[D], np.maximum(1.0 - L[U], 0)) * ff)
+                stuck = ~F[:, 1:] | (L[:, 1:] >= 0.95)
+                if it % 2 == 0:
+                    a, b = (slice(None, -1), slice(None, -1)), (slice(1, None), slice(1, None))
+                    ok = fd1 & stuck[:-1]
+                else:
+                    a, b = (slice(1, None), slice(None, -1)), (slice(None, -1), slice(1, None))
+                    ok = fd2 & stuck[1:]
+                flow(a, b, np.minimum(L[a], np.maximum(1.0 - L[b], 0)) * 0.25 * ok)
+                sup = np.ones(L.shape, bool)
+                sup[:, :-1] = ~F[:, 1:] | (L[:, 1:] >= 0.95)
+                diff = L[:-1] - L[1:]
+                ok = fx & (((diff > 0.5) & sup[:-1]) | ((diff < -0.5) & sup[1:]))
+                fl = 0.25 * diff * ok
+                lo_, hi_ = (slice(None, -1),), (slice(1, None),)
+                flow(lo_, hi_, np.maximum(fl, 0))
+                flow(hi_, lo_, np.maximum(-fl, 0))
+            np.clip(L, 0, 1, out=L)
+            mT[x0:x1, y0:y1] = np.where(L > 1e-4, E / np.maximum(L, 1e-4), 293)
+        m = mol > 1e-4
+        S = n.shape[0]
+        Cg = (self.cvv @ n.reshape(S, -1)).reshape(T.shape) + G_LIQ_C * self.liq
+        Cm = G_MOL_C * mol
+        mT[m] += self.mol_pw * 6.0 / G_MOL_C
+        q = np.where(m, G_MOL_K * (mT - T) * Cg * Cm / (Cg + Cm + 1e-9), 0)
+        T += q / np.maximum(Cg, 1e-3) * (Cg > 1e-3)
+        mT -= np.where(m, q / np.maximum(Cm, 1e-3), 0)
+        mT += np.where(m, (293 - mT) * G_MOL_COOL, 0)
+        np.clip(mT, 20, 5000, out=mT)
+        self.mol_pw *= 0.9997
+        if self.mol_pw < 1e-4:
+            self.mol_pw = 0.0
+        # hot puddles melt whatever they touch
+        hot = np.where(m, np.maximum(mT - G_MOL_BURN, 0) * mol, 0)
+        if hot.any():
+            nb = np.zeros_like(hot)
+            nb[1:] += hot[:-1]
+            nb[:-1] += hot[1:]
+            nb[:, 1:] += hot[:, :-1]
+            nb[:, :-1] += hot[:, 1:]
+            tgt = self.solid & (self.kind > 0) & (self.kind != G_URAN) & ~self.ring
+            res = np.ones(len(G_SOLIDS), np.float32)
+            res[G_GLASS], res[G_STEEL] = 0.4, 1.5
+            self.meltd += np.where(tgt, nb * 5e-5 / res[self.kind], 0)
+            gone = tgt & (self.meltd >= 1.0)
+            if gone.any():
+                self.meltd[gone] = 0
+                near = gone.copy()
+                near[1:] |= gone[:-1]
+                near[:-1] |= gone[1:]
+                near[:, 1:] |= gone[:, :-1]
+                near[:, :-1] |= gone[:, 1:]
+                mT[near & m] -= 60.0        # melting walls costs the puddle heat
+                self.erase(gone)
+                free = ~self.solid
+                if self.age - getattr(self, 'burn_t', -999) > 60:
+                    self.news.append('molten fuel is burning through the wall!')
+                self.burn_t = self.age
+        fz = m & (mT < G_MOL_FREEZE) & free & ~self.ring
+        if fz.any():
+            # cold puddle sets solid, whole cells only, so no fuel appears or vanishes
+            xs, ys = np.nonzero(fz)
+            vals = mol[xs, ys]
+            tot = float(vals.sum())
+            k = int(tot + 1e-3)
+            if k >= 1:
+                order = np.argsort(-vals)
+                pick = order[:k]
+                fm = np.zeros_like(fz)
+                fm[xs[pick], ys[pick]] = True
+                rest = np.ones(len(xs), bool)
+                rest[pick] = False
+                left = max(tot - k, 0.0)
+                keepT = mT[fm].copy()
+                self.set_solid(fm, G_URAN)
+                self.T[fm] = keepT
+                mol[fm] = 0
+                if rest.any():
+                    rs = vals[rest].sum()
+                    mol[xs[rest], ys[rest]] = vals[rest] * (left / rs if rs > 0 else 0)
+        np.clip(T, 20, 5000, out=T)
+
     def reactor(self, n, T):
         # neutron flux diffuses through everything, water slows neutrons so fuel can catch them, control rods soak them up.
         # hot fuel catches fewer (doppler), fuel makes heat and keeps making some after shutdown (decay heat)
@@ -6063,6 +6494,9 @@ class GasSim:
             T += (pw + self.decay) / G_THERM_C[kind].clip(1)  * fuel
             melt = fuel & (T > R['MELT'])
             if melt.any():
+                self.mol[melt] = 1.0            # the fuel runs as a hot puddle instead of vanishing
+                self.molT[melt] = T[melt]
+                self.mol_pw = max(self.mol_pw, float(self.decay[melt].mean()))
                 kind[melt] = 0
                 self.strength[melt] = 0
                 self.aux[melt] = 0
@@ -6191,7 +6625,7 @@ class GasSim:
         np.clip(liq, 0, G_LIQ_CAP, out=liq)
         liq[liq < 1e-4] = 0
 
-    def flow_devices(self, u, v):
+    def flow_devices(self, u, v, p=None):
         # one-way valves only let flow go their way, pumps push it
         for kd, push in ((G_CHECK, False), (G_PUMP, True)):
             if kd not in self.has:
@@ -6201,12 +6635,19 @@ class GasSim:
                 if not m.any():
                     continue
                 xs, ys = np.nonzero(m)
+                fp = np.ones(len(xs))
+                if push and p is not None and G_PUMP_PMAX:
+                    # a pump stalls against a very high pressure instead of packing gas in without limit
+                    xd, yd = np.clip(xs + dx, 0, p.shape[0] - 1), np.clip(ys + dy, 0, p.shape[1] - 1)
+                    pd = np.maximum(p[xd, yd], p[xs, ys])
+                    fp = np.clip((G_PUMP_PMAX - pd) / (0.3 * G_PUMP_PMAX), 0, 1)
                 if dx:
                     for fx in (xs - 1, xs):
                         ok = (fx >= 0) & (fx < u.shape[0])
                         a, b = fx[ok], ys[ok]
-                        u[a, b] = np.maximum(u[a, b], G_PUMP_V if push else 0) if dx > 0 \
-                            else np.minimum(u[a, b], -G_PUMP_V if push else 0)
+                        fq = fp[ok]
+                        u[a, b] = np.maximum(u[a, b], G_PUMP_V * fq if push else 0) if dx > 0 \
+                            else np.minimum(u[a, b], -G_PUMP_V * fq if push else 0)
                     ok = (ys >= 0) & (ys < v.shape[1])
                     v[xs[ok], ys[ok]] = 0
                     ok = ys >= 1
@@ -6215,8 +6656,9 @@ class GasSim:
                     for fy in (ys - 1, ys):
                         ok = (fy >= 0) & (fy < v.shape[1])
                         a, b = xs[ok], fy[ok]
-                        v[a, b] = np.maximum(v[a, b], G_PUMP_V if push else 0) if dy > 0 \
-                            else np.minimum(v[a, b], -G_PUMP_V if push else 0)
+                        fq = fp[ok]
+                        v[a, b] = np.maximum(v[a, b], G_PUMP_V * fq if push else 0) if dy > 0 \
+                            else np.minimum(v[a, b], -G_PUMP_V * fq if push else 0)
                     ok = (xs >= 0) & (xs < u.shape[0])
                     u[xs[ok], ys[ok]] = 0
                     ok = xs >= 1
@@ -6280,17 +6722,23 @@ class GasSim:
         if not self.open or self.void or G_TURB in self.has or not G_CROP:
             return None
         W2 = self.W2
-        d = np.abs(n[idx] - self.amb_field[idx]).max(0) > 3e-3
-        d &= ~sol
-        col = d.any(1)
-        col |= (np.abs(T - 293) * ~sol > 0.5).any(1)
-        um = (np.abs(self.u) > 0.01).any(1)
-        col[:-1] |= um
-        col[1:] |= um
-        col |= (np.abs(self.v) > 0.01).any(1)
-        col |= ((self.kind > 3) | (self.liq > 0)).any(1)
-        col |= self.cogmask.any(1)
-        col |= self.spark_t.any(1)
+        if HAVE_NUMBA and G_NUMBA and NB_READY.is_set():
+            col = np.zeros(W2, bool)
+            amb = np.ascontiguousarray(self.amb_field[idx][:, 0, :], dtype=np.float32)
+            k_active(n, np.ascontiguousarray(idx, dtype=np.int64), amb, T, sol, self.u, self.v, self.kind,
+                     self.liq, self.mol, self.cogmask, self.spark_t, col)
+        else:
+            d = np.abs(n[idx] - self.amb_field[idx]).max(0) > 3e-3
+            d &= ~sol
+            col = d.any(1)
+            col |= (np.abs(T - 293) * ~sol > 0.5).any(1)
+            um = (np.abs(self.u) > 0.01).any(1)
+            col[:-1] |= um
+            col[1:] |= um
+            col |= (np.abs(self.v) > 0.01).any(1)
+            col |= ((self.kind > 3) | (self.liq > 0) | (self.mol > 0)).any(1)
+            col |= self.cogmask.any(1)
+            col |= self.spark_t.any(1)
         for f in self.frames:
             col[max(0, f['x0'] - 2):f['x0'] + f['w'] + 3] = True
         for b in self.bodies:
@@ -6318,7 +6766,50 @@ class GasSim:
             return None
         return out
 
+    def flow_core_nb(self, full, T, sol, idx):
+        W, H = T.shape
+        S = len(idx)
+        key = (W, H, S)
+        if getattr(self, '_nbk', None) != key:
+            f = np.float32
+            self._nbk = key
+            self._nb = dict(p=np.empty((W, H), f), C=np.empty((W, H), f), rho=np.empty((W, H), f),
+                            uo=np.empty((W - 1, H), f), vo=np.empty((W, H - 1), f), Eo=np.empty((W, H), f),
+                            nn=np.empty((S, W, H), f), Tn=np.empty((W, H), f),
+                            up=np.empty((W - 1, H), f), un=np.empty((W - 1, H), f),
+                            vp=np.empty((W, H - 1), f), vn=np.empty((W, H - 1), f), s=np.empty((W, H), f),
+                            nochk=np.zeros((W, H), bool))
+        b = self._nb
+        idx = np.ascontiguousarray(idx, dtype=np.int64)
+        cvv = np.ascontiguousarray(self.cvv[idx], dtype=np.float32)
+        Mv = np.ascontiguousarray(self.Mv[idx], dtype=np.float32)
+        for _sub in range(G_SUB):
+            u, v = self.u, self.v
+            k_force(full, idx, cvv, Mv, T, sol, u, v, b['p'], b['C'], b['rho'], b['uo'], b['vo'],
+                    bool(self.gravity), G_K, G_COLL, G_VISC, G_ADV, G_DAMP, G_BUOY)
+            u[:] = b['uo']
+            v[:] = b['vo']
+            chk = (self.kind == G_CHECK) if G_CHECK in self.has else None
+            if G_PUMP in self.has or chk is not None:
+                self.flow_devices(u, v, b['p'])
+                u *= ~sol[:-1] & ~sol[1:]
+                v *= ~sol[:, :-1] & ~sol[:, 1:]
+            if G_TURB in self.has and _sub == 0:
+                self.turbines(u, v, b['p'])
+            exm = self.thermal() if self.has & set(G_THERM) else None
+            exT = T[exm].copy() if exm is not None else None
+            k_move(full, idx, cvv, T, sol, chk if chk is not None else b['nochk'], u, v, b['C'], b['Eo'], b['nn'], b['Tn'],
+                   b['up'], b['un'], b['vp'], b['vn'], b['s'], G_UMAX, G_DIFF, G_HEAT, G_PDV)
+            if self.liq.any():
+                self.mist(b['up'], b['un'], b['vp'], b['vn'], b['s'])
+            full[idx] = b['nn']
+            T[:] = b['Tn']
+            if exm is not None:
+                T[exm] = exT
+
     def flow_core(self, full, T, sol, idx):
+        if HAVE_NUMBA and G_NUMBA and NB_READY.is_set():
+            return self.flow_core_nb(full, T, sol, idx)
         n = full
         for _sub in range(G_SUB):
             n = full[idx]
@@ -6371,7 +6862,9 @@ class GasSim:
             v *= G_DAMP * oy
             chk = (self.kind == G_CHECK) if G_CHECK in self.has else None
             if G_PUMP in self.has or chk is not None:
-                self.flow_devices(u, v)
+                self.flow_devices(u, v, p)
+                u *= ox         # a pump or valve pushing at a wall must not push gas into it
+                v *= oy
             if G_TURB in self.has and _sub == 0:
                 self.turbines(u, v, p)
             np.clip(u, -G_UMAX, G_UMAX, out=u)
@@ -6489,6 +6982,8 @@ class GasSim:
             self.devices(n, T, sol)
         if G_URAN in self.has:
             self.reactor(n, T)
+        if self.mol.any():
+            self.mol_step(n, T)
         if self.has & set(G_THERM):
             self.exchange(n, T)
         if self.probes:
@@ -6557,6 +7052,11 @@ class GasSim:
         col[ntot < 1e-3] = (6, 8, 16)
         wl = np.clip(self.liq[1:-1, 1:-1] / 1.5, 0, 0.9)[..., None]
         col = col * (1 - wl) + np.array([45, 115, 225], np.float32) * wl
+        if self.mol.any():
+            ml = np.clip(self.mol[1:-1, 1:-1] * 1.5, 0, 1)[..., None]
+            gl = np.clip((self.molT[1:-1, 1:-1] - 900) / 1800, 0, 1)[..., None]
+            hotc = np.array([255, 120, 30], np.float32) * (1 - gl) + np.array([255, 240, 190], np.float32) * gl
+            col = col * (1 - ml) + hotc * ml
         kind = self.kind[1:-1, 1:-1]
         for i in range(1, len(G_SOLIDS)):
             col[kind == i] = G_SOLIDS[i][2]
@@ -6668,6 +7168,8 @@ class GasSim:
         n = self.n[:, x, y]
         tot = float(n.sum())
         wtxt = f'water {float(self.liq[x, y]):.1f}  ' if self.liq[x, y] > 0.05 else ''
+        if self.mol[x, y] > 0.05:
+            wtxt += f'molten fuel {float(self.molT[x, y]) - 273:.0f}C  '
         if tot < 1e-3:
             return wtxt + 'vacuum'
         p = tot * float(self.T[x, y]) / 293
@@ -6685,7 +7187,7 @@ class GasSim:
             np.savez_compressed(f, n=self.n, T=self.T, kind=self.kind, strength=self.strength,
                                 made_by=np.array(AUTHOR), bodies=bodies, open=np.array(self.open), void=np.array(self.void),
                                 probes=np.array(list(self.probes), np.int32).reshape(-1, 2), gravity=np.array(self.gravity),
-                                sensors=sens, link=self.link, aux=self.aux, liq=self.liq, phi=self.phi, decay=self.decay,
+                                sensors=sens, link=self.link, aux=self.aux, liq=self.liq, phi=self.phi, decay=self.decay, mol=self.mol, molT=self.molT,
                                 shafts=np.array([[q['x'], q['y'], q['R'], q['th'], q['om'], q.get('teeth', 0), q.get('tl', 0),
                                                   int(bool(q.get('wheel')))]
                                                  for q in self.shafts], np.float64).reshape(-1, 8),
@@ -6778,6 +7280,9 @@ class GasSim:
             self.aux[:] = d['aux'] if 'aux' in d else 0
             self.liq[:] = d['liq'] if 'liq' in d else 0
             self.phi[:] = d['phi'] if 'phi' in d else 0
+            self.mol[:] = d['mol'] if 'mol' in d else 0
+            self.molT[:] = d['molT'] if 'molT' in d else 293
+            self.mol_pw = 0.3 if self.mol.any() else 0.0
             self.decay[:] = d['decay'] if 'decay' in d else 0
             self.scram[:] = False
             self.relief_open[:] = False
@@ -7502,6 +8007,10 @@ class GasMode:
             pass        # sensors and links are placed one click at a time
         elif self.mat == 'BLOCK':
             self.app.say('draw blocks with RECT')
+        elif self.mat in ('HEAT BRUSH', 'COOL BRUSH'):
+            m = mask & ~sim.solid
+            d = amount * 400 * (1 if self.mat == 'HEAT BRUSH' else -1)
+            sim.T[m] = np.clip(sim.T[m] + d, 20, 5000)
         elif self.mat == 'VACUUM':
             sim.drain(mask, 0.5 if amount < 1 else 0.0)
         elif self.mat == 'WATER':
@@ -7943,7 +8452,12 @@ class GasMode:
         objs = [(f['x0'], f['y0'], f['w'], f['h'], f['fx'], f['fy']) for f in sim.frames]
         for b in sim.bodies:
             if sim.frame_at(b['x'] + b['w'] / 2.0, b['y'] + b['h'] / 2.0, 0) is None:
-                objs.append((b['x'], b['y'], b['w'], b['h'], b['fx'], b['fy']))
+                bx_, by_ = b['fx'], b['fy']
+                if bx_ and sim.body_blocked(b, 1 if bx_ > 0 else -1, 0):
+                    bx_ = 0.0       # never draw a block sunk into the wall it's pushing on
+                if by_ and sim.body_blocked(b, 0, 1 if by_ > 0 else -1):
+                    by_ = 0.0
+                objs.append((b['x'], b['y'], b['w'], b['h'], bx_, by_))
         for cx, cy, w, h, fx, fy in objs:
             if abs(fx) < 0.02 and abs(fy) < 0.02:
                 continue
@@ -7954,20 +8468,34 @@ class GasMode:
             spr.blit(surf, (0, 0), R)
             ox, oy = int(round(fx * cs)), int(round(fy * cs))
             # the strip the object leaves behind gets the gas colors from just outside of it
+            empty = (6, 8, 16)
             if ox:
                 col_x = R.x - 1 if ox > 0 else R.right
-                if 0 <= col_x < sw:
-                    line = pygame.Surface((1, R.h))
-                    line.blit(surf, (0, 0), (col_x, R.y, 1, R.h))
-                    strip = pygame.transform.scale(line, (abs(ox), R.h))
-                    surf.blit(strip, (R.x if ox > 0 else R.right - abs(ox), R.y))
+                sx0 = R.x if ox > 0 else R.right - abs(ox)
+                ncx = cx - 1 if ox > 0 else cx + w
+                for r_ in range(h):
+                    if not (0 <= col_x < sw):
+                        continue
+                    # a wall next door is not what's behind the block, so only copy gas colours
+                    if 0 <= ncx < sim.W2 and 0 <= cy + r_ < sim.H2 and sim.solid[ncx, cy + r_]:
+                        surf.fill(empty, (sx0, R.y + r_ * cs, abs(ox), cs))
+                    else:
+                        line = pygame.Surface((1, cs))
+                        line.blit(surf, (0, 0), (col_x, R.y + r_ * cs, 1, cs))
+                        surf.blit(pygame.transform.scale(line, (abs(ox), cs)), (sx0, R.y + r_ * cs))
             if oy:
                 row_y = R.y - 1 if oy > 0 else R.bottom
-                if 0 <= row_y < sh_:
-                    line = pygame.Surface((R.w, 1))
-                    line.blit(surf, (0, 0), (R.x, row_y, R.w, 1))
-                    strip = pygame.transform.scale(line, (R.w, abs(oy)))
-                    surf.blit(strip, (R.x, R.y if oy > 0 else R.bottom - abs(oy)))
+                sy0 = R.y if oy > 0 else R.bottom - abs(oy)
+                ncy = cy - 1 if oy > 0 else cy + h
+                for c_ in range(w):
+                    if not (0 <= row_y < sh_):
+                        continue
+                    if 0 <= cx + c_ < sim.W2 and 0 <= ncy < sim.H2 and sim.solid[cx + c_, ncy]:
+                        surf.fill(empty, (R.x + c_ * cs, sy0, cs, abs(oy)))
+                    else:
+                        line = pygame.Surface((cs, 1))
+                        line.blit(surf, (0, 0), (R.x + c_ * cs, row_y, cs, 1))
+                        surf.blit(pygame.transform.scale(line, (cs, abs(oy))), (R.x + c_ * cs, sy0))
             surf.blit(spr, (R.x + ox, R.y + oy))
 
     def draw_rbodies(self, surf):
@@ -8240,8 +8768,8 @@ class GasMode:
                 gx, gy, gw_, gh_ = vr.x + 10, by, 250, 74
                 pygame.draw.rect(surf, PANEL, (gx, gy, gw_, gh_))
                 pygame.draw.rect(surf, PANEL_LINE, (gx, gy, gw_, gh_), 1)
-                surf.blit(self.app.small.render(f'T{i + 1}  thrust {mag:.1f}  {" + ".join(dirs) or "-"}', True, (255, 190, 90)), (gx + 6, gy + 4))
-                surf.blit(self.app.tiny.render(f'peak {pr["peak"]:.1f}    impulse {imp:.0f}    (click probe = reset)', True, TEXT_DIM), (gx + 6, gy + 22))
+                surf.blit(self.app.small.render(f'T{i + 1}  thrust {fmt_force(mag)}  {" + ".join(dirs) or "-"}', True, (255, 190, 90)), (gx + 6, gy + 4))
+                surf.blit(self.app.tiny.render(f'peak {fmt_force(pr["peak"])}   impulse {fmt_force(imp * G_STEP_S).replace("N", "N·s")}   (click = reset)', True, TEXT_DIM), (gx + 6, gy + 22))
                 h = pr['hist']
                 if len(h) > 1:
                     vals = [math.hypot(a_, b_) for a_, b_ in h]
@@ -8304,8 +8832,9 @@ HARD_CIRCUIT = [('INPUT', ['SOURCE', 'SWITCH', 'BUTTON']), ('OUTPUT', ['LAMP', '
 
 def apply_hard():
     # hard: circuits only get NAND and the basics, gas has no mixtures and every part can break
-    global HARD, G_TOUGH
+    global HARD, G_TOUGH, G_PUMP_PMAX
     HARD = True
+    G_PUMP_PMAX = 20.0
     PAL_CATS[:] = HARD_CIRCUIT
     PAL_ITEMS[:] = [k for _, ks in HARD_CIRCUIT for k in ks]
     G_TOUGH = ()
@@ -8314,6 +8843,17 @@ def apply_hard():
             G_SOLIDS[i] = (sd[0], 120 if sd[0] == 'STEEL' else 30, sd[2])
     G_CATS[:] = [(n, [m for m in ms if m != 'VACUUM'] if n == 'GASES' else ms) for n, ms in G_CATS if n != 'MIXES']
     G_CATS[[n for n, _ in G_CATS].index('GASES')][1].append('VACUUM')
+
+
+def fmt_force(f):
+    # raw thrust is atm x cell faces, turn that into real newtons
+    n = abs(f) * 101325.0 * G_CELL_M * G_DEPTH_M
+    sgn = '-' if f < 0 else ''
+    if n >= 1e6:
+        return f'{sgn}{n / 1e6:.2f} MN'
+    if n >= 1e3:
+        return f'{sgn}{n / 1e3:.1f} kN'
+    return f'{sgn}{n:.0f} N'
 
 
 def pick_difficulty(surf):
@@ -8360,6 +8900,7 @@ def pick_difficulty(surf):
 
 def main():
     pygame.init()
+    warm_numba()
     pygame.display.set_caption('logic sandbox  |  ' + AUTHOR)
     pygame.display.set_mode((1280, 800), pygame.RESIZABLE)
     if '--hard' in sys.argv:
