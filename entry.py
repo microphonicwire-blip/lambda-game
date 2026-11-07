@@ -9,6 +9,10 @@ try:
     import certifi  # noqa
 except ImportError:
     pass
+try:
+    import numba  # noqa  (fast gas kernels, the game falls back to numpy without it)
+except Exception:
+    pass
 import launcher
 
 if __name__ == '__main__':
